@@ -1,0 +1,58 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the project
+    cmds:
+      - cargo build --release
+
+  dev:
+    desc: Run in development mode
+    cmds:
+      - cargo watch -x run
+
+  test:
+    desc: Run tests
+    cmds:
+      - cargo test
+
+  lint:
+    desc: Run linter
+    cmds:
+      - cargo clippy -- -D warnings
+
+  fmt:
+    desc: Format code
+    cmds:
+      - cargo fmt
+
+  check:
+    desc: Run all checks
+    cmds:
+      - task: fmt
+      - task: lint
+      - task: test
+
+  setup:
+    desc: Setup development environment
+    cmds:
+      - cp .env.example .env
+      - echo "Please edit .env with your configuration"
+      - cargo build
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
+      - rm -rf .contextnest_cache
+
+  neo4j:start:
+    desc: Start Neo4j in Docker
+    cmds:
+      - docker run -d --name contextnest-neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:5
+
+  neo4j:stop:
+    desc: Stop Neo4j container
+    cmds:
+      - docker stop contextnest-neo4j
+      - docker rm contextnest-neo4j
