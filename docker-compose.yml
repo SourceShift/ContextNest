@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  # ContextNest Application
+  contextnest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${CONTEXTNEST_SERVER_PORT:-8080}:8080"
+    environment:
+      - CONTEXTNEST_SERVER_HOST=0.0.0.0
+      - CONTEXTNEST_SERVER_PORT=8080
+      - CONTEXTNEST_SERVER_LOG_LEVEL=${CONTEXTNEST_SERVER_LOG_LEVEL:-info}
+      - CONTEXTNEST_DATABASE_NEO4J_URI=neo4j://neo4j:7687
+      - CONTEXTNEST_DATABASE_NEO4J_USERNAME=${CONTEXTNEST_DATABASE_NEO4J_USERNAME:-neo4j}
+      - CONTEXTNEST_DATABASE_NEO4J_PASSWORD=${CONTEXTNEST_DATABASE_NEO4J_PASSWORD:-contextnest123}
+      - CONTEXTNEST_DATABASE_NEO4J_DATABASE=${CONTEXTNEST_DATABASE_NEO4J_DATABASE:-neo4j}
+      - CONTEXTNEST_PARSER_DART_ANALYZER_PATH=/usr/bin/dart
+      - CONTEXTNEST_PARSER_CACHE_DIRECTORY=/app/.contextnest_cache
+      - CONTEXTNEST_EMBEDDINGS_PROVIDER=${CONTEXTNEST_EMBEDDINGS_PROVIDER:-openai}
+      - CONTEXTNEST_EMBEDDINGS_API_KEY=${CONTEXTNEST_EMBEDDINGS_API_KEY}
+      - CONTEXTNEST_EMBEDDINGS_MODEL=${CONTEXTNEST_EMBEDDINGS_MODEL:-text-embedding-ada-002}
+      - CONTEXTNEST_EMBEDDINGS_DIMENSIONS=${CONTEXTNEST_EMBEDDINGS_DIMENSIONS:-1536}
+      - CONTEXTNEST_CACHE_REDIS_URL=redis://redis:6379
+    volumes:
+      - ./.contextnest_cache:/app/.contextnest_cache
+      - ./logs:/app/logs
+    depends_on:
+      - neo4j
+      - redis
+    restart: unless-stopped
+    networks:
+      - contextnest-network
+
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15-community
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/${CONTEXTNEST_DATABASE_NEO4J_PASSWORD:-contextnest123}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_security_procedures_allowlist=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2g
+      - NEO4J_dbms_memory_pagecache_size=512m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+    restart: unless-stopped
+    networks:
+      - contextnest-network
+
+  # Redis for Caching
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-contextnest123}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - contextnest-network
+
+  # Development tools (optional)
+  adminer:
+    image: adminer:4.8.1
+    ports:
+      - "8081:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=neo4j
+    depends_on:
+      - neo4j
+    restart: unless-stopped
+    networks:
+      - contextnest-network
+    profiles:
+      - dev
+
+  # Redis Commander (optional)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD:-contextnest123}
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - contextnest-network
+    profiles:
+      - dev
+
+volumes:
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  neo4j_import:
+    driver: local
+  neo4j_plugins:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  contextnest-network:
+    driver: bridge
