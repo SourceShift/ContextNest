@@ -1,0 +1,83 @@
+version: 2
+updates:
+  # Rust dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "contextnest/maintainers"
+    assignees:
+      - "contextnest/maintainers"
+    commit-message:
+      prefix: "cargo"
+      prefix-development: "cargo-dev"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "rust"
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    ignore:
+      # Ignore major version updates for critical dependencies
+      - dependency-name: "tokio"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "serde"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "contextnest/maintainers"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Python dependencies (if requirements.txt exists)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "contextnest/maintainers"
+    commit-message:
+      prefix: "python"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "python"
+
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "10:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "contextnest/maintainers"
+    commit-message:
+      prefix: "examples"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "python"
+      - "examples"
