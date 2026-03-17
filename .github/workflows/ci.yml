@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run cargo check
+        run: cargo check
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+          NEO4J_PLUGINS: '["apoc"]'
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Wait for Neo4j
+        run: |
+          echo "Waiting for Neo4j to be ready..."
+          max_attempts=30
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            if curl -s http://localhost:7474 > /dev/null 2>&1; then
+              echo "Neo4j is ready"
+              break
+            fi
+            echo "Waiting for Neo4j... ($attempt/$max_attempts)"
+            sleep 2
+            attempt=$((attempt + 1))
+          done
+
+      - name: Run tests
+        env:
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: testpassword
+        run: cargo test
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Surfaces all warnings across lib, bins, tests, examples, benches.
+      # This job is the gate that must pass.
+      - name: Run cargo clippy (all targets)
+        run: cargo clippy --all-targets
+
+  clippy_strict:
+    # Aspirational `-D warnings` gate. Latent warnings are tracked in
+    # follow-up cleanup work; marked continue-on-error so PRs aren't
+    # blocked until those land.
+    name: Clippy (strict, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  docs_check:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check documentation links
+        run: |
+          # Check for broken internal links in markdown files
+          find . -name "*.md" -exec grep -l "\[\[.*\]\]" {} \; | while read file; do
+            echo "Checking $file for broken links..."
+            # Extract links and verify they exist
+            grep -o "\[\[.*\]\]" "$file" | sed 's/\[\[\(.*\)\]\]/\1/' | while read link; do
+              if [ ! -f "$link" ] && [ ! -f "${link}.md" ]; then
+                echo "Broken link in $file: $link"
+                exit 1
+              fi
+            done
+          done
+
+      - name: Build documentation
+        run: cargo doc --no-deps --document-private-items
+
