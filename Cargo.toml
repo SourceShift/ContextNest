@@ -67,7 +67,7 @@ tree-sitter = "0.20"
 tree-sitter-rust = "0.20"
 
 # Configuration
-config = "0.14"
+config = "0.15"
 dotenvy = "0.15"
 toml = "0.8"
 
