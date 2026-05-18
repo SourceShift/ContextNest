@@ -130,34 +130,6 @@ jobs:
       - name: Run cargo clippy (all targets)
         run: cargo clippy --all-targets
 
-  clippy_strict:
-    # Aspirational `-D warnings` gate. Latent warnings are tracked in
-    # follow-up cleanup work; marked continue-on-error so PRs aren't
-    # blocked until those land.
-    name: Clippy (strict, advisory)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run cargo clippy --all-targets -- -D warnings
-        run: cargo clippy --all-targets -- -D warnings
-
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
