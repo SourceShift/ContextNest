@@ -1,0 +1,154 @@
+[package]
+name = "contextnest"
+version = "0.1.0"
+edition = "2021"
+authors = ["Amir Khakshour <https://github.com/amirkhakshour>"]
+description = "Continual-learning memory substrate for LLM agents — neural-field attractor consolidation"
+license = "MIT"
+repository = "https://github.com/SourceShift/ContextNest"
+rust-version = "1.80"
+keywords = ["llm", "agents", "memory", "context", "neural-field"]
+categories = ["data-structures", "science"]
+homepage = "https://contextnest.dev"
+documentation = "https://docs.rs/contextnest"
+readme = "README.md"
+
+# Whitelist what ships in the published crate. Anything outside this list
+# is excluded — keeps the crate size focused on what downstream users
+# actually consume.
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+]
+
+[[bin]]
+name = "contextnest"
+path = "src/bin/contextnest.rs"
+
+[features]
+# Default feature set: v0.1.0 single-agent continual-learning memory substrate.
+default = []
+
+# Multi-agent cluster (canon Module 07). Adds field-based multi-agent coordination
+# on top of the same neural-field substrate. v0.2+ work.
+multi-agent = []
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.36", features = ["full"] }
+tokio-util = "0.7"  # CancellationToken for protocol execution
+async-trait = "0.1"
+async-recursion = "1.0"
+
+# Web framework
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "auth", "compression-br", "request-id"] }
+hyper = { version = "1.0", features = ["full"] }
+http = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database drivers
+neo4rs = "0.9.0-rc.6"  # Neo4j driver
+
+# Parser
+tree-sitter = "0.20"
+tree-sitter-rust = "0.20"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+log = "0.4"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# UUID generation
+uuid = { version = "1.7", features = ["v4", "serde"] }
+
+# HTTP client (for embeddings)
+reqwest = { version = "0.11", features = ["json"] }
+
+# GraphQL
+async-graphql = { version = "6.0", features = ["apollo_tracing", "apollo_persisted_queries"] }
+async-graphql-axum = "6.0"
+
+# Command line args
+clap = { version = "4.5", features = ["derive"] }
+
+# CLI dependencies
+colored = "2.1"
+inquire = "0.6"
+indicatif = "0.17"
+console = "0.15"
+dialoguer = "0.11"
+
+# Additional dependencies
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+regex = "1.10"
+num_cpus = "1.16"
+threadpool = "1.8"
+ordered-float = { version = "5.0", features = ["serde"] }
+
+# Redis for rate limiting (optional)
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"], optional = true }
+
+# Security headers and validation
+validator = { version = "0.18", features = ["derive"] }
+
+# Cryptographic utilities
+rand = "0.8"
+base64 = "0.21"
+hex = "0.4"
+
+# HTTP security
+
+# Performance optimization dependencies (Sprint 1)
+parking_lot = "0.12"  # Fast mutex for memory pools and caching
+
+# Additional dependencies for advanced memory system
+
+# Security: Force minimum safe versions
+ring = "0.17.12"
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+rsa = "0.9"
+p256 = "0.13"
+elliptic-curve = "0.13"
+nix = { version = "0.27", features = ["signal", "process", "user", "resource"] }
+
+# Compression for response middleware
+flate2 = "1.0"
+
+# LLM provider abstraction (Phase J) — multi-provider (Anthropic, OpenAI, Google)
+# with config-driven base_url override so z.ai / LiteLLM proxies plug in without
+# code changes.
+llm-sdk-rs = "0.3.0"
+
+[dev-dependencies]
+# Testing utilities
+tempfile = "3.8"
+env_logger = "0.10"
+tokio-test = "0.4"
+wiremock = "0.5"
+criterion = "0.5"
+proptest = "1.0"
+axum-test = "15.0"
