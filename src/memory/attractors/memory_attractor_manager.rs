@@ -1035,9 +1035,9 @@ mod tests {
 
         let result = manager.optimize_system().await.unwrap();
         let _ = result;
-                                                    // `optimization_time` is measured with `Utc::now()` which has
-                                                    // microsecond resolution; on an empty manager the run completes in
-                                                    // sub-millisecond time, so check nanos rather than millis.
+        // `optimization_time` is measured with `Utc::now()` which has
+        // microsecond resolution; on an empty manager the run completes in
+        // sub-millisecond time, so check nanos rather than millis.
         assert!(result.optimization_time.as_nanos() > 0);
     }
 

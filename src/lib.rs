@@ -68,8 +68,7 @@ mod tests {
 
     #[test]
     fn test_memory_orchestrator_creation() {
-        let _memory =
-            MemoryOrchestrator::new(MemoryStrategy::PriorityPruning { max_tokens: 1024 });
+        let _memory = MemoryOrchestrator::new(MemoryStrategy::PriorityPruning { max_tokens: 1024 });
     }
 
     #[test]

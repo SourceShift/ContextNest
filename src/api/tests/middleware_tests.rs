@@ -61,9 +61,11 @@ mod tests {
 
         let context = RequestContext::from_headers(&headers);
 
-        // Sensitive headers should not set user_id in this basic implementation
-        // In a real implementation, you'd extract user info from valid tokens
-        assert_eq!(context.user_id, Some("user_123".to_string())); // Mock extraction
+        // v0.1.0 has no auth implementation — `extract_user_id_from_auth`
+        // returns None unconditionally. Even with an Authorization header
+        // present, user_id stays None until a real JWT/OIDC validator is
+        // wired up (deferred to v0.5+).
+        assert_eq!(context.user_id, None);
     }
 
     #[tokio::test]

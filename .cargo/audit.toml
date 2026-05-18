@@ -1,0 +1,23 @@
+# cargo-audit policy file.
+#
+# Advisories listed here are acknowledged but not blocking — either no fixed
+# version exists upstream, or the transitive-dep chain doesn't expose an
+# upgrade we can take without a major version bump elsewhere. Each entry
+# should explain *why* it's ignored and what would resolve it.
+
+[advisories]
+ignore = [
+    # rsa 0.9.x — Marvin Attack (timing sidechannel during PKCS#1 v1.5 decrypt).
+    # No upstream fix; the maintainer has documented it as a known
+    # limitation. ContextNest does not perform any PKCS#1 v1.5 decryption
+    # in v0.1.0 (we only use RSA key *generation* + signing inside the
+    # offline key-management primitives), so the timing side-channel is
+    # not reachable through the seven-tool API. Re-evaluate when rustls/
+    # rsa ship a patched release.
+    "RUSTSEC-2023-0071",
+
+    # idna < 1.0 — accepts Punycode labels that decode to all-ASCII. Pulled
+    # in transitively through reqwest -> url. The reqwest 0.11 -> 0.12 jump
+    # is a breaking change we'll do as part of v0.2's HTTP-client refresh.
+    "RUSTSEC-2024-0421",
+]

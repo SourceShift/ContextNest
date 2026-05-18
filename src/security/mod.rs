@@ -3,7 +3,7 @@
 //! encryption and request-validation middleware. The sandbox + plugin-verifier
 //! + advanced-security stack was deleted with the plugin SDK in v0.1.0. Auth is
 //! out of scope (deploy behind a reverse proxy).
-//! # Production contract 
+//! # Production contract
 //! What's REAL and safe to depend on:
 //! - [`path_validator`] — `PathValidator` blocks directory-traversal attacks
 //!   on user-supplied paths. Canonicalises inputs + symlink-scopes to the leaf

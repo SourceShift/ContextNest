@@ -970,7 +970,8 @@ impl AttractorField {
             access_count: 1,
             content,
             connections: Vec::new(),
-            deleted_at: None,            delete_reason: None,
+            deleted_at: None,
+            delete_reason: None,
         };
 
         // Check for connections with existing attractors

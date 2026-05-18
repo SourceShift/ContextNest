@@ -573,7 +573,8 @@ impl NeuralField {
             created_at: Utc::now(),
             last_activated: Utc::now(),
             activation_count: 1,
-            deleted_at: None,            delete_reason: None,
+            deleted_at: None,
+            delete_reason: None,
         };
 
         // Calculate resonance with existing patterns
