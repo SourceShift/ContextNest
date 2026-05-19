@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub mod context;
 pub mod embedding;
+pub mod embedding_providers;
 pub mod graph;
 pub mod graph_enhanced;
 pub mod llm;
@@ -20,9 +21,13 @@ pub mod session_index;
 
 pub use context::ContextManagerService;
 pub use embedding::EmbeddingService;
+pub use embedding_providers::{
+    CustomHttpEmbeddingConfig, CustomHttpEmbeddingProvider, EmbeddingProvider,
+    HuggingFaceEmbeddingProvider, OllamaEmbeddingProvider,
+};
 pub use graph::GraphService;
 pub use graph_enhanced::EnhancedGraphService;
-pub use llm::LlmService;
+pub use llm::{LlmProvider, LlmService, LlmServiceBuilder};
 pub use parser::ParserService;
 
 /// Central service container (domain-agnostic).

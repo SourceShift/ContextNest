@@ -80,6 +80,17 @@ pub enum LlmProvider {
     Google {
         model: Arc<dyn LanguageModel + Send + Sync>,
     },
+    /// Caller-supplied [`LanguageModel`] implementation. The escape hatch
+    /// for any provider, proxy, or test double the substrate doesn't ship
+    /// natively. Construct via
+    /// [`LlmServiceBuilder::with_custom_provider`].
+    ///
+    /// The `name` field is used in logs and metrics only — it does not
+    /// affect dispatch.
+    Custom {
+        name: String,
+        model: Arc<dyn LanguageModel + Send + Sync>,
+    },
 }
 
 // Manual Debug so we don't require LanguageModel: Debug.
@@ -90,6 +101,7 @@ impl std::fmt::Debug for LlmProvider {
             LlmProvider::Anthropic { .. } => write!(f, "LlmProvider::Anthropic"),
             LlmProvider::OpenAi { .. } => write!(f, "LlmProvider::OpenAi"),
             LlmProvider::Google { .. } => write!(f, "LlmProvider::Google"),
+            LlmProvider::Custom { name, .. } => write!(f, "LlmProvider::Custom({})", name),
         }
     }
 }
@@ -267,6 +279,7 @@ impl LlmService {
             LlmProvider::Anthropic { model } => model.clone(),
             LlmProvider::OpenAi { model } => model.clone(),
             LlmProvider::Google { model } => model.clone(),
+            LlmProvider::Custom { model, .. } => model.clone(),
         };
 
         let input = LanguageModelInput {
@@ -390,6 +403,135 @@ fn build_google(
     let model = GoogleModel::new(model_id, options);
     LlmProvider::Google {
         model: Arc::new(model),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder — programmatic construction (the extensibility entry point)
+// ---------------------------------------------------------------------------
+
+/// Programmatic construction path for [`LlmService`].
+///
+/// Use this when env-var-driven config is the wrong fit — most commonly:
+/// integration tests with a mock LLM, embedding the substrate as a library
+/// inside another Rust app that owns its own config story, or plugging a
+/// caller-supplied custom provider implementing the `LanguageModel` trait
+/// directly.
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use contextnest::services::{LlmService, LlmServiceBuilder};
+///
+/// // Use a built-in provider:
+/// let service = LlmServiceBuilder::new()
+///     .with_openai_compatible(
+///         "http://localhost:11434/v1",
+///         "ollama",          // any non-empty key works for local Ollama
+///         "llama3",
+///     )
+///     .build();
+///
+/// // Or plug a fully custom LanguageModel impl:
+/// // let service = LlmServiceBuilder::new()
+/// //     .with_custom_provider("my-internal-llm", Arc::new(my_model))
+/// //     .build();
+/// ```
+pub struct LlmServiceBuilder {
+    provider: LlmProvider,
+}
+
+impl Default for LlmServiceBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmServiceBuilder {
+    /// Start with a disabled provider. Add a provider via one of the
+    /// `with_*` methods before calling [`Self::build`].
+    pub fn new() -> Self {
+        Self {
+            provider: LlmProvider::Disabled,
+        }
+    }
+
+    /// Build an Anthropic provider with explicit credentials.
+    pub fn with_anthropic(
+        mut self,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        self.provider = build_anthropic(api_key.into(), base_url, model);
+        self
+    }
+
+    /// Build an OpenAI provider with explicit credentials.
+    pub fn with_openai(
+        mut self,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        self.provider = build_openai(api_key.into(), base_url, model);
+        self
+    }
+
+    /// Build a Google provider with explicit credentials.
+    pub fn with_google(
+        mut self,
+        api_key: impl Into<String>,
+        base_url: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        self.provider = build_google(api_key.into(), base_url, model);
+        self
+    }
+
+    /// Configure any OpenAI-compatible endpoint — Ollama, LiteLLM, vLLM,
+    /// LM Studio, OpenRouter, Together, Groq, Anyscale, Fireworks,
+    /// Mistral, Anyscale, or any self-hosted gateway speaking the
+    /// `/v1/chat/completions` shape.
+    ///
+    /// `api_key` may be a placeholder string for endpoints that don't
+    /// enforce auth (local Ollama). It is still sent in the
+    /// `Authorization: Bearer …` header because most proxies require
+    /// *some* value and reject empty bearers.
+    pub fn with_openai_compatible(
+        mut self,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.provider = build_openai(api_key.into(), Some(base_url.into()), Some(model.into()));
+        self
+    }
+
+    /// Plug a caller-supplied [`LanguageModel`] implementation. The
+    /// substrate dispatches through the trait object — anything that
+    /// satisfies `llm_sdk::LanguageModel + Send + Sync` works.
+    ///
+    /// `name` appears in logs and metrics (`LlmProvider::Custom(<name>)`)
+    /// and is the only thing distinguishing custom providers from each
+    /// other on the wire.
+    pub fn with_custom_provider(
+        mut self,
+        name: impl Into<String>,
+        model: Arc<dyn LanguageModel + Send + Sync>,
+    ) -> Self {
+        self.provider = LlmProvider::Custom {
+            name: name.into(),
+            model,
+        };
+        self
+    }
+
+    /// Finalise the builder into an [`LlmService`].
+    ///
+    /// A builder that never had a `with_*` call returns a disabled
+    /// service — same contract as [`LlmService::from_env`] without keys.
+    pub fn build(self) -> LlmService {
+        LlmService::new(self.provider)
     }
 }
 
