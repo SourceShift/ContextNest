@@ -21,11 +21,10 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
+        // The substrate exposes everything under /api/* — health at
+        // /api/health, status at /api/status, seven tools at
+        // /api/v1/tools/*. One proxy entry covers all of it.
         "/api": {
-          target: apiBaseUrl,
-          changeOrigin: true,
-        },
-        "/health": {
           target: apiBaseUrl,
           changeOrigin: true,
         },

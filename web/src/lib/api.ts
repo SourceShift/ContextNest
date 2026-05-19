@@ -180,7 +180,7 @@ export const api = {
     call<ResonateRequest, ResonateResponse>("/api/v1/tools/resonate", body),
 
   health: async (): Promise<HealthResponse> => {
-    const res = await fetch(`${API_BASE}/health`);
+    const res = await fetch(`${API_BASE}/api/health`);
     if (!res.ok) {
       throw new ApiError(res.status, "", `health returned ${res.status}`);
     }
