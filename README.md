@@ -227,6 +227,8 @@ is unset.
 
 ## Documentation
 
+- [docs/architecture.md](docs/architecture.md) — substrate internals, mermaid + sequence diagrams per tool, concurrency contract
+- [docs/usage.md](docs/usage.md) — copy-paste curl examples for every tool, integration recipes (Python, bash, Claude Code hooks), troubleshooting
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to add a tool, CI gates, canonical pipeline
 - [SECURITY.md](SECURITY.md) — vulnerability reporting
 - [CHANGELOG.md](CHANGELOG.md) — version history

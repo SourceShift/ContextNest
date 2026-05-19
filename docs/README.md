@@ -1,17 +1,28 @@
 # ContextNest Documentation
 
-This directory is reserved for design notes and architecture write-ups that
-augment the inline rustdoc on the public crate.
+Curated entry points for understanding and using ContextNest.
 
-For the current v0.1.0 surface, see:
+## Core reading
 
-- [`../README.md`](../README.md) — quickstart, seven-tool API, LLM provider
-  config, build + test commands.
-- [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — canonical pipeline (`store →
-  retrieve → reconstruct`), how to add a tool, and CI gates.
-- [`../SECURITY.md`](../SECURITY.md) — responsible-disclosure contact.
-- [`../CHANGELOG.md`](../CHANGELOG.md) — release notes.
+- [**architecture.md**](architecture.md) — how the substrate works under the
+  seven-tool API. Mental model, sequence diagrams for each tool, why
+  neural-field attractors beat a flat vector store, concurrency contract.
+- [**usage.md**](usage.md) — practical how-to with copy-paste curl examples
+  for every tool, end-to-end demo, integration recipes (Python, bash,
+  Claude Code hooks), and a troubleshooting matrix.
 
-Auto-generated API docs (after `cargo doc --no-deps --open`) live in
-`target/doc/contextnest/`; the public docs.rs build is at
-<https://docs.rs/contextnest>.
+## Repository docs
+
+- [../README.md](../README.md) — project overview, quickstart, badges
+- [../CONTRIBUTING.md](../CONTRIBUTING.md) — canonical pipeline + how to
+  add a new tool to the seven-tool API
+- [../SECURITY.md](../SECURITY.md) — responsible-disclosure contact
+- [../CHANGELOG.md](../CHANGELOG.md) — release notes
+
+## Auto-generated API docs
+
+```bash
+cargo doc --no-deps --open
+```
+
+Public docs.rs build: <https://docs.rs/contextnest>
