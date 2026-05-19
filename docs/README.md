@@ -11,6 +11,12 @@ Curated entry points for understanding and using ContextNest.
   for every tool, end-to-end demo, integration recipes (Python, bash,
   Claude Code hooks), and a troubleshooting matrix.
 
+## Where this is going
+
+- [**roadmap/**](roadmap/) — forward-looking design + sequencing. Strategic
+  five-milestone plan (v0.2 → v1.0) plus concrete spec for the next
+  milestone (v0.3 self-caching LLM proxy).
+
 ## Repository docs
 
 - [../README.md](../README.md) — project overview, quickstart, badges
