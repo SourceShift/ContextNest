@@ -109,7 +109,7 @@ sequenceDiagram
     Session-->>API: ok
     API->>MAM: process_memories(fragment, embedding)
     MAM->>Basin: form_or_attach(fragment)
-    Note over Basin: Creates a new basin when no neighbour is within threshold; otherwise attaches to and reinforces the existing one
+    Note over Basin: Creates a new basin when no neighbour is within threshold, otherwise attaches to and reinforces the existing one
     Basin-->>MAM: basin_id
     MAM->>Net: index_edges(basin_id, neighbours)
     Net-->>MAM: edge_count
