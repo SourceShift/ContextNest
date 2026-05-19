@@ -9,10 +9,15 @@
 
 use clap::Parser;
 use contextnest::api::create_app;
-use contextnest::cli::{Cli, Commands};
+use contextnest::cli::{Cli, Commands, IngestSource};
 use contextnest::config::Config;
+use contextnest::ingest::claude_code::{
+    discover_sessions, ingest_session_file, parse_since, DryRunSink, HttpSink, Sink, SinkReport,
+};
 use contextnest::services::ContextNestServices;
+use std::path::PathBuf;
 use std::process;
+use std::time::SystemTime;
 use tokio::fs;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -29,7 +34,190 @@ async fn main() {
 async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { bind } => serve(bind).await,
+        Commands::Ingest { source } => ingest(source).await,
     }
+}
+
+/// Dispatch the `ingest` subcommand. Each adapter is a sibling under
+/// `IngestSource`; v0.2 phase 1 ships only the Claude Code adapter.
+async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> {
+    match source {
+        IngestSource::ClaudeCode {
+            project,
+            session_id,
+            since,
+            dry_run,
+            substrate,
+            projects_dir,
+        } => ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await,
+    }
+}
+
+/// Walk `~/.claude/projects/`, filter by the user's flags, push memories
+/// from every matching session to the chosen sink.
+async fn ingest_claude_code(
+    project: Option<String>,
+    session_id: Option<String>,
+    since: Option<String>,
+    dry_run: bool,
+    substrate: String,
+    projects_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve the projects discovery root. Default: ~/.claude/projects/.
+    let projects_root = projects_dir.unwrap_or_else(default_projects_dir);
+    if !projects_root.exists() {
+        return Err(format!(
+            "Claude Code projects directory not found: {}",
+            projects_root.display()
+        )
+        .into());
+    }
+
+    // Translate --since "7d" into a SystemTime cutoff. Bad input is a
+    // hard error so users notice typos.
+    let since_cutoff = match since.as_deref() {
+        None => None,
+        Some(s) => match parse_since(s) {
+            Some(dur) => Some(SystemTime::now() - dur),
+            None => {
+                return Err(format!(
+                    "Invalid --since value '{}'. Use a number + unit, e.g. '7d', '24h', '30m'.",
+                    s
+                )
+                .into());
+            }
+        },
+    };
+
+    // When --session-id is set, project + since filters are ignored
+    // because the user wants exactly that one session.
+    let sessions = if let Some(uuid_filter) = session_id.as_deref() {
+        let all = discover_sessions(&projects_root, None, None)?;
+        let want = uuid_filter.to_lowercase();
+        all.into_iter()
+            .filter(|s| s.session_uuid.to_lowercase().contains(&want))
+            .collect()
+    } else {
+        discover_sessions(&projects_root, project.as_deref(), since_cutoff)?
+    };
+
+    if sessions.is_empty() {
+        println!(
+            "No matching sessions in {}. (project={:?}, since={:?}, session_id={:?})",
+            projects_root.display(),
+            project,
+            since,
+            session_id
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Discovered {} session(s) under {}",
+        sessions.len(),
+        projects_root.display()
+    );
+    for s in &sessions {
+        let mb = s.size_bytes as f64 / 1_048_576.0;
+        println!(
+            "  • {}  ({:.2} MB)  project: {}",
+            &s.session_uuid[..s.session_uuid.len().min(8)],
+            mb,
+            s.project_cwd
+        );
+    }
+    println!();
+
+    // Pick the sink based on --dry-run.
+    if dry_run {
+        let sink = DryRunSink::new();
+        let total = process_sessions(&sessions, &sink).await?;
+        let by_kind = sink.captured_by_kind().await;
+        report_summary(total, &by_kind, true);
+    } else {
+        let sink = HttpSink::new(&substrate);
+        println!("Pushing to substrate at {}", substrate);
+        let total = process_sessions(&sessions, &sink).await?;
+        report_summary(total, &std::collections::HashMap::new(), false);
+    }
+
+    Ok(())
+}
+
+/// Run `ingest_session_file` over a list of sessions and aggregate the
+/// reports. Errors on individual sessions are logged and counted; we
+/// don't abort the whole batch.
+async fn process_sessions<S: Sink + ?Sized>(
+    sessions: &[contextnest::ingest::claude_code::DiscoveredSession],
+    sink: &S,
+) -> Result<SinkReport, Box<dyn std::error::Error>> {
+    let mut combined = SinkReport::default();
+    for s in sessions {
+        match ingest_session_file(s, sink).await {
+            Ok(report) => {
+                combined.success += report.success;
+                combined.failed += report.failed;
+                if combined.first_error.is_none() {
+                    combined.first_error = report.first_error;
+                }
+                for (k, v) in report.by_kind {
+                    *combined.by_kind.entry(k).or_insert(0) += v;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "  ✗ session {}: {}",
+                    &s.session_uuid[..s.session_uuid.len().min(8)],
+                    e
+                );
+                combined.failed += 1;
+            }
+        }
+    }
+    Ok(combined)
+}
+
+fn report_summary(
+    report: SinkReport,
+    captured_by_kind: &std::collections::HashMap<String, usize>,
+    dry_run: bool,
+) {
+    println!();
+    println!(
+        "─── {} ───",
+        if dry_run {
+            "DRY RUN COMPLETE"
+        } else {
+            "INGEST COMPLETE"
+        }
+    );
+    println!(
+        "  Memories: {} success / {} fail",
+        report.success, report.failed
+    );
+    let by_kind = if !report.by_kind.is_empty() {
+        &report.by_kind
+    } else {
+        captured_by_kind
+    };
+    if !by_kind.is_empty() {
+        println!("  Breakdown by kind:");
+        let mut entries: Vec<_> = by_kind.iter().collect();
+        entries.sort_by_key(|(k, _)| k.clone());
+        for (kind, count) in entries {
+            println!("    {:<22} {}", kind, count);
+        }
+    }
+    if let Some(err) = &report.first_error {
+        eprintln!("  First error: {}", err);
+    }
+}
+
+fn default_projects_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".claude").join("projects")
 }
 
 /// Start the HTTP server (seven-tool memory API + health/status).

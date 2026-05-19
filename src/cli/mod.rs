@@ -37,6 +37,57 @@ pub enum Commands {
         #[arg(long)]
         bind: Option<String>,
     },
+
+    /// Ingest external session data into the substrate.
+    Ingest {
+        #[command(subcommand)]
+        source: IngestSource,
+    },
+}
+
+/// Sources the ingester can pull from. v0.2 phase 1 ships only the Claude
+/// Code adapter; more adapters land as siblings here.
+#[derive(Subcommand)]
+pub enum IngestSource {
+    /// Ingest Claude Code session transcripts from `~/.claude/projects/`.
+    ///
+    /// Examples:
+    ///   contextnest ingest claude-code --project ContextNest --since 7d
+    ///   contextnest ingest claude-code --session-id 4c998114 --dry-run
+    ///   contextnest ingest claude-code --substrate http://localhost:28080 \
+    ///       --project ContextNest
+    ///
+    /// `--dry-run` prints what WOULD be stored without hitting the
+    /// substrate. Useful for sanity-checking extraction before mass-ingest.
+    #[command(name = "claude-code")]
+    ClaudeCode {
+        /// Substring-match the project cwd (case-insensitive). Skipped
+        /// when omitted — every project in the projects dir is ingested.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Specific session UUID (or first-N-chars prefix). When set,
+        /// `--project` and `--since` are ignored.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Only sessions modified within this duration. Format: `<n>{s,m,h,d,w}`.
+        /// Example: `7d` for 7 days, `24h` for 24 hours.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Print records to stdout instead of POSTing. No network calls.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Substrate base URL. Default: `http://localhost:8080`.
+        #[arg(long, default_value = "http://localhost:8080")]
+        substrate: String,
+
+        /// Override the discovery root. Default: `~/.claude/projects/`.
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+    },
 }
 
 /// CLI execution result
