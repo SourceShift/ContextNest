@@ -63,6 +63,20 @@ pub struct ContextNestServices {
     /// themselves are session-agnostic in the canonical IP; session affinity
     /// for "what to surface" lives in [`Self::session_index`].
     pub fragment_texts: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Per-fragment metadata sidecar — sibling to [`Self::fragment_texts`].
+    /// Stores whatever the caller passed in `StoreRequest.metadata`, keyed
+    /// by the same `fragment_id`. The `retrieve` handler reads this to
+    /// support `metadata_filter`, so callers can answer queries like
+    /// "show me pending decisions for session X" without changing the
+    /// canonical `MemoryFragment` shape.
+    ///
+    /// Separate from `fragment_texts` (rather than a unified sidecar
+    /// struct) because the other six tool handlers — `update`,
+    /// `summarize`, `discard`, `reconstruct`, `resonate` — don't need
+    /// metadata access; keeping them split means none of those handlers
+    /// has to change. The diff stays scoped to store + retrieve.
+    pub fragment_metadata:
+        Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, serde_json::Value>>>>,
     /// LLM provider abstraction (Phase J).
     /// Always present — may be [`crate::services::llm::LlmProvider::Disabled`]
     /// when no API key / provider config is present. Callers MUST check
@@ -130,6 +144,7 @@ impl ContextNestServices {
         let session_index = Arc::new(crate::services::session_index::SessionIndex::new());
 
         let fragment_texts = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let fragment_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         // Construct the LLM service from environment. Returns Disabled when no
         // API key is present — never propagates an error so offline / CI starts
@@ -152,6 +167,7 @@ impl ContextNestServices {
             attractor_manager,
             session_index,
             fragment_texts,
+            fragment_metadata,
             llm,
         })
     }
