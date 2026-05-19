@@ -104,12 +104,12 @@ sequenceDiagram
 
     Client->>API: store {content, importance, session_id}
     API->>Embed: embed(content)
-    Embed-->>API: Vec<f32> (768-d)
+    Embed-->>API: 768-d embedding
     API->>Session: register(session_id, fragment_id)
     Session-->>API: ok
     API->>MAM: process_memories(fragment, embedding)
     MAM->>Basin: form_or_attach(fragment)
-    Note over Basin: New basin if no neighbour within threshold;<br/>else attach + reinforce existing basin
+    Note over Basin: New basin if no neighbour within threshold; else attach + reinforce existing one
     Basin-->>MAM: basin_id
     MAM->>Net: index_edges(basin_id, neighbours)
     Net-->>MAM: edge_count
@@ -141,7 +141,7 @@ sequenceDiagram
 
     Client->>API: retrieve {query, top_k, session_id}
     API->>Embed: embed(query)
-    Embed-->>API: Vec<f32>
+    Embed-->>API: embedding
     API->>Session: scope(session_id)
     Session-->>API: fragment_ids
     API->>MAM: retrieve(embedding, top_k, scope)
@@ -150,7 +150,7 @@ sequenceDiagram
     MAM-->>API: top_k attractors
     API-->>Client: 200 {attractors[]}
 
-    Note over Client: Agent realises the cue was partial.<br/>Asks for reconstruction.
+    Note over Client: Agent realises the cue was partial. Asks for reconstruction.
 
     Client->>API: reconstruct {partial_cue, session_id}
     API->>MAM: reconstruct(cue, scope)
@@ -190,7 +190,7 @@ sequenceDiagram
     Net-->>MAM: activation_pattern[]
     MAM->>Phase: detect_coherence(activation_pattern)
     Phase-->>MAM: coherent_groups[]
-    Note over Phase: Group basins that activated<br/>together more strongly than<br/>their individual scores predict
+    Note over Phase: Group basins that activated together more strongly than their individual scores predict
     MAM-->>API: emergent_patterns
     API-->>Client: 200 {patterns[], strength}
 ```
