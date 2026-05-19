@@ -225,6 +225,14 @@ is unset.
 - Neo4j (optional — graph service feature only)
 - Redis (optional — rate limiting only)
 
+## Dashboard
+
+A React dashboard scaffolds under [`web/`](web/). v0.2-ui phase 1 lands the
+providers catalog screen; the seven-tool playground and per-session memory
+list follow in phases 2 and 3. See [`web/README.md`](web/README.md) for the
+dev loop or [`docs/roadmap/v0.2-ui-dashboard.md`](docs/roadmap/v0.2-ui-dashboard.md)
+for the design rationale.
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — substrate internals, mermaid + sequence diagrams per tool, concurrency contract

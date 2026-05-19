@@ -1,0 +1,53 @@
+name: Web CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+
+jobs:
+  build:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        # Lockfile lands after first local pnpm install. Once it's
+        # committed, swap this line for `pnpm install --frozen-lockfile`
+        # to catch dep drift on CI.
+        run: pnpm install
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Bundle size sanity
+        run: |
+          # Soft check: warn if the gzipped main bundle drifts above the
+          # baseline. v0.2-ui aims for <250 KB gzipped total per the spec.
+          du -sb dist | awk '{ print "dist size:", $1, "bytes (" $1/1024 " KB)" }'

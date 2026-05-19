@@ -1,0 +1,59 @@
+/* Tailwind v4 — CSS-first config. No PostCSS chain needed. */
+@import "tailwindcss";
+
+/* Theme tokens. Dark-by-default per the v0.2-ui spec ("most agent
+   builders run dark IDEs"). Override via system preference. */
+@theme {
+  --color-bg: oklch(0.18 0.01 240);
+  --color-bg-elevated: oklch(0.22 0.01 240);
+  --color-bg-subtle: oklch(0.25 0.012 240);
+  --color-border: oklch(0.32 0.01 240);
+  --color-border-strong: oklch(0.4 0.012 240);
+  --color-text: oklch(0.95 0.005 240);
+  --color-text-muted: oklch(0.68 0.01 240);
+  --color-text-subtle: oklch(0.5 0.01 240);
+
+  /* Accent — neural-field teal. Matches the favicon. */
+  --color-accent: oklch(0.78 0.14 180);
+  --color-accent-strong: oklch(0.7 0.18 180);
+  --color-accent-bg: oklch(0.28 0.06 180);
+
+  --color-danger: oklch(0.7 0.18 25);
+  --color-success: oklch(0.78 0.14 150);
+  --color-warning: oklch(0.82 0.14 80);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Code blocks inherit a monospace stack so playground response
+   inspection stays readable. */
+code,
+pre,
+kbd,
+samp {
+  font-family:
+    "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Code",
+    "Roboto Mono", "Liberation Mono", Menlo, Consolas, monospace;
+  font-feature-settings: "calt", "liga";
+}
+
+/* Subtle focus ring matching the accent token. */
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
