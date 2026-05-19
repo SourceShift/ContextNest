@@ -126,12 +126,15 @@ impl LlmService {
     ///    else if `OPENAI_API_KEY` is set → `openai`;
     ///    else if `GOOGLE_API_KEY` is set → `google`;
     ///    else → `Disabled`.
+    ///
     /// ### Optional overrides
+    ///
     /// * `CONTEXTNEST_LLM_BASE_URL` — overrides the provider's default API
     ///   endpoint, enabling z.ai GLM, LiteLLM proxies, or local Ollama
     ///   instances without any code change.
     /// * `CONTEXTNEST_LLM_MODEL` — overrides the default model id for the
     ///   selected provider.
+    ///
     /// No network call is made at construction time; the provider model is
     /// configured but the first actual HTTP call happens on the first
     /// `complete` invocation.

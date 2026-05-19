@@ -1,15 +1,20 @@
 //! Session-to-fragment index for the seven-tool memory API.
+//!
 //! ## Why this exists
+//!
 //! The canonical [`MemoryAttractorManager`] is deliberately session-agnostic:
 //! it tracks attractor basin dynamics and connection networks globally, not
 //! per-caller. That is the right abstraction for the consolidation layer, but
 //! the HTTP API layer needs to answer two questions the manager cannot:
+//!
 //! 1. "What fragment IDs belong to session X?" (for `retrieve` and `summarize`)
 //! 2. "Which session owns fragment F?" (for cross-session audit and `discard`
 //!    restore semantics)
+//!
 //! `SessionIndex` is that thin, session-aware overlay. It carries no attractor
 //! physics — it is purely an in-memory routing table that keeps three
 //! consistent hash maps across every mutating operation.
+//!
 //! ## Consistency contract
 //! The three maps (`active`, `deleted`, `reverse`) are **always written
 //! together** inside a single `write()` guard for any mutating operation. This

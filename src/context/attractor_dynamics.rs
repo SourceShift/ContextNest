@@ -3527,7 +3527,8 @@ mod tests {
             created_at: Utc::now(),
             last_activated: Utc::now(),
             activation_count: 1,
-            deleted_at: None,            delete_reason: None,
+            deleted_at: None,
+            delete_reason: None,
         };
 
         let basin_id = engine.create_attractor_basin(&pattern).unwrap();
@@ -3550,7 +3551,8 @@ mod tests {
             created_at: Utc::now(),
             last_activated: Utc::now(),
             activation_count: 1,
-            deleted_at: None,            delete_reason: None,
+            deleted_at: None,
+            delete_reason: None,
         };
 
         let basin_id = engine.create_attractor_basin(&pattern).unwrap();
@@ -3575,7 +3577,8 @@ mod tests {
             created_at: Utc::now(),
             last_activated: Utc::now(),
             activation_count: 1,
-            deleted_at: None,            delete_reason: None,
+            deleted_at: None,
+            delete_reason: None,
         };
 
         engine.create_attractor_basin(&pattern).unwrap();

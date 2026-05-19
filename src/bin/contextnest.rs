@@ -2,7 +2,7 @@
 //! Single command in v0.1.0:
 //! - `contextnest serve [--bind ADDR]` — start the HTTP server exposing the
 //!   seven-tool memory API (`/api/v1/tools/*`), health, and status endpoints.
-//! `field` / `test` / `status` subcommands were removed 
+//! `field` / `test` / `status` subcommands were removed
 //! after they were found to print "not wired up in this build" and exit 0
 //! silently — breaking CI scripts that probed the exit code. Re-introduce
 //! as feature-gated commands when implementations land.

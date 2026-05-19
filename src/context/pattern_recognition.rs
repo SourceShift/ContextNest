@@ -549,7 +549,7 @@ impl PatternRecognitionEngine {
         Ok(patterns)
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn recognize_patterns(
@@ -653,7 +653,7 @@ impl PatternRecognitionEngine {
         Ok(relationships)
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn detect_anomalies(
@@ -678,7 +678,7 @@ impl PatternRecognitionEngine {
         Ok(scores)
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn assess_field_health_impact(
@@ -716,7 +716,7 @@ impl PatternRecognitionEngine {
         Ok(())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn extract_features(&self, _pattern_data: &[f32]) -> ContextNestResult<Vec<FeatureVector>> {
@@ -724,7 +724,7 @@ impl PatternRecognitionEngine {
         Ok(Vec::new())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn extract_features_from_embedding(
@@ -735,7 +735,7 @@ impl PatternRecognitionEngine {
         Ok(Vec::new())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn classify_pattern(
@@ -749,7 +749,7 @@ impl PatternRecognitionEngine {
         })
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn update_template_from_example(
@@ -760,7 +760,7 @@ impl PatternRecognitionEngine {
         Ok(())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn update_classifiers(
@@ -772,7 +772,7 @@ impl PatternRecognitionEngine {
         Ok(())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn calculate_prediction_confidence(
@@ -797,7 +797,7 @@ impl PatternRecognitionEngine {
         Ok(similar)
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn calculate_feature_importance(
@@ -850,7 +850,7 @@ impl PatternRecognitionEngine {
         Ok(())
     }
 
-    /// # Placeholder 
+    /// # Placeholder
     /// Returns a constant / no-op result — NOT computed from inputs.
     /// Real implementation tracked in.
     fn learn_pattern_associations(&mut self, _instance: &PatternInstance) -> ContextNestResult<()> {
