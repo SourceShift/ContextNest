@@ -164,17 +164,36 @@ jobs:
 
       - name: Check documentation links
         run: |
-          # Check for broken internal links in markdown files
-          find . -name "*.md" -exec grep -l "\[\[.*\]\]" {} \; | while read file; do
-            echo "Checking $file for broken links..."
-            # Extract links and verify they exist
-            grep -o "\[\[.*\]\]" "$file" | sed 's/\[\[\(.*\)\]\]/\1/' | while read link; do
-              if [ ! -f "$link" ] && [ ! -f "${link}.md" ]; then
-                echo "Broken link in $file: $link"
-                exit 1
+          # Check for broken internal wiki-style `[[link]]` references in
+          # markdown files, but SKIP fenced code blocks — TOML's
+          # `[[table]]` array-of-tables and Rust's `[[T]]` slice-of-slice
+          # syntax look like wiki links but aren't.
+          #
+          # Use `git ls-files` (not `find`) so the check only looks at
+          # tracked files — vendor directories like `web/node_modules/`
+          # are gitignored and never trip this check, even when a
+          # contributor runs the workflow locally.
+          set -e
+          fail=0
+          while IFS= read -r file; do
+            # Strip fenced code blocks before searching.
+            content=$(awk '/^```/{in_code=!in_code; next} !in_code' "$file")
+            # Find every [[...]] outside code blocks.
+            links=$(printf '%s' "$content" | grep -oE '\[\[[^][]+\]\]' | sed 's/\[\[\(.*\)\]\]/\1/')
+            if [ -z "$links" ]; then
+              continue
+            fi
+            echo "Checking $file for broken wiki links..."
+            while IFS= read -r link; do
+              if [ -n "$link" ] && [ ! -f "$link" ] && [ ! -f "${link}.md" ]; then
+                echo "::error file=$file::Broken wiki link: $link"
+                fail=1
               fi
-            done
-          done
+            done <<EOF
+          $links
+          EOF
+          done < <(git ls-files '*.md')
+          exit $fail
 
       - name: Build documentation
         run: cargo doc --no-deps --document-private-items

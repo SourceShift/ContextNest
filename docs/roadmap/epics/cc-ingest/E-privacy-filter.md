@@ -26,19 +26,19 @@ Built-in patterns (always on):
 - AWS / GCP / GitHub / Anthropic / OpenAI tokens (well-known prefixes)
 - Email addresses (`--redact-emails` flag opt-in only, off by default)
 
-User-supplied patterns via `~/.contextnest/redact.toml`:
+User-supplied patterns via `~/.contextnest/redact.toml` — use the
+inline-table array form so docs CI's grep-based link checker doesn't
+false-positive on TOML's array-of-tables syntax:
 
 ```toml
-[[patterns]]
-name  = "internal_customer_id"
-regex = "CUST-[A-Z0-9]{8}"
-label = "customer_id"
-
-[[patterns]]
-name  = "api_key_format"
-regex = "sk-[a-zA-Z0-9]{32,}"
-label = "api_key"
+patterns = [
+    { name = "internal_customer_id", regex = "CUST-[A-Z0-9]{8}", label = "customer_id" },
+    { name = "api_key_format",       regex = "sk-[a-zA-Z0-9]{32,}",  label = "api_key" },
+]
 ```
+
+(The implementation accepts both inline-table and array-of-tables
+syntax — TOML treats them identically.)
 
 ## Why
 
