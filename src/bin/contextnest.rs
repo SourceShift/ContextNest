@@ -11,13 +11,16 @@ use clap::Parser;
 use contextnest::api::create_app;
 use contextnest::cli::{Cli, Commands, IngestSource};
 use contextnest::config::Config;
+use contextnest::inbox::{render_json, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
     discover_sessions, ingest_session_file, parse_since, DryRunSink, HttpSink, Sink, SinkReport,
 };
 use contextnest::services::ContextNestServices;
+use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -35,7 +38,165 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { bind } => serve(bind).await,
         Commands::Ingest { source } => ingest(source).await,
+        Commands::Inbox {
+            project,
+            urgency,
+            substrate,
+            session_id,
+            json,
+        } => inbox(project, urgency, substrate, session_id, json).await,
     }
+}
+
+/// Query the substrate for everything Claude is waiting on the user for,
+/// across one or every known session, and render an urgency-sorted list.
+///
+/// Algorithm:
+///
+/// 1. Determine which session_ids to scan:
+///    - If `--session-id` is set, use exactly that.
+///    - Else discover Claude Code sessions on disk (same path as `ingest`)
+///      and derive `cc-<8char>` substrate session_ids from each UUID.
+/// 2. For each session, run TWO retrieve calls in parallel:
+///    - `metadata_filter: {kind: "user_action"}` (optionally + urgency)
+///    - `metadata_filter: {kind: "decision", awaiting_decision: true}`
+/// 3. Parse hits via `InboxItem::from_hits`, aggregate, render.
+async fn inbox(
+    project: Option<String>,
+    urgency: Option<String>,
+    substrate: String,
+    session_id: Option<String>,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate --urgency early — bad input is a hard error so users
+    // notice typos.
+    if let Some(u) = urgency.as_deref() {
+        match u {
+            "now" | "soon" | "later" => {}
+            _ => {
+                return Err(
+                    format!("Invalid --urgency '{}'. Use one of: now, soon, later.", u).into(),
+                );
+            }
+        }
+    }
+
+    // Build the list of substrate session_ids to query.
+    let session_ids: Vec<String> = if let Some(sid) = session_id {
+        vec![sid]
+    } else {
+        // Discover on-disk Claude Code sessions and derive substrate ids.
+        let projects_root = default_projects_dir();
+        if !projects_root.exists() {
+            return Err(format!(
+                "No --session-id given and Claude Code projects directory not found at {}. \
+                 Pass --session-id <id> to scope the inbox query.",
+                projects_root.display()
+            )
+            .into());
+        }
+        let discovered = discover_sessions(&projects_root, project.as_deref(), None)?;
+        // Derive substrate session ids: cc-<8char> of each Claude Code UUID.
+        // Dedup in case multiple .jsonl files share a UUID prefix (unlikely
+        // but defensive).
+        let mut seen = HashSet::new();
+        discovered
+            .iter()
+            .filter_map(|s| {
+                if s.session_uuid.is_empty() {
+                    return None;
+                }
+                let cn_id = format!("cc-{}", &s.session_uuid[..s.session_uuid.len().min(8)]);
+                if seen.insert(cn_id.clone()) {
+                    Some(cn_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    if session_ids.is_empty() {
+        if json_mode {
+            println!("[]");
+        } else {
+            println!("📋 No sessions discovered. Run `contextnest ingest claude-code` first.");
+        }
+        return Ok(());
+    }
+
+    // For each session, query both user_actions and decisions. Run all
+    // queries with bounded concurrency so big inboxes don't blow up.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut all_items: Vec<InboxItem> = Vec::new();
+
+    for sid in &session_ids {
+        // user_actions
+        let mut filter = json!({"kind": "user_action"});
+        if let Some(u) = urgency.as_deref() {
+            filter["urgency"] = json!(u);
+        }
+        if let Some(items) = fetch_inbox_for(&client, &substrate, sid, &filter).await? {
+            all_items.extend(items);
+        }
+
+        // decisions (only if not filtering by an urgency other than "now"
+        // — decisions are always urgent so they'd be filtered out below
+        // by anything except urgency=now or no urgency filter)
+        if matches!(urgency.as_deref(), None | Some("now")) {
+            let dec_filter = json!({"kind": "decision", "awaiting_decision": true});
+            if let Some(items) = fetch_inbox_for(&client, &substrate, sid, &dec_filter).await? {
+                all_items.extend(items);
+            }
+        }
+    }
+
+    if json_mode {
+        println!("{}", render_json(&all_items)?);
+    } else {
+        print!("{}", render_text(&all_items));
+    }
+    Ok(())
+}
+
+/// One retrieve call for one session + one filter. Returns the parsed
+/// InboxItems on success, `None` for "session has no fragments" (HTTP
+/// 200 with empty hits). Errors bubble up as the caller's problem.
+async fn fetch_inbox_for(
+    client: &reqwest::Client,
+    substrate: &str,
+    session_id: &str,
+    metadata_filter: &Value,
+) -> Result<Option<Vec<InboxItem>>, Box<dyn std::error::Error>> {
+    let url = format!("{}/api/v1/tools/retrieve", substrate.trim_end_matches('/'));
+    let body = json!({
+        "query": "inbox", // semantic content doesn't matter — filter does the work
+        "top_k": 200,     // generous cap; the filter narrows the result set
+        "session_id": session_id,
+        "metadata_filter": metadata_filter,
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "inbox: /retrieve returned {} for session {}: {}",
+            status, session_id, body_text
+        )
+        .into());
+    }
+    let parsed: Value = resp.json().await?;
+    let hits = parsed
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(InboxItem::from_hits(&hits)))
 }
 
 /// Dispatch the `ingest` subcommand. Each adapter is a sibling under

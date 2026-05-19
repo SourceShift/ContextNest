@@ -43,6 +43,43 @@ pub enum Commands {
         #[command(subcommand)]
         source: IngestSource,
     },
+
+    /// Print an urgency-sorted action list for every session waiting on
+    /// the user. Queries the substrate's `/api/v1/tools/retrieve` with
+    /// metadata filters for `kind=user_action` and `kind=decision +
+    /// awaiting_decision=true`, groups by session, renders to the
+    /// terminal.
+    ///
+    /// Examples:
+    ///   contextnest inbox
+    ///   contextnest inbox --project ContextNest
+    ///   contextnest inbox --urgency now
+    ///   contextnest inbox --json
+    Inbox {
+        /// Substring-match the project cwd in metadata.project_cwd.
+        /// Case-insensitive. Omit to include every project.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only show items with this urgency. One of: `now`, `soon`,
+        /// `later`. Omit to show everything sorted with now first.
+        #[arg(long)]
+        urgency: Option<String>,
+
+        /// Substrate base URL. Default: `http://localhost:8080`.
+        #[arg(long, default_value = "http://localhost:8080")]
+        substrate: String,
+
+        /// Specific session_id to scope the inbox to. Omit to query
+        /// every session the substrate knows about.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Machine-readable JSON output instead of the terminal-styled
+        /// list. Suitable for `jq` / scripts / piping into other tools.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Sources the ingester can pull from. v0.2 phase 1 ships only the Claude

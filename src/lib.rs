@@ -29,6 +29,7 @@ pub mod config;
 pub mod context;
 pub mod domains;
 pub mod error;
+pub mod inbox; // Cross-session attention surface — what the user is waiting on.
 pub mod ingest; // Adapters that pull external session data (Claude Code, ...) into the substrate.
 pub mod memory; // Canonical attractor-based memory sub-engines.
 pub mod models;

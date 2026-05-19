@@ -140,6 +140,35 @@ metadata on every memory (`kind`, `urgency`, `awaiting_decision`,
 is what turns that stored metadata into queryable inbox surfaces
 without any new HTTP endpoint.
 
+#### Reading the inbox: `contextnest inbox`
+
+`contextnest inbox` is the canonical reader on top of the
+`metadata_filter` pattern above. It walks every discovered Claude Code
+session, runs the two filters (`kind=user_action` and `kind=decision +
+awaiting_decision=true`) against `/api/v1/tools/retrieve`, groups the
+results by session, and prints them sorted by urgency. No new endpoint,
+no new database — just a thin CLI over the substrate.
+
+```bash
+# All sessions, every urgency, grouped + sorted (now → soon → later):
+contextnest inbox
+
+# One project only:
+contextnest inbox --project ContextNest
+
+# Just the urgent ones:
+contextnest inbox --urgency now
+
+# One specific session:
+contextnest inbox --session-id cc-4c998114
+
+# Machine-readable (pipe into jq / scripts):
+contextnest inbox --json | jq '.[] | select(.urgency=="now")'
+```
+
+The CLI presumes the substrate runs at `http://localhost:8080`; override
+with `--substrate http://host:port` for non-default deployments.
+
 ### 2.3 `update` — mutate a stored attractor
 
 ```bash
