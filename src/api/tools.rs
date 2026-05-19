@@ -79,6 +79,21 @@ pub struct RetrieveRequest {
     pub top_k: usize,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Optional per-fragment metadata filter. When set, a fragment is
+    /// only returned if its stored metadata contains every key from this
+    /// map with the exact same value. Missing key on the fragment = no
+    /// match. Extra keys on the fragment = still matches (we don't
+    /// require full equality of the metadata map).
+    ///
+    /// Example: `{"kind": "decision", "awaiting_decision": true}` →
+    /// only returns memories whose metadata has BOTH kind=decision AND
+    /// awaiting_decision=true.
+    ///
+    /// Filtering happens AFTER similarity scoring against the canonical
+    /// fragments, BEFORE the top_k truncation — so top_k applies to the
+    /// filtered set, not the pre-filter universe.
+    #[serde(default)]
+    pub metadata_filter: Option<HashMap<String, serde_json::Value>>,
 }
 
 fn default_top_k() -> usize {
@@ -91,6 +106,11 @@ pub struct RetrieveHit {
     pub content: String,
     pub importance: f32,
     pub similarity: f32,
+    /// Stored metadata for this fragment, if any. Empty when no metadata
+    /// was supplied at store time. Lets consumers see what they matched
+    /// on + render UIs without a second request.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,6 +318,19 @@ pub async fn store(
         .await
         .insert(fragment_id.clone(), req.content);
 
+    // Save metadata sidecar so `retrieve` can filter by it. The metadata
+    // is what callers passed in `StoreRequest.metadata` — typically a
+    // `{kind, urgency, src_session, project_cwd, ...}` map from the
+    // Claude Code ingester (see docs/z-insight-schema.md), but the
+    // shape is opaque to the substrate.
+    if !req.metadata.is_empty() {
+        services
+            .fragment_metadata
+            .write()
+            .await
+            .insert(fragment_id.clone(), req.metadata);
+    }
+
     // Register session affinity. `add` is idempotent + acts as a restore path
     // for previously soft-deleted IDs (see SessionIndex docs).
     services.session_index.add(&session_id, &fragment_id).await;
@@ -361,22 +394,42 @@ pub async fn retrieve(
         hydrated.push((fragment, similarity));
     }
 
-    // Phase 2: single bulk text lookup. Lock window scales with hits, not the
-    // whole session.
+    // Phase 2: single bulk text + metadata lookup. Lock windows scale with
+    // hits, not the whole session. Reading text and metadata in lockstep
+    // because the metadata_filter check needs both maps available.
     let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
     let mut scored: Vec<RetrieveHit> = hydrated
         .into_iter()
-        .map(|(fragment, similarity)| {
+        .filter_map(|(fragment, similarity)| {
+            let fragment_meta = metadata.get(&fragment.id);
+
+            // Apply the metadata filter (if any) BEFORE we materialise the
+            // RetrieveHit — a fragment that doesn't match the filter never
+            // makes it into the result set, so `top_k` applies to the
+            // post-filter universe.
+            if let Some(filter) = req.metadata_filter.as_ref() {
+                let matches = match fragment_meta {
+                    Some(meta) => metadata_filter_matches(filter, meta),
+                    None => filter.is_empty(),
+                };
+                if !matches {
+                    return None;
+                }
+            }
+
             let content = texts.get(&fragment.id).cloned().unwrap_or_default();
-            RetrieveHit {
+            Some(RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
                 similarity,
-            }
+                metadata: fragment_meta.cloned().unwrap_or_default(),
+            })
         })
         .collect();
     drop(texts);
+    drop(metadata);
 
     // Sort by similarity desc, then importance desc as tiebreaker.
     scored.sort_by(|a, b| {
@@ -392,6 +445,22 @@ pub async fn retrieve(
     scored.truncate(req.top_k);
 
     (StatusCode::OK, Json(RetrieveResponse { hits: scored }))
+}
+
+/// True iff every `(key, value)` pair in `filter` is present in
+/// `fragment_meta` with an equal value. Missing key = no match.
+/// Extra keys on the fragment side = still matches (we don't require
+/// full-set equality).
+fn metadata_filter_matches(
+    filter: &HashMap<String, serde_json::Value>,
+    fragment_meta: &HashMap<String, serde_json::Value>,
+) -> bool {
+    filter.iter().all(|(k, expected)| {
+        fragment_meta
+            .get(k)
+            .map(|actual| actual == expected)
+            .unwrap_or(false)
+    })
 }
 
 /// POST /api/v1/tools/update — mutate an existing fragment's properties.

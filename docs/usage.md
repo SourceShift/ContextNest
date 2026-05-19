@@ -81,9 +81,64 @@ curl -s -X POST http://localhost:8080/api/v1/tools/retrieve \
 ```
 
 Returns up to `top_k` attractors ranked by activation score. Each entry
-includes the original content, the basin id, and the activation strength.
+includes the original content, the basin id, the activation strength, and
+the fragment's full stored metadata (when any was saved at store time).
 
 `top_k` defaults to 5 and caps at 50.
+
+#### Filtering by metadata
+
+`retrieve` supports an optional `metadata_filter` that restricts the
+result set to fragments whose stored metadata contains every key from
+the filter with the exact value:
+
+```bash
+# All "user_action" memories with urgency=now across this session —
+# the inbox query pattern.
+curl -s -X POST http://localhost:8080/api/v1/tools/retrieve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "what does Claude need from me?",
+    "top_k": 50,
+    "session_id": "cc-abc12345",
+    "metadata_filter": {
+      "kind": "user_action",
+      "urgency": "now"
+    }
+  }' | jq .
+
+# All open decisions across this project
+curl -s -X POST http://localhost:8080/api/v1/tools/retrieve \
+  -d '{
+    "query": "open decisions",
+    "top_k": 20,
+    "session_id": "cc-abc12345",
+    "metadata_filter": {
+      "kind": "decision",
+      "awaiting_decision": true
+    }
+  }' | jq .
+```
+
+Semantics:
+
+- Filter values are compared with **exact equality** (string == string,
+  number == number, boolean == boolean). No range / regex / set
+  matching today.
+- A fragment must contain **every** filter key with a matching value
+  ("AND" across the keys). Fragments missing any key are filtered out.
+- `metadata_filter: {}` (empty map) is a no-op — every fragment passes.
+- Filtering happens **after similarity scoring** but **before `top_k`
+  truncation**, so `top_k` applies to the post-filter universe.
+- The metadata field on each `RetrieveHit` carries the full stored
+  metadata so consumers see what they matched on without a second
+  request.
+
+The Claude Code ingester (`docs/z-insight-schema.md`) stores rich
+metadata on every memory (`kind`, `urgency`, `awaiting_decision`,
+`task_status`, `src_session`, `project_cwd`, …). The metadata filter
+is what turns that stored metadata into queryable inbox surfaces
+without any new HTTP endpoint.
 
 ### 2.3 `update` — mutate a stored attractor
 
