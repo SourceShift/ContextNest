@@ -10,6 +10,12 @@ Curated entry points for understanding and using ContextNest.
 - [**usage.md**](usage.md) — practical how-to with copy-paste curl examples
   for every tool, end-to-end demo, integration recipes (Python, bash,
   Claude Code hooks), and a troubleshooting matrix.
+- [**extensibility.md**](extensibility.md) — plug any LLM or embedding
+  provider. Built-in support for Anthropic / OpenAI / Google plus any
+  OpenAI-shaped endpoint (Ollama, LiteLLM, vLLM, OpenRouter, Together,
+  Groq, Mistral) and three embedding providers (Ollama, Hugging Face,
+  generic HTTP for Voyage / Cohere / Jina / Mistral / TEI). Custom
+  provider trait for anything else.
 
 ## Repository docs
 
