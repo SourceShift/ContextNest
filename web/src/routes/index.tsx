@@ -12,6 +12,7 @@ import {
 } from '@/components/atoms';
 import type { InboxItemMock } from '@/lib/mock-data';
 import { useInbox } from '@/hooks/useInbox';
+import { useKnownProjects } from '@/hooks/useSessions';
 
 export const Route = createFileRoute('/')({
   component: InboxPage,
@@ -65,7 +66,20 @@ function InboxPage() {
     return { grouped: g, sessionOrder: order };
   }, [filteredItems]);
 
-  const projects = useMemo(() => Array.from(new Set(inboxData.map((i) => i.project))), [inboxData]);
+  // Projects in the dropdown derive from EVERY known session (not just
+  // sessions that have inbox-eligible items), so a project with no open
+  // user_actions / awaiting_decisions still appears as a filter option.
+  // Falls back to inbox-derived projects if the /api/v1/sessions call
+  // fails for any reason.
+  const knownProjects = useKnownProjects();
+  const inboxProjects = useMemo(
+    () => Array.from(new Set(inboxData.map((i) => i.project))),
+    [inboxData],
+  );
+  const projects = useMemo(
+    () => Array.from(new Set([...knownProjects, ...inboxProjects])).sort(),
+    [knownProjects, inboxProjects],
+  );
 
   const ack = (id: string) => setAckedIds((prev) => new Set(prev).add(id));
 
