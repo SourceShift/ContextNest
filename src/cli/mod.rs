@@ -127,16 +127,27 @@ pub enum IngestSource {
 
         /// Append the four real-time hooks (SessionStart,
         /// UserPromptSubmit, Stop, TaskCompleted) to
-        /// `~/.claude/settings.json`, pointing at `<substrate>/api/v1/cc/hook/*`.
-        /// Backs up the existing settings file with a `.bak-<ts>` suffix
-        /// before writing, and APPENDS — existing hooks (z-dashboard,
-        /// claude-status-writer, etc.) stay in place. Re-running is
-        /// idempotent: existing ContextNest hook entries are detected by
-        /// their `cc/hook/` URL substring and skipped.
-        /// When this flag is set, no ingest happens — the command exits
-        /// after writing settings.
+        /// `~/.claude/settings.json` (user-level), pointing at
+        /// `<substrate>/api/v1/cc/hook/*`. Backs up the existing settings
+        /// file with a `.bak-<ts>` suffix before writing, and APPENDS —
+        /// existing hooks (z-dashboard, claude-status-writer, etc.) stay
+        /// in place. Re-running is idempotent: existing ContextNest hook
+        /// entries are detected by their `cc/hook/` URL substring and
+        /// skipped. When this flag is set, no ingest happens — the
+        /// command exits after writing settings.
         #[arg(long)]
         install_hooks: bool,
+
+        /// Project root path to ALSO install hooks into, as a sibling to
+        /// the user-level install. Repeatable. For each path, hooks are
+        /// appended to `<path>/.claude/settings.local.json` (created if
+        /// missing). Use this when a project defines its own hooks for
+        /// SessionStart/UserPromptSubmit/Stop/TaskCompleted that would
+        /// otherwise shadow the user-level ContextNest entries.
+        /// Example: --install-hooks --project-path ~/code/researcher
+        ///                          --project-path ~/code/other-proj
+        #[arg(long = "project-path", action = clap::ArgAction::Append)]
+        project_paths: Vec<PathBuf>,
     },
 }
 
