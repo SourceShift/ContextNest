@@ -1,20 +1,12 @@
-import type {
-  HealthResponse,
-  RetrieveResponse,
-  StatusResponse,
-} from './types';
+import type { HealthResponse, RetrieveResponse, StatusResponse } from './types';
 
-const SUBSTRATE_URL =
-  import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
+const SUBSTRATE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
 
 const trimmed = SUBSTRATE_URL.replace(/\/+$/, '');
 
 export const substrateUrl = trimmed;
 
-async function request<T>(
-  path: string,
-  init?: RequestInit & { json?: unknown },
-): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const { json, ...rest } = init ?? {};
   const res = await fetch(`${trimmed}${path}`, {
     ...rest,
@@ -63,8 +55,8 @@ export const api = {
     session_id?: string;
     metadata?: Record<string, unknown>;
   }) =>
-    request<{ attractor_id: string | null; stored: boolean }>(
-      '/api/v1/tools/store',
-      { method: 'POST', json: params },
-    ),
+    request<{ attractor_id: string | null; stored: boolean }>('/api/v1/tools/store', {
+      method: 'POST',
+      json: params,
+    }),
 };

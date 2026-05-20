@@ -143,3 +143,4 @@ hive-mind-prompt-*.txt
 .agentflow/tmp/
 .agentflow/mini-orch/scripts/cl_*.sh
 !.agentflow/mini-orch/scripts/cl_*.example.sh
+design/

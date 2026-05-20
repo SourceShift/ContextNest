@@ -1,30 +1,74 @@
 import { Link, useRouterState } from '@tanstack/react-router';
-import {
-  Inbox,
-  History,
-  Search,
-  Workflow,
-  Wrench,
-  Settings2,
-} from 'lucide-react';
 
-import { Logo } from './Logo';
-import { cn } from '@/lib/cn';
+import { BrandMark, Icon } from './atoms';
+
+type NavKey = 'inbox' | 'sessions' | 'search' | 'phases' | 'field' | 'tools' | 'substrate';
 
 type NavItem = {
-  to: '/' | '/sessions' | '/search' | '/phases' | '/tools' | '/substrate';
-  icon: typeof Inbox;
+  k: NavKey;
+  to: '/' | '/sessions' | '/search' | '/phases' | '/field' | '/tools' | '/substrate';
   label: string;
-  shortcut: string;
+  icon: React.ReactNode;
+  kbd: string;
+  count?: number;
+  urgent?: boolean;
 };
 
 const NAV: NavItem[] = [
-  { to: '/', icon: Inbox, label: 'Inbox', shortcut: 'g i' },
-  { to: '/sessions', icon: History, label: 'Sessions', shortcut: 'g s' },
-  { to: '/search', icon: Search, label: 'Search', shortcut: 'g /' },
-  { to: '/phases', icon: Workflow, label: 'Phases', shortcut: 'g p' },
-  { to: '/tools', icon: Wrench, label: 'Tools', shortcut: 'g t' },
-  { to: '/substrate', icon: Settings2, label: 'Substrate', shortcut: 'g o' },
+  {
+    k: 'inbox',
+    to: '/',
+    label: 'Inbox',
+    icon: <Icon.Inbox className="nav-icon" />,
+    kbd: 'g i',
+    count: 4,
+    urgent: true,
+  },
+  {
+    k: 'sessions',
+    to: '/sessions',
+    label: 'Sessions',
+    icon: <Icon.List className="nav-icon" />,
+    kbd: 'g s',
+    count: 6,
+  },
+  {
+    k: 'search',
+    to: '/search',
+    label: 'Search',
+    icon: <Icon.Search className="nav-icon" />,
+    kbd: 'g /',
+  },
+  {
+    k: 'phases',
+    to: '/phases',
+    label: 'Phases',
+    icon: <Icon.Layers className="nav-icon" />,
+    kbd: 'g p',
+    count: 22,
+  },
+  {
+    k: 'field',
+    to: '/field',
+    label: 'Field',
+    icon: <Icon.Atom className="nav-icon" />,
+    kbd: 'g f',
+    count: 38,
+  },
+  {
+    k: 'tools',
+    to: '/tools',
+    label: 'Tools',
+    icon: <Icon.Terminal className="nav-icon" />,
+    kbd: 'g t',
+  },
+  {
+    k: 'substrate',
+    to: '/substrate',
+    label: 'Substrate',
+    icon: <Icon.Cpu className="nav-icon" />,
+    kbd: 'g o',
+  },
 ];
 
 export function Sidebar() {
@@ -32,62 +76,54 @@ export function Sidebar() {
   const pathname = location.pathname;
 
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-[--color-border] bg-[--color-surface]">
-      <div className="flex items-center gap-2 px-4 py-5">
-        <Logo className="text-[--color-accent]" />
-        <span className="text-base font-semibold tracking-tight">
-          ContextNest
-        </span>
+    <aside className="sidebar" role="navigation">
+      <div className="sidebar-brand">
+        <BrandMark size={22} />
+        <div>
+          <div className="sidebar-brand-text">ContextNest</div>
+          <div className="sidebar-brand-sub">v0.2.0-rc.3</div>
+        </div>
       </div>
+      <div className="sidebar-section-label">Views</div>
+      {NAV.map((it) => {
+        const active = it.to === '/' ? pathname === '/' : pathname.startsWith(it.to);
+        return (
+          <Link
+            key={it.k}
+            to={it.to}
+            className={`nav-item${active ? ' active' : ''}${
+              it.k === 'inbox' && it.urgent ? ' has-urgent' : ''
+            }`}
+          >
+            {it.icon}
+            <span>{it.label}</span>
+            {it.count !== undefined ? (
+              <span className="nav-count">{it.count}</span>
+            ) : (
+              <span className="nav-kbd">{it.kbd}</span>
+            )}
+          </Link>
+        );
+      })}
 
-      <nav className="flex flex-col gap-1 px-2">
-        {NAV.map((item) => {
-          const active =
-            item.to === '/'
-              ? pathname === '/'
-              : pathname.startsWith(item.to);
-          const Icon = item.icon;
-          return (
-            <Link
-              key={item.to}
-              to={item.to}
-              className={cn(
-                'group flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors',
-                active
-                  ? 'bg-[--color-surface-2] text-[--color-ink]'
-                  : 'text-[--color-ink-muted] hover:bg-[--color-surface-1] hover:text-[--color-ink]',
-              )}
-            >
-              <Icon className="size-4 shrink-0" />
-              <span className="flex-1">{item.label}</span>
-              <span
-                className={cn(
-                  'mono text-[10px] tracking-wider transition-opacity',
-                  active
-                    ? 'text-[--color-ink-dim]'
-                    : 'text-[--color-ink-faint] opacity-0 group-hover:opacity-100',
-                )}
-              >
-                {item.shortcut}
-              </span>
-            </Link>
-          );
-        })}
-      </nav>
-
-      <div className="mt-auto px-4 py-4 text-[10px] text-[--color-ink-dim]">
-        <div className="mono">v0.1.0</div>
-        <div className="mono opacity-60">{substrateOrigin()}</div>
+      <div className="sidebar-footer">
+        <div className="row">
+          <span>origin</span>
+          <span className="v">localhost:28080</span>
+        </div>
+        <div className="row">
+          <span>fragments</span>
+          <span className="v">619</span>
+        </div>
+        <div className="row">
+          <span>embed</span>
+          <span className="v">tf-idf · 256d</span>
+        </div>
+        <div className="row" style={{ marginTop: 4, color: 'var(--ink-faint)' }}>
+          <span>↑↓ select</span>
+          <span>↵ open</span>
+        </div>
       </div>
     </aside>
   );
-}
-
-function substrateOrigin(): string {
-  const url = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
 }
