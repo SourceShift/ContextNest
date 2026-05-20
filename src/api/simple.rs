@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::services::ServiceContainer;
+use crate::api::sessions;
 use crate::api::tools;
 use crate::services::ContextNestServices;
 
@@ -26,6 +27,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     // an Extension so handlers can access it without changing the
     // router's State<S> signature.
     let cc_hooks_router = cc_hooks::create_cc_hooks_router();
+    let sessions_router = sessions::create_sessions_router();
     let session_tracker = Arc::new(SessionTracker::new());
 
     let base_router = Router::new()
@@ -33,6 +35,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .route("/api/status", get(status_check))
         .merge(tools_router)
         .merge(cc_hooks_router)
+        .merge(sessions_router)
         .layer(Extension(session_tracker))
         .with_state(services);
 

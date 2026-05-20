@@ -13,6 +13,7 @@ pub mod cc_hooks;
 pub mod middleware;
 pub mod server;
 pub mod services;
+pub mod sessions;
 pub mod simple;
 pub mod tools;
 
@@ -22,6 +23,7 @@ pub mod tests;
 pub use cc_hooks::{create_cc_hooks_router, HookPayload, SessionTracker};
 pub use middleware::{apply_middleware, build_middleware_stack, MiddlewareStack};
 pub use server::{ApiRequest, ApiResponse, ContextNestApiServer, ProcessedApiRequest, UserContext};
+pub use sessions::create_sessions_router;
 pub use simple::create_simple_app;
 pub use tools::create_tools_router;
 
