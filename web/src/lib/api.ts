@@ -1,4 +1,4 @@
-import type { HealthResponse, RetrieveResponse, StatusResponse } from './types';
+import type { HealthResponse, RetrieveResponse, SessionListResponse, StatusResponse } from './types';
 
 const SUBSTRATE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
 
@@ -48,6 +48,8 @@ export const api = {
       method: 'POST',
       json: { top_k: 50, ...params },
     }),
+
+  sessions: () => request<SessionListResponse>('/api/v1/sessions', { method: 'GET' }),
 
   store: (params: {
     content: string;

@@ -16,7 +16,12 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5175,
+    port: 5057,
+    strictPort: true,
+    host: '127.0.0.1',
+  },
+  preview: {
+    port: 5057,
     strictPort: true,
     host: '127.0.0.1',
   },

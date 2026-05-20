@@ -49,3 +49,15 @@ export type StatusResponse = {
   name: string;
   description: string;
 };
+
+export type SessionListItem = {
+  id: string;
+  fragment_count: number;
+  project_cwd: string;
+  src_session_uuid: string;
+  last_ts: string | null;
+};
+
+export type SessionListResponse = {
+  sessions: SessionListItem[];
+};

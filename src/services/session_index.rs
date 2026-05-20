@@ -199,6 +199,26 @@ impl SessionIndex {
         let reverse = self.reverse.read().await;
         reverse.get(fragment_id).cloned()
     }
+
+    /// Return every session ID that has at least one entry in `active` **or**
+    /// `deleted` (i.e. the union of both maps' key sets). The result is
+    /// deduplicated and sorted lexicographically for stable iteration.
+    ///
+    /// The reverse map is intentionally **not** used here: it maps fragment →
+    /// session and would require an extra dedup pass over values. Scanning
+    /// `active` + `deleted` keys directly is O(S) where S is the number of
+    /// distinct sessions — exactly what the caller needs.
+    pub async fn list_all_sessions(&self) -> Vec<String> {
+        let active = self.active.read().await;
+        let deleted = self.deleted.read().await;
+
+        let mut sessions: std::collections::HashSet<String> = active.keys().cloned().collect();
+        sessions.extend(deleted.keys().cloned());
+
+        let mut result: Vec<String> = sessions.into_iter().collect();
+        result.sort();
+        result
+    }
 }
 
 impl Default for SessionIndex {
