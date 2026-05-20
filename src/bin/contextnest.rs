@@ -18,7 +18,7 @@ use contextnest::ingest::claude_code::{
 use contextnest::services::ContextNestServices;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
@@ -211,6 +211,7 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
             substrate,
             projects_dir,
             install_hooks,
+            project_paths,
         } => {
             if install_hooks {
                 // --install-hooks is a one-shot configuration write —
@@ -218,28 +219,73 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
                 // accidentally start a transcript scan they didn't ask
                 // for. Errors here are user-facing (likely a bad path
                 // or unreadable settings.json), so surface them clearly.
-                install_cc_hooks(&substrate)?;
+                install_cc_hooks(&substrate, &project_paths)?;
                 return Ok(());
+            }
+            if !project_paths.is_empty() {
+                return Err("--project-path requires --install-hooks (the flag is meaningful only when installing hooks).".into());
             }
             ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await
         }
     }
 }
 
-/// Write the four real-time hooks (SessionStart, UserPromptSubmit,
-/// Stop, TaskCompleted) into `~/.claude/settings.json`, pointing each
-/// at `<substrate>/api/v1/cc/hook/<event>`. Backs the existing file up
-/// with a `.bak-<unix-ts>` suffix before writing, and is idempotent —
-/// existing entries whose command contains `/api/v1/cc/hook/` are
-/// detected and skipped so re-running doesn't create duplicates.
-fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+/// Install the four real-time hooks (SessionStart, UserPromptSubmit,
+/// Stop, TaskCompleted) into the user-level Claude settings AND into
+/// every explicitly-named project's local settings. Each target file is
+/// backed up before write; the merge is idempotent (existing entries
+/// detected by their `cc/hook/` URL substring are skipped).
+///
+/// Project paths are explicit — there is no filesystem scan. This is a
+/// deliberate trust boundary: ContextNest never writes to a project's
+/// settings file you haven't pointed it at.
+fn install_cc_hooks(
+    substrate: &str,
+    project_paths: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var_os("HOME")
         .ok_or("install-hooks: $HOME is not set; cannot locate ~/.claude/settings.json")?;
-    let settings_path = PathBuf::from(home).join(".claude/settings.json");
+    let user_settings = PathBuf::from(home).join(".claude/settings.json");
 
-    let existing_text = match std::fs::read_to_string(&settings_path) {
+    let mut targets: Vec<(String, PathBuf)> = Vec::with_capacity(1 + project_paths.len());
+    targets.push(("user".into(), user_settings));
+    for p in project_paths {
+        let project_settings = p.join(".claude/settings.local.json");
+        targets.push((format!("project {}", p.display()), project_settings));
+    }
+
+    let mut any_change = false;
+    for (label, settings_path) in &targets {
+        match install_to_target(substrate, label, settings_path)? {
+            HookInstallOutcome::Wrote => {
+                any_change = true;
+            }
+            HookInstallOutcome::AlreadyInstalled => {}
+        }
+    }
+
+    if !any_change {
+        println!("All ContextNest hooks already present in every target. Nothing to do.");
+    }
+    Ok(())
+}
+
+enum HookInstallOutcome {
+    Wrote,
+    AlreadyInstalled,
+}
+
+/// Append ContextNest hook entries to one settings file. Creates the
+/// file (and its parent dir) if missing. Backs up any pre-existing
+/// content with a `.bak-<unix-ts>` suffix before writing.
+fn install_to_target(
+    substrate: &str,
+    label: &str,
+    settings_path: &Path,
+) -> Result<HookInstallOutcome, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let existing_text = match std::fs::read_to_string(settings_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
         Err(e) => return Err(format!("read {}: {}", settings_path.display(), e).into()),
@@ -251,19 +297,27 @@ fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if added.is_empty() {
         println!(
-            "All four ContextNest hooks already present in {}. Nothing to do.",
+            "[{}] All four ContextNest hooks already present in {}. Skipping.",
+            label,
             settings_path.display()
         );
-        return Ok(());
+        return Ok(HookInstallOutcome::AlreadyInstalled);
     }
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup_path = settings_path.with_extension(format!("json.bak-{}", ts));
+    let backup_path = settings_path.with_extension(format!(
+        "{}.bak-{}",
+        settings_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("json"),
+        ts
+    ));
     if settings_path.exists() {
-        std::fs::copy(&settings_path, &backup_path)
+        std::fs::copy(settings_path, &backup_path)
             .map_err(|e| format!("backup to {}: {}", backup_path.display(), e))?;
     }
 
@@ -271,26 +325,29 @@ fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&settings_path, format!("{}\n", pretty))
+    std::fs::write(settings_path, format!("{}\n", pretty))
         .map_err(|e| format!("write {}: {}", settings_path.display(), e))?;
 
     println!(
-        "Installed ContextNest hooks into {}",
+        "[{}] Installed ContextNest hooks into {}",
+        label,
         settings_path.display()
     );
     if backup_path.exists() {
-        println!("Previous file backed up to       {}", backup_path.display());
+        println!(
+            "        Previous file backed up to {}",
+            backup_path.display()
+        );
     }
-    println!("Added entries:");
     for ev in &added {
         println!(
-            "  {:<22} -> {}/api/v1/cc/hook/{}",
+            "        + {:<22} -> {}/api/v1/cc/hook/{}",
             ev,
             substrate.trim_end_matches('/'),
             cc_hook_path_segment(ev)
         );
     }
-    Ok(())
+    Ok(HookInstallOutcome::Wrote)
 }
 
 /// Merge ContextNest hook entries into a settings JSON value. Returns
@@ -324,9 +381,15 @@ fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'sta
     let mut added: Vec<&'static str> = Vec::new();
     for (event_name, path_seg) in EVENTS {
         let url = format!("{}/api/v1/cc/hook/{}", substrate, path_seg);
+        // Drain stdin into a tempfile BEFORE backgrounding the curl.
+        // The naive `curl --data-binary @- &` pattern races: bash
+        // backgrounds curl before it has read stdin, the parent sh
+        // exits, the pipe closes, curl reads zero bytes, the substrate
+        // sees an empty POST and returns 400. This tempfile dance
+        // guarantees the body is fully captured before the parent shell
+        // returns control to Claude.
         let cmd = format!(
-            "curl -s -m 1 -X POST {} -H 'content-type: application/json' --data-binary @- &",
-            url
+            r#"F=$(mktemp /tmp/cnhk-XXXXXX.json); cat > "$F"; (curl -s -m 1 -X POST {url} -H "content-type: application/json" --data-binary @"$F" >/dev/null 2>&1; rm -f "$F") &"#,
         );
 
         let entries = hooks_obj
