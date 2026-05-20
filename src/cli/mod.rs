@@ -124,6 +124,19 @@ pub enum IngestSource {
         /// Override the discovery root. Default: `~/.claude/projects/`.
         #[arg(long)]
         projects_dir: Option<PathBuf>,
+
+        /// Append the four real-time hooks (SessionStart,
+        /// UserPromptSubmit, Stop, TaskCompleted) to
+        /// `~/.claude/settings.json`, pointing at `<substrate>/api/v1/cc/hook/*`.
+        /// Backs up the existing settings file with a `.bak-<ts>` suffix
+        /// before writing, and APPENDS — existing hooks (z-dashboard,
+        /// claude-status-writer, etc.) stay in place. Re-running is
+        /// idempotent: existing ContextNest hook entries are detected by
+        /// their `cc/hook/` URL substring and skipped.
+        /// When this flag is set, no ingest happens — the command exits
+        /// after writing settings.
+        #[arg(long)]
+        install_hooks: bool,
     },
 }
 

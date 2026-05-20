@@ -30,7 +30,7 @@ use std::time::SystemTime;
 
 pub use event::{extract_zinsight_blocks, parse_session_file, RawEvent, SessionMetadata};
 pub use extractor::{extract_memories, MemoryKind, MemoryRecord};
-pub use sink::{DryRunSink, HttpSink, Sink, SinkReport};
+pub use sink::{DryRunSink, HttpSink, ServicesSink, Sink, SinkReport};
 
 /// One discovered Claude Code session on disk.
 #[derive(Debug, Clone)]

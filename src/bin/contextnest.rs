@@ -210,7 +210,171 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
             dry_run,
             substrate,
             projects_dir,
-        } => ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await,
+            install_hooks,
+        } => {
+            if install_hooks {
+                // --install-hooks is a one-shot configuration write —
+                // it short-circuits the ingest path so the user doesn't
+                // accidentally start a transcript scan they didn't ask
+                // for. Errors here are user-facing (likely a bad path
+                // or unreadable settings.json), so surface them clearly.
+                install_cc_hooks(&substrate)?;
+                return Ok(());
+            }
+            ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await
+        }
+    }
+}
+
+/// Write the four real-time hooks (SessionStart, UserPromptSubmit,
+/// Stop, TaskCompleted) into `~/.claude/settings.json`, pointing each
+/// at `<substrate>/api/v1/cc/hook/<event>`. Backs the existing file up
+/// with a `.bak-<unix-ts>` suffix before writing, and is idempotent —
+/// existing entries whose command contains `/api/v1/cc/hook/` are
+/// detected and skipped so re-running doesn't create duplicates.
+fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let home = std::env::var_os("HOME")
+        .ok_or("install-hooks: $HOME is not set; cannot locate ~/.claude/settings.json")?;
+    let settings_path = PathBuf::from(home).join(".claude/settings.json");
+
+    let existing_text = match std::fs::read_to_string(&settings_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(e) => return Err(format!("read {}: {}", settings_path.display(), e).into()),
+    };
+    let existing: Value = serde_json::from_str(&existing_text)
+        .map_err(|e| format!("parse {}: {}", settings_path.display(), e))?;
+
+    let (updated, added) = merge_cc_hook_entries(&existing, substrate);
+
+    if added.is_empty() {
+        println!(
+            "All four ContextNest hooks already present in {}. Nothing to do.",
+            settings_path.display()
+        );
+        return Ok(());
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup_path = settings_path.with_extension(format!("json.bak-{}", ts));
+    if settings_path.exists() {
+        std::fs::copy(&settings_path, &backup_path)
+            .map_err(|e| format!("backup to {}: {}", backup_path.display(), e))?;
+    }
+
+    let pretty = serde_json::to_string_pretty(&updated)?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&settings_path, format!("{}\n", pretty))
+        .map_err(|e| format!("write {}: {}", settings_path.display(), e))?;
+
+    println!(
+        "Installed ContextNest hooks into {}",
+        settings_path.display()
+    );
+    if backup_path.exists() {
+        println!("Previous file backed up to       {}", backup_path.display());
+    }
+    println!("Added entries:");
+    for ev in &added {
+        println!(
+            "  {:<22} -> {}/api/v1/cc/hook/{}",
+            ev,
+            substrate.trim_end_matches('/'),
+            cc_hook_path_segment(ev)
+        );
+    }
+    Ok(())
+}
+
+/// Merge ContextNest hook entries into a settings JSON value. Returns
+/// `(updated_value, events_appended)`. Pure function so it can be
+/// unit-tested without touching disk. Entries are detected by URL
+/// substring (`/api/v1/cc/hook/`) so a re-run after a substrate URL
+/// change still appends — that's intentional, so a user pointing
+/// at a new substrate gets a fresh entry next to the old one.
+fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'static str>) {
+    const EVENTS: &[(&str, &str)] = &[
+        ("SessionStart", "session_start"),
+        ("UserPromptSubmit", "user_prompt_submit"),
+        ("Stop", "stop"),
+        ("TaskCompleted", "task_completed"),
+    ];
+
+    let substrate = substrate.trim_end_matches('/').to_string();
+    let mut root = existing.clone();
+    if !root.is_object() {
+        root = json!({});
+    }
+    let root_obj = root.as_object_mut().expect("just ensured object");
+    let hooks_entry = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    if !hooks_entry.is_object() {
+        *hooks_entry = json!({});
+    }
+    let hooks_obj = hooks_entry.as_object_mut().expect("just ensured object");
+
+    let mut added: Vec<&'static str> = Vec::new();
+    for (event_name, path_seg) in EVENTS {
+        let url = format!("{}/api/v1/cc/hook/{}", substrate, path_seg);
+        let cmd = format!(
+            "curl -s -m 1 -X POST {} -H 'content-type: application/json' --data-binary @- &",
+            url
+        );
+
+        let entries = hooks_obj
+            .entry((*event_name).to_string())
+            .or_insert_with(|| json!([]));
+        if !entries.is_array() {
+            *entries = json!([]);
+        }
+        let arr = entries.as_array_mut().expect("just ensured array");
+
+        let already_present = arr.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .map(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| c.contains(&url))
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if already_present {
+            continue;
+        }
+
+        arr.push(json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": cmd
+                }
+            ]
+        }));
+        added.push(event_name);
+    }
+
+    (root, added)
+}
+
+fn cc_hook_path_segment(event_name: &str) -> &'static str {
+    match event_name {
+        "SessionStart" => "session_start",
+        "UserPromptSubmit" => "user_prompt_submit",
+        "Stop" => "stop",
+        "TaskCompleted" => "task_completed",
+        _ => "",
     }
 }
 
