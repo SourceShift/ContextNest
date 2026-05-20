@@ -1,9 +1,11 @@
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Extension, Router};
 use serde::Serialize;
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
+use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::services::ServiceContainer;
 use crate::api::tools;
 use crate::services::ContextNestServices;
@@ -19,10 +21,19 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     // Seven-tool memory API per OPEN_SOURCE_PLAN §4.2.
     let tools_router = tools::create_tools_router();
 
+    // Claude Code real-time hook receiver. Shares the same state type
+    // as the tools router; the per-session byte-offset tracker rides as
+    // an Extension so handlers can access it without changing the
+    // router's State<S> signature.
+    let cc_hooks_router = cc_hooks::create_cc_hooks_router();
+    let session_tracker = Arc::new(SessionTracker::new());
+
     let base_router = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/status", get(status_check))
         .merge(tools_router)
+        .merge(cc_hooks_router)
+        .layer(Extension(session_tracker))
         .with_state(services);
 
     info!("Core API initialized (domain-agnostic)");

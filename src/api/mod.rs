@@ -9,6 +9,7 @@ pub use crate::services::HealthStatus;
 // Domain-specific API modules moved to examples/domains/
 // Use route_registry for dynamic plugin-based routing
 
+pub mod cc_hooks;
 pub mod middleware;
 pub mod server;
 pub mod services;
@@ -18,6 +19,7 @@ pub mod tools;
 #[cfg(test)]
 pub mod tests;
 
+pub use cc_hooks::{create_cc_hooks_router, HookPayload, SessionTracker};
 pub use middleware::{apply_middleware, build_middleware_stack, MiddlewareStack};
 pub use server::{ApiRequest, ApiResponse, ContextNestApiServer, ProcessedApiRequest, UserContext};
 pub use simple::create_simple_app;

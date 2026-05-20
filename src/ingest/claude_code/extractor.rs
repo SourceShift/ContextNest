@@ -94,7 +94,7 @@ pub struct MemoryRecord {
 }
 
 impl MemoryRecord {
-    fn new(kind: MemoryKind, text: String, session_id_cn: String) -> Self {
+    pub fn new(kind: MemoryKind, text: String, session_id_cn: String) -> Self {
         Self {
             kind,
             text,
@@ -104,7 +104,7 @@ impl MemoryRecord {
         }
     }
 
-    fn with_meta(mut self, key: &str, value: Value) -> Self {
+    pub fn with_meta(mut self, key: &str, value: Value) -> Self {
         self.metadata.insert(key.to_string(), value);
         self
     }

@@ -251,6 +251,116 @@ impl Sink for DryRunSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ServicesSink — in-process sink for the real-time hook receiver
+// ---------------------------------------------------------------------------
+
+/// Writes records directly into a [`ContextNestServices`] container in the
+/// same process. Skips the HTTP round-trip that [`HttpSink`] uses and is
+/// the right choice when the caller already has a handle on the services
+/// (e.g. the hook receiver living inside the running substrate).
+///
+/// Semantics match the `/api/v1/tools/store` HTTP handler in
+/// `src/api/tools.rs`:
+/// 1. Generate an embedding for `record.text`
+/// 2. Build a [`MemoryFragment`], submit via `process_memories`
+/// 3. Insert text into `fragment_texts`, metadata into `fragment_metadata`
+/// 4. Register session affinity via `session_index`
+///
+/// Any failure at any stage flips the record into the `failed` count of
+/// the resulting [`SinkReport`] — never panics, never blocks the caller
+/// past the storage timeout already enforced by `process_memories`.
+pub struct ServicesSink {
+    services: crate::services::ContextNestServices,
+}
+
+impl ServicesSink {
+    pub fn new(services: crate::services::ContextNestServices) -> Self {
+        Self { services }
+    }
+}
+
+#[async_trait]
+impl Sink for ServicesSink {
+    async fn store(&self, record: &MemoryRecord) -> ContextNestResult<()> {
+        use crate::memory::attractors::memory_attractor_manager::{
+            MemoryProcessingRequest, ProcessingOptions, ProcessingPriority,
+        };
+        use crate::memory::attractors::MemoryFragment;
+        use std::collections::HashSet;
+
+        let embedding = self
+            .services
+            .embedding
+            .generate_embedding(&record.text)
+            .await
+            .map_err(|e| {
+                ContextNestError::Api(format!(
+                    "ServicesSink: embedding failed for kind={}: {}",
+                    record.kind.as_str(),
+                    e
+                ))
+            })?;
+
+        let now = chrono::Utc::now();
+        let fragment_id = uuid::Uuid::new_v4().to_string();
+        let fragment = MemoryFragment {
+            id: fragment_id.clone(),
+            content: embedding,
+            importance: record.importance,
+            created_at: now,
+            last_accessed: now,
+            attractor_basin_id: None,
+            connections: HashSet::new(),
+            confidence: record.importance,
+        };
+
+        let process_req = MemoryProcessingRequest {
+            id: format!("hook-store-{fragment_id}"),
+            fragments: vec![fragment],
+            options: ProcessingOptions {
+                enable_attractor_creation: true,
+                enable_reconstruction: false,
+                enable_gap_filling: false,
+                enable_connections: true,
+                quality_threshold: 0.1,
+                max_processing_time: std::time::Duration::from_secs(5),
+            },
+            priority: ProcessingPriority::Medium,
+            created_at: now,
+        };
+
+        self.services
+            .attractor_manager
+            .process_memories(process_req)
+            .await
+            .map_err(|e| {
+                ContextNestError::Api(format!("ServicesSink: process_memories failed: {e}"))
+            })?;
+
+        self.services
+            .fragment_texts
+            .write()
+            .await
+            .insert(fragment_id.clone(), record.text.clone());
+
+        if !record.metadata.is_empty() {
+            self.services
+                .fragment_metadata
+                .write()
+                .await
+                .insert(fragment_id.clone(), record.metadata.clone());
+        }
+
+        self.services
+            .session_index
+            .add(&record.session_id_cn, &fragment_id)
+            .await;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::extractor::{MemoryKind, MemoryRecord};
