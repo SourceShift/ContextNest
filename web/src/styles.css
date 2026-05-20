@@ -102,6 +102,17 @@ body {
   border-radius: 4px;
 }
 
+/* Anchor reset for routed links — the design uses non-anchor elements
+ * with onClick, but TanStack Router's <Link> renders as <a>. Without
+ * this reset, browser default underline + blue color leak through and
+ * read as visual noise (especially the underline looks like a faint
+ * border-bottom). Components that want link styling opt back in
+ * explicitly via inline color or a dedicated class. */
+.app a {
+  text-decoration: none;
+  color: inherit;
+}
+
 /* App shell */
 .app {
   display: grid;
@@ -171,6 +182,9 @@ body {
   font-size: 13px;
   line-height: 1;
   border: 1px solid transparent;
+  /* Port uses <a> (TanStack Link); reset default anchor styling so the
+   * label doesn't render with an underline that reads as a border-bottom. */
+  text-decoration: none;
 }
 .nav-item:hover {
   background: var(--surface-2);

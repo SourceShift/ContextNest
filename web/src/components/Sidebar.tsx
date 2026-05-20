@@ -1,6 +1,7 @@
 import { Link, useRouterState } from '@tanstack/react-router';
 
 import { BrandMark, Icon } from './atoms';
+import { MOCK } from '@/lib/mock-data';
 
 type NavKey = 'inbox' | 'sessions' | 'search' | 'phases' | 'field' | 'tools' | 'substrate';
 
@@ -14,6 +15,15 @@ type NavItem = {
   urgent?: boolean;
 };
 
+// Counts derive from MOCK so the sidebar stays consistent with the
+// data the routes render — match `design/app.jsx::counts`.
+const COUNTS = {
+  inbox: MOCK.inbox.length,
+  sessions: MOCK.sessions.length,
+  phases: MOCK.phases.length,
+  basins: 6,
+};
+
 const NAV: NavItem[] = [
   {
     k: 'inbox',
@@ -21,8 +31,8 @@ const NAV: NavItem[] = [
     label: 'Inbox',
     icon: <Icon.Inbox className="nav-icon" />,
     kbd: 'g i',
-    count: 4,
-    urgent: true,
+    count: COUNTS.inbox,
+    urgent: MOCK.inbox.some((i) => i.urgency === 'now'),
   },
   {
     k: 'sessions',
@@ -30,7 +40,7 @@ const NAV: NavItem[] = [
     label: 'Sessions',
     icon: <Icon.List className="nav-icon" />,
     kbd: 'g s',
-    count: 6,
+    count: COUNTS.sessions,
   },
   {
     k: 'search',
@@ -45,7 +55,7 @@ const NAV: NavItem[] = [
     label: 'Phases',
     icon: <Icon.Layers className="nav-icon" />,
     kbd: 'g p',
-    count: 22,
+    count: COUNTS.phases,
   },
   {
     k: 'field',
@@ -53,7 +63,7 @@ const NAV: NavItem[] = [
     label: 'Field',
     icon: <Icon.Atom className="nav-icon" />,
     kbd: 'g f',
-    count: 38,
+    count: COUNTS.basins,
   },
   {
     k: 'tools',
