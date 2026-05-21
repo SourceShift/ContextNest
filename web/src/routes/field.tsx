@@ -6,7 +6,7 @@ import { useFieldData } from '@/hooks/useFieldData';
 import { useSessions } from '@/hooks/useSessions';
 import type { FieldFragment } from '@/hooks/useFieldData';
 import { cosineSimilarity } from '@/lib/pca';
-import type { BasinSummary } from '@/lib/types';
+import type { BasinSummary, SessionListItem } from '@/lib/types';
 
 export const Route = createFileRoute('/field')({
   component: FieldPage,
@@ -588,38 +588,12 @@ function FieldPage() {
         >
           session <span style={{ textTransform: 'none' }}>(optional)</span>
         </label>
-        <select
-          value={focusedSession ?? ''}
-          onChange={(e) =>
-            setSessionFilter(e.target.value || undefined)
-          }
-          className="mono"
-          style={{
-            background: 'var(--surface-2)',
-            color: 'var(--ink)',
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-            padding: '5px 10px',
-            fontSize: 12,
-            minWidth: 280,
-          }}
-        >
-          <option value="">
-            all {sessionOptions.length} session
-            {sessionOptions.length === 1 ? '' : 's'}
-            {focusedProject ? ` in "${focusedProject}"` : ''}
-          </option>
-          {sessionOptions.map((s) => {
-            const cwd = s.project_cwd ?? '';
-            const proj =
-              cwd.trim().replace(/\/+$/, '').split('/').pop() || '?';
-            return (
-              <option key={s.id} value={s.id}>
-                {s.id} · {proj} · {s.fragment_count} frags
-              </option>
-            );
-          })}
-        </select>
+        <SessionPicker
+          sessions={sessionOptions}
+          value={focusedSession}
+          onChange={setSessionFilter}
+          projectLabel={focusedProject}
+        />
 
         {(focusedProject || focusedSession) && (
           <button
@@ -1596,6 +1570,270 @@ function FieldTooltip({
       <div className="mono dim" style={{ fontSize: 10, marginTop: 6 }}>
         {fragment.session_id} · {fragment.project}
       </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// SessionPicker — searchable combobox for the session filter
+// =============================================================================
+//
+// Replaces the native <select> for the session dropdown because:
+//
+// 1. 100+ sessions is too many to scroll. Typing to filter is the only
+//    usable interaction at that scale.
+// 2. The substrate's internal `cc-<8char>` is opaque; users routinely
+//    have the full Claude Code UUID in their hand (from `~/.claude/
+//    projects/.../<uuid>.jsonl`) and want to paste it. Showing the
+//    full UUID as the visible label and accepting it as a search
+//    string solves both problems.
+//
+// Implementation is a deliberately small dependency-free combobox:
+// input + popover list + keyboard nav + outside-click close. ~150 LOC.
+// If we end up needing this elsewhere (folder picker, tools page, …)
+// it gets extracted to web/src/components/SearchableSelect.tsx; right
+// now it's the only consumer.
+type SessionPickerProps = {
+  sessions: SessionListItem[];
+  value: string | undefined; // selected cc-id (substrate short form)
+  onChange: (id: string | undefined) => void;
+  projectLabel: string | undefined; // for the empty-state placeholder
+};
+
+function basenameOf(p: string | null | undefined): string {
+  if (!p) return '?';
+  const segs = p.replace(/\/+$/, '').split('/');
+  return segs[segs.length - 1] || '?';
+}
+
+function SessionPicker({
+  sessions,
+  value,
+  onChange,
+  projectLabel,
+}: SessionPickerProps) {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Filter sessions by query — matches the full UUID, the cc-<8char>
+  // short id, and the project basename. Case-insensitive substring.
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter((s) => {
+      const uuid = (s.src_session_uuid ?? '').toLowerCase();
+      const cc = s.id.toLowerCase();
+      const proj = basenameOf(s.project_cwd).toLowerCase();
+      return uuid.includes(q) || cc.includes(q) || proj.includes(q);
+    });
+  }, [sessions, query]);
+
+  // Reset highlight whenever the filtered list changes.
+  useEffect(() => {
+    setHighlight(0);
+  }, [filtered.length]);
+
+  // Keep the highlighted row scrolled into view (only when open).
+  useEffect(() => {
+    if (!open || !listRef.current) return;
+    const node = listRef.current.querySelector<HTMLDivElement>(
+      `[data-session-row="${highlight}"]`,
+    );
+    node?.scrollIntoView({ block: 'nearest' });
+  }, [highlight, open]);
+
+  // Close on outside click.
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (!wrapperRef.current) return;
+      if (!wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery('');
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  const selected = value ? sessions.find((s) => s.id === value) : undefined;
+  const placeholder = selected
+    ? `${selected.src_session_uuid || selected.id} · ${basenameOf(selected.project_cwd)} · ${selected.fragment_count} frags`
+    : `all ${sessions.length} session${sessions.length === 1 ? '' : 's'}${projectLabel ? ` in "${projectLabel}"` : ''}`;
+
+  const commitSession = (s: SessionListItem | null) => {
+    onChange(s ? s.id : undefined);
+    setOpen(false);
+    setQuery('');
+    inputRef.current?.blur();
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!open) setOpen(true);
+      setHighlight((h) => Math.min(filtered.length - 1, h + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlight((h) => Math.max(0, h - 1));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (filtered.length > 0) commitSession(filtered[highlight] ?? null);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setOpen(false);
+      setQuery('');
+      inputRef.current?.blur();
+    }
+  };
+
+  return (
+    <div ref={wrapperRef} style={{ position: 'relative', minWidth: 360 }}>
+      <input
+        ref={inputRef}
+        type="text"
+        className="mono"
+        // Show placeholder = current selection. When user types, the
+        // typed text shadows the placeholder. This avoids the awkward
+        // "should we sync the input text to the selection" question
+        // that bites every combobox without it.
+        placeholder={placeholder}
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          if (!open) setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={onKeyDown}
+        style={{
+          width: '100%',
+          background: 'var(--surface-2)',
+          color: 'var(--ink)',
+          border: '1px solid var(--border)',
+          borderRadius: 6,
+          padding: '5px 26px 5px 10px',
+          fontSize: 12,
+          fontFamily: 'var(--font-mono)',
+          outline: 'none',
+        }}
+      />
+      {value && (
+        <button
+          type="button"
+          onClick={() => commitSession(null)}
+          title="clear session filter"
+          style={{
+            position: 'absolute',
+            right: 6,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            background: 'transparent',
+            border: 'none',
+            color: 'var(--ink-faint)',
+            cursor: 'pointer',
+            padding: '2px 6px',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 12,
+            lineHeight: 1,
+          }}
+        >
+          ×
+        </button>
+      )}
+      {open && (
+        <div
+          ref={listRef}
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            top: 'calc(100% + 4px)',
+            background: 'var(--surface-1, #111111)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            maxHeight: 340,
+            overflowY: 'auto',
+            zIndex: 50,
+            boxShadow: '0 10px 30px rgba(0, 0, 0, 0.5)',
+          }}
+        >
+          <div
+            onClick={() => commitSession(null)}
+            style={{
+              padding: '6px 10px',
+              cursor: 'pointer',
+              fontFamily: 'var(--font-mono)',
+              fontSize: 11.5,
+              color: value ? 'var(--ink-muted)' : 'var(--accent)',
+              borderBottom: '1px dashed var(--border)',
+              background: !value ? 'var(--surface-2)' : undefined,
+            }}
+          >
+            all {sessions.length} session
+            {sessions.length === 1 ? '' : 's'}
+            {projectLabel ? ` in "${projectLabel}"` : ''}
+          </div>
+          {filtered.length === 0 ? (
+            <div
+              style={{
+                padding: '14px 10px',
+                color: 'var(--ink-faint)',
+                fontSize: 11.5,
+                fontStyle: 'italic',
+              }}
+            >
+              no sessions match "{query}"
+            </div>
+          ) : (
+            filtered.map((s, i) => {
+              const uuid = s.src_session_uuid || s.id;
+              const proj = basenameOf(s.project_cwd);
+              const isHl = i === highlight;
+              const isSel = value === s.id;
+              return (
+                <div
+                  key={s.id}
+                  data-session-row={i}
+                  onClick={() => commitSession(s)}
+                  onMouseEnter={() => setHighlight(i)}
+                  style={{
+                    padding: '5px 10px',
+                    cursor: 'pointer',
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 11.5,
+                    color: isSel ? 'var(--accent)' : 'var(--ink)',
+                    background: isHl
+                      ? 'var(--surface-2)'
+                      : isSel
+                        ? 'var(--accent-soft)'
+                        : undefined,
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    gap: 12,
+                    alignItems: 'baseline',
+                  }}
+                >
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {uuid}
+                  </span>
+                  <span
+                    style={{
+                      color: 'var(--ink-faint)',
+                      fontSize: 10.5,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {proj} · {s.fragment_count}
+                  </span>
+                </div>
+              );
+            })
+          )}
+        </div>
+      )}
     </div>
   );
 }
