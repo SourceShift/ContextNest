@@ -132,8 +132,13 @@ hive-mind-prompt-*.txt
 # Stray test binaries that shouldn't be committed
 *.exe
 
-# Local dev-only files
+# Local dev-only files. Root-anchored so .cargo/config.toml (which we
+# DO want tracked — it ships build defaults) isn't accidentally hidden.
 .env
+/config.toml
+
+# Vite dev server cache — generated, machine-specific.
+web/.vite/
 
 # mini-orch / agentflow runtime
 .agentflow/state.db

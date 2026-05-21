@@ -103,3 +103,130 @@ recover-list: ## mo-recover list — show recoverable files from last 24h
 .PHONY: stash-watchdog stash-watchdog-pop dispatch-watchdog \
         dispatch-watchdog-close watchdogs-install watchdogs-uninstall \
         watchdogs-status recover-list
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  ContextNest substrate targets (cn-* prefix)                         ║
+# ║                                                                      ║
+# ║  These targets manage the Rust substrate (src/, target/release/      ║
+# ║  contextnest) — separate from the mini-orch targets above. The cn-   ║
+# ║  prefix avoids colliding with mini-orch's `test`, `lint`, `clean`.   ║
+# ║                                                                      ║
+# ║  Override any variable from the command line:                        ║
+# ║    make cn-ingest SINCE=14d PROJECT=researcher                       ║
+# ║    make cn-serve  CN_BIND=0.0.0.0:9090                               ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+CN_BIND       ?= 127.0.0.1:28080
+CN_SUBSTRATE  ?= http://$(CN_BIND)
+CN_WAL        ?= $(HOME)/.contextnest/wal.jsonl
+CN_BIN        ?= ./target/release/contextnest
+SINCE         ?= 7d
+PROJECT       ?=
+
+.PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev \
+        cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config
+
+cn-help:
+	@echo "ContextNest substrate targets"
+	@echo
+	@echo "  make cn-config          — copy config.example.toml → config.toml (once)"
+	@echo "  make cn-build           — cargo build --release (produces $(CN_BIN))"
+	@echo "  make cn-build-fast      — cargo build --profile fast (faster compile, ~ same runtime)"
+	@echo "  make cn-test            — cargo test --tests (full integration suite)"
+	@echo "  make cn-lint            — cargo clippy --tests (correctness gate)"
+	@echo "  make cn-serve           — run the release binary, WAL on, config.toml loaded"
+	@echo "  make cn-serve-dev       — cargo run --profile fast (auto-rebuilds, target/fast/)"
+	@echo "  make cn-watch           — auto-rebuild + restart on .rs changes (needs cargo-watch)"
+	@echo "  make cn-ingest          — backfill Claude Code sessions; vars: SINCE PROJECT"
+	@echo "                              e.g. make cn-ingest SINCE=7d PROJECT=researcher"
+	@echo "  make cn-curl-health     — quick liveness check against the running server"
+	@echo "  make cn-curl-inbox      — dump current /api/v1/inbox contents"
+	@echo "  make cn-wal-clear       — DELETE $(CN_WAL) (next serve starts fresh)"
+	@echo
+	@echo "Overridable variables (current defaults shown):"
+	@echo "  CN_BIND=$(CN_BIND)"
+	@echo "  CN_SUBSTRATE=$(CN_SUBSTRATE)"
+	@echo "  CN_WAL=$(CN_WAL)"
+	@echo "  CN_BIN=$(CN_BIN)"
+	@echo "  SINCE=$(SINCE)   PROJECT=$(PROJECT)"
+	@echo
+	@echo "Secrets: set DEEPINFRA_API_KEY (or OPENAI_API_KEY) in your shell."
+	@echo "Mini-orch targets remain available under 'make help'."
+
+cn-config:
+	@if [ -f config.toml ]; then \
+	  echo "config.toml already exists — not overwriting"; \
+	else \
+	  cp config.example.toml config.toml && \
+	  echo "✓ created config.toml from template (edit to taste; it's git-ignored)"; \
+	fi
+
+cn-build:
+	cargo build --release
+
+cn-test:
+	cargo test --tests
+
+cn-lint:
+	cargo clippy --tests -- -A clippy::all -D clippy::correctness
+
+# Refuses to start without an API key in the env, because a silent fall-through
+# to the local TF-IDF default is more confusing than a fast failure when the
+# operator clearly meant to use a real provider (their config.toml sets one).
+cn-serve: $(CN_BIN)
+	@if [ ! -f config.toml ]; then \
+	  echo "no config.toml — copying from example"; $(MAKE) cn-config; \
+	fi
+	@if [ -z "$$DEEPINFRA_API_KEY" ] && [ -z "$$OPENAI_API_KEY" ]; then \
+	  echo "warning: neither DEEPINFRA_API_KEY nor OPENAI_API_KEY is set in env."; \
+	  echo "         If config.toml points at a remote provider, ingest calls will fail."; \
+	fi
+	mkdir -p $(dir $(CN_WAL))
+	CONTEXTNEST_WAL_PATH=$(CN_WAL) $(CN_BIN) serve --bind $(CN_BIND)
+
+cn-ingest: $(CN_BIN)
+	$(CN_BIN) ingest claude-code \
+	  --substrate $(CN_SUBSTRATE) \
+	  --since $(SINCE) \
+	  $(if $(PROJECT),--project $(PROJECT),)
+
+# ── Dev-loop helpers ────────────────────────────────────────────────────
+# The `fast` profile (defined in Cargo.toml) builds in ~60s clean / ~10s
+# incremental and produces an optimized-enough binary at target/fast/.
+# Use these for the edit-restart loop; reserve `cn-serve` for benchmarks
+# or production-shaped runs.
+
+CN_BIN_FAST   ?= ./target/fast/contextnest
+
+cn-build-fast: ## Build the fast-profile binary (cargo build --profile fast)
+	cargo build --profile fast
+
+cn-serve-dev: ## Run the fast-profile binary, WAL on. Auto-rebuilds on each invocation.
+	@if [ ! -f config.toml ]; then $(MAKE) cn-config; fi
+	@mkdir -p $(dir $(CN_WAL))
+	cargo run --profile fast --bin contextnest -- serve --bind $(CN_BIND)
+
+cn-watch: ## Auto-rebuild + restart on .rs file changes (requires cargo-watch). Ctrl-C exits both.
+	@if ! command -v cargo-watch >/dev/null 2>&1; then \
+	  echo "cargo-watch not installed — run: cargo install cargo-watch"; exit 1; \
+	fi
+	@if [ ! -f config.toml ]; then $(MAKE) cn-config; fi
+	@mkdir -p $(dir $(CN_WAL))
+	CONTEXTNEST_WAL_PATH=$(CN_WAL) cargo watch \
+	  --watch src --watch Cargo.toml \
+	  -x 'run --profile fast --bin contextnest -- serve --bind $(CN_BIND)'
+
+cn-curl-health:
+	@curl -fsS $(CN_SUBSTRATE)/api/health | head -c 500; echo
+
+cn-curl-inbox:
+	@curl -fsS $(CN_SUBSTRATE)/api/v1/inbox | head -c 1000; echo
+
+cn-wal-clear:
+	@printf 'DELETE $(CN_WAL)? This wipes substrate persistence. Confirm with y/Y: '; \
+	read ans; case "$$ans" in [Yy]|[Yy][Ee][Ss]) ;; *) echo "aborted"; exit 1;; esac; \
+	rm -f $(CN_WAL); echo "✓ removed $(CN_WAL)"
+
+# Marker target — re-runs cn-build if the binary is missing.
+$(CN_BIN):
+	$(MAKE) cn-build

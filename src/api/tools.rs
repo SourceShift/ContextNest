@@ -262,31 +262,146 @@ pub async fn store(
         .session_id
         .unwrap_or_else(|| DEFAULT_SESSION.to_string());
     let importance = req.importance.unwrap_or(0.5).clamp(0.0, 1.0);
+    let fragment_id = uuid::Uuid::new_v4().to_string();
 
-    let embedding = match services.embedding.generate_embedding(&req.content).await {
-        Ok(e) => e,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+    match store_with_id(
+        &services,
+        &fragment_id,
+        &session_id,
+        &req.content,
+        importance,
+        req.metadata.clone(),
+    )
+    .await
+    {
+        Ok(()) => {
+            // Append to WAL on success. Best-effort: if the WAL write
+            // fails we still acknowledge the in-memory store — the user
+            // already got the data into the substrate, and a WAL outage
+            // is a logged-and-monitored ops concern, not a request-path
+            // failure. (If durability matters more than availability for
+            // a given deployment, this is the line to invert.)
+            if let Some(wal) = services.wal.get() {
+                let record = crate::services::wal::WalRecord::Store {
+                    fragment_id: fragment_id.clone(),
+                    session_id: session_id.clone(),
+                    content: req.content,
+                    importance,
+                    metadata: req.metadata,
+                };
+                if let Err(e) = wal.append(&record) {
+                    tracing::warn!(error = %e, "wal: append failed for store");
+                }
+            }
+            (
+                StatusCode::OK,
                 Json(StoreResponse {
-                    attractor_id: None,
-                    stored: false,
+                    attractor_id: Some(fragment_id),
+                    stored: true,
                 }),
-            );
+            )
         }
-    };
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(StoreResponse {
+                attractor_id: None,
+                stored: false,
+            }),
+        ),
+    }
+}
+
+/// Bulk sidecar restore for WAL replay. Skips embedding and
+/// `process_memories` entirely — only repopulates the three sidecars
+/// (`fragment_texts`, `fragment_metadata`, [`SessionIndex`]) needed to
+/// serve the `/api/v1/inbox` endpoint and any read paths that don't
+/// reach into [`crate::memory::attractors::MemoryAttractorManager`].
+///
+/// Why this exists: the live `store` pipeline calls `process_memories`
+/// which, when the LLM is enabled, makes a blocking HTTP request to
+/// OpenAI per fragment for basin formation. At 12k+ records that's
+/// hours of replay time, dominated by network latency. The sidecar
+/// path completes in seconds because it only does HashMap inserts.
+///
+/// Trade-off: `/api/v1/tools/retrieve` and `/api/v1/tools/resonate`
+/// return empty hits after a sidecar-only replay because the canonical
+/// attractor store is empty. The inbox endpoint, sessions list, and
+/// metadata-filter-based queries all work normally. Live `store` calls
+/// after replay restore canonical state for new fragments.
+///
+/// Acquires each sidecar's write lock exactly once for the whole batch
+/// (rather than 3N times in a per-record loop) so replay throughput is
+/// bound by the HashMap insert cost, not lock churn.
+pub async fn restore_sidecars_bulk(
+    services: &ContextNestServices,
+    records: Vec<(String, String, String, HashMap<String, serde_json::Value>)>,
+) {
+    if records.is_empty() {
+        return;
+    }
+
+    // Take write locks once each, drop them as soon as inserts are done so
+    // the handlers can serve reads if anyone races us during startup.
+    {
+        let mut texts = services.fragment_texts.write().await;
+        for (frag_id, _, content, _) in &records {
+            texts.insert(frag_id.clone(), content.clone());
+        }
+    }
+    {
+        let mut metadata = services.fragment_metadata.write().await;
+        for (frag_id, _, _, meta) in &records {
+            if !meta.is_empty() {
+                metadata.insert(frag_id.clone(), meta.clone());
+            }
+        }
+    }
+
+    // SessionIndex.add internally takes its own three write locks
+    // (active/deleted/reverse) per call. Could be made bulk too if it
+    // becomes the bottleneck — for 12k records it's not.
+    for (frag_id, session_id, _, _) in records {
+        services.session_index.add(&session_id, &frag_id).await;
+    }
+}
+
+/// Pure substrate-write helper extracted from [`store`]. Called by both
+/// the HTTP handler and the WAL replay path on startup.
+///
+/// Why this isn't private to this module: the binary's `serve()` startup
+/// in `src/bin/contextnest.rs` invokes this once per replayed
+/// [`crate::services::wal::WalRecord::Store`] to repopulate the in-memory
+/// state from disk. Returning `Result<(), String>` (instead of an
+/// `impl IntoResponse`) keeps the function decoupled from the HTTP layer.
+///
+/// The fragment_id is passed in (rather than generated inside) so that
+/// replay can preserve the original IDs — otherwise SessionIndex and
+/// metadata maps would diverge from any in-flight client that still
+/// holds the old IDs.
+pub async fn store_with_id(
+    services: &ContextNestServices,
+    fragment_id: &str,
+    session_id: &str,
+    content: &str,
+    importance: f32,
+    metadata: HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let embedding = services
+        .embedding
+        .generate_embedding(content)
+        .await
+        .map_err(|e| format!("embed: {e}"))?;
 
     let now = Utc::now();
-    let fragment_id = uuid::Uuid::new_v4().to_string();
     let fragment = MemoryFragment {
-        id: fragment_id.clone(),
+        id: fragment_id.to_string(),
         content: embedding,
         importance,
         created_at: now,
         last_accessed: now,
         attractor_basin_id: None,
         connections: HashSet::new(),
-        confidence: importance, // initial confidence == importance until decay/reuse reshapes it
+        confidence: importance,
     };
 
     let process_req = MemoryProcessingRequest {
@@ -296,63 +411,46 @@ pub async fn store(
         priority: ProcessingPriority::Medium,
         created_at: now,
     };
-    if services
+    services
         .attractor_manager
         .process_memories(process_req)
         .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(StoreResponse {
-                attractor_id: None,
-                stored: false,
-            }),
-        );
-    }
+        .map_err(|e| format!("process_memories: {e}"))?;
 
-    // Save text sidecar so `retrieve` can return what the user actually wrote.
+    // Sidecars: text first, metadata second, index last. Same order as the
+    // pre-extraction handler — see the original comment for the
+    // visible-but-unstored vs. stored-but-invisible trade-off rationale.
     services
         .fragment_texts
         .write()
         .await
-        .insert(fragment_id.clone(), req.content);
+        .insert(fragment_id.to_string(), content.to_string());
 
-    // Save metadata sidecar so `retrieve` can filter by it. The metadata
-    // is what callers passed in `StoreRequest.metadata` — typically a
-    // `{kind, urgency, src_session, project_cwd, ...}` map from the
-    // Claude Code ingester (see docs/z-insight-schema.md), but the
-    // shape is opaque to the substrate.
-    if !req.metadata.is_empty() {
+    if !metadata.is_empty() {
         services
             .fragment_metadata
             .write()
             .await
-            .insert(fragment_id.clone(), req.metadata);
+            .insert(fragment_id.to_string(), metadata);
     }
 
-    // Register session affinity. `add` is idempotent + acts as a restore path
-    // for previously soft-deleted IDs (see SessionIndex docs).
-    services.session_index.add(&session_id, &fragment_id).await;
+    services.session_index.add(session_id, fragment_id).await;
 
-    (
-        StatusCode::OK,
-        Json(StoreResponse {
-            attractor_id: Some(fragment_id),
-            stored: true,
-        }),
-    )
+    Ok(())
 }
 
 /// POST /api/v1/tools/retrieve — fetch relevant memory fragments for a query.
 /// Phase H pipeline:
 ///   1. Embed the query
 ///   2. Pull active fragment IDs for the session from `session_index`
-///   3. For each, fetch the canonical fragment via
+///   3. If `metadata_filter` is set, **prefilter** active IDs against the
+///      metadata sidecar so non-matching fragments never get hydrated.
+///      This is the hot-path saver for high-fan-out callers (Inbox UI).
+///   4. For each survivor, fetch the canonical fragment via
 ///      `MemoryAttractorManager::get_fragment` and score by cosine similarity
 ///      against the query embedding
-///   4. Look up text from `fragment_texts` sidecar
-///   5. Sort by similarity desc, importance desc, truncate to `top_k`
+///   5. Look up text from `fragment_texts` sidecar
+///   6. Sort by similarity desc, importance desc, truncate to `top_k`
 pub async fn retrieve(
     State(services): State<ContextNestServices>,
     Json(req): Json<RetrieveRequest>,
@@ -376,58 +474,110 @@ pub async fn retrieve(
         return (StatusCode::OK, Json(RetrieveResponse { hits: Vec::new() }));
     }
 
+    // Prefilter: if the caller passed a `metadata_filter`, narrow the candidate
+    // set BEFORE we pay the `get_fragment` lock + clone cost. The metadata
+    // sidecar is a single HashMap behind one RwLock; checking N keys against an
+    // in-memory map is orders of magnitude cheaper than N lock-acquires on the
+    // attractor manager's fragment_store. For inbox-style filters that match
+    // ~1% of fragments this turns a full-set scan into a handful of hydrations.
+    //
+    // Semantics preserved exactly: a fragment with no metadata entry never
+    // matches a non-empty filter (same conservative rule as the original
+    // post-hydration filter in `metadata_filter_matches`).
+    let candidate_ids: Vec<String> = if let Some(filter) = req.metadata_filter.as_ref() {
+        let metadata = services.fragment_metadata.read().await;
+        active_ids
+            .into_iter()
+            .filter(|id| match metadata.get(id) {
+                Some(meta) => metadata_filter_matches(filter, meta),
+                None => filter.is_empty(),
+            })
+            .collect()
+    } else {
+        active_ids
+    };
+
+    if candidate_ids.is_empty() {
+        return (StatusCode::OK, Json(RetrieveResponse { hits: Vec::new() }));
+    }
+
     // Phase 1: hydrate canonical fragments + score. Hold *no* `fragment_texts`
     // lock during this loop — `get_fragment` takes `fragment_store.read()` so
     // concurrent `store`/`update` writers can still progress on the text
     // sidecar. (Phase-H review finding 2.2: prior version held the
     // fragment_texts read lock across the entire scan.)
-    let mut hydrated: Vec<(MemoryFragment, f32)> = Vec::with_capacity(active_ids.len());
-    for id in &active_ids {
-        let Ok(Some(fragment)) = services.attractor_manager.get_fragment(id).await else {
-            // SessionIndex says it's active but manager doesn't have it — index
-            // drift, treat as a miss rather than failing the whole request.
-            continue;
-        };
-        let similarity = services
-            .embedding
-            .calculate_similarity(&query_embedding, &fragment.content);
-        hydrated.push((fragment, similarity));
+    //
+    // Sidecar fallback rationale: after a sidecars-only WAL replay (the
+    // default startup mode) the canonical attractor store is empty,
+    // even though `session_index` + `fragment_metadata` +
+    // `fragment_texts` are all repopulated. Without a fallback, every
+    // `retrieve` against a replayed substrate returned zero hits — the
+    // dashboard's per-section views silently went blank while the inbox
+    // showed identical data via a different endpoint. We track which
+    // candidate IDs the canonical store could not produce and rebuild
+    // their hits from the sidecars in Phase 2. similarity is set to 0
+    // for these (no embedding to compare); they sort to the bottom of
+    // the result set behind any genuinely scored hit.
+    let mut hydrated: Vec<(MemoryFragment, f32)> = Vec::with_capacity(candidate_ids.len());
+    let mut sidecar_only_ids: Vec<String> = Vec::new();
+    for id in &candidate_ids {
+        match services.attractor_manager.get_fragment(id).await {
+            Ok(Some(fragment)) => {
+                let similarity = services
+                    .embedding
+                    .calculate_similarity(&query_embedding, &fragment.content);
+                hydrated.push((fragment, similarity));
+            }
+            // SessionIndex says it's active but manager doesn't have it.
+            // This is the post-WAL-replay case OR a transient index drift
+            // race. Either way, treat the sidecar as the source of truth
+            // and synthesize a minimal hit downstream.
+            Ok(None) | Err(_) => sidecar_only_ids.push(id.clone()),
+        }
     }
 
-    // Phase 2: single bulk text + metadata lookup. Lock windows scale with
-    // hits, not the whole session. Reading text and metadata in lockstep
-    // because the metadata_filter check needs both maps available.
+    // Phase 2: bulk text + metadata lookup for survivors only. Locks scale
+    // with the post-filter set, not the session size. Same map is used
+    // for both hydrated (canonical) and sidecar-only hits so we acquire
+    // each read lock exactly once.
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
     let mut scored: Vec<RetrieveHit> = hydrated
         .into_iter()
-        .filter_map(|(fragment, similarity)| {
+        .map(|(fragment, similarity)| {
             let fragment_meta = metadata.get(&fragment.id);
-
-            // Apply the metadata filter (if any) BEFORE we materialise the
-            // RetrieveHit — a fragment that doesn't match the filter never
-            // makes it into the result set, so `top_k` applies to the
-            // post-filter universe.
-            if let Some(filter) = req.metadata_filter.as_ref() {
-                let matches = match fragment_meta {
-                    Some(meta) => metadata_filter_matches(filter, meta),
-                    None => filter.is_empty(),
-                };
-                if !matches {
-                    return None;
-                }
-            }
-
             let content = texts.get(&fragment.id).cloned().unwrap_or_default();
-            Some(RetrieveHit {
+            RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
                 similarity,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
-            })
+            }
         })
         .collect();
+
+    for id in &sidecar_only_ids {
+        // Skip fragments that have neither text nor metadata — that's a
+        // truly orphaned index entry, not a sidecar-only fragment.
+        let content = texts.get(id).cloned();
+        let meta = metadata.get(id).cloned();
+        if content.is_none() && meta.is_none() {
+            continue;
+        }
+        scored.push(RetrieveHit {
+            id: id.clone(),
+            content: content.unwrap_or_default(),
+            // Importance default mirrors `restore_sidecars_bulk` — neutral
+            // 0.5 because we don't have the canonical fragment's value.
+            importance: 0.5,
+            // No embedding → no similarity. Use 0.0 so canonical hits
+            // (which have real similarity scores ≥ ~0.6 typically) sort
+            // ahead of sidecar-only hits in mixed result sets.
+            similarity: 0.0,
+            metadata: meta.unwrap_or_default(),
+        });
+    }
     drop(texts);
     drop(metadata);
 
@@ -443,6 +593,41 @@ pub async fn retrieve(
             })
     });
     scored.truncate(req.top_k);
+
+    // Update the retrieve co-occurrence log: every unordered pair of
+    // returned hits gains +1 in the shared connection map. This is the
+    // substrate's only signal for "fragments that show up together" —
+    // the field viz reads it to draw real resonance edges (replacing
+    // the synthesized same-session-and-kind placeholder edges).
+    //
+    // Cost gating: at most top_k² / 2 pair-updates per retrieve call,
+    // which is ≤1250 for top_k=50. Each is a HashMap entry update so
+    // total wall-clock per call stays under a millisecond.
+    //
+    // Memory bound: when the log exceeds 8000 entries we keep only the
+    // 2000 strongest (highest count) and drop the long tail. This is
+    // O(n log n) but only runs on overflow, so amortized cost is fine.
+    if scored.len() >= 2 {
+        let mut log = services.connection_log.write().await;
+        for i in 0..scored.len() {
+            for j in (i + 1)..scored.len() {
+                let a = &scored[i].id;
+                let b = &scored[j].id;
+                let key = if a < b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
+                *log.entry(key).or_insert(0) += 1;
+            }
+        }
+        if log.len() > 8000 {
+            let mut entries: Vec<((String, String), u32)> = log.drain().collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            entries.truncate(2000);
+            *log = entries.into_iter().collect();
+        }
+    }
 
     (StatusCode::OK, Json(RetrieveResponse { hits: scored }))
 }

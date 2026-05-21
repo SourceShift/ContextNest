@@ -18,6 +18,7 @@ pub mod graph_enhanced;
 pub mod llm;
 pub mod parser;
 pub mod session_index;
+pub mod wal;
 
 pub use context::ContextManagerService;
 pub use embedding::EmbeddingService;
@@ -77,6 +78,37 @@ pub struct ContextNestServices {
     /// has to change. The diff stays scoped to store + retrieve.
     pub fragment_metadata:
         Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, serde_json::Value>>>>,
+    /// Retrieve co-occurrence log — counts how many times each unordered
+    /// `(fragment_id, fragment_id)` pair was returned by the same
+    /// `/api/v1/tools/retrieve` call. Drives the /field viz's "real
+    /// resonance" edges (replacing the synthesized same-session
+    /// placeholder edges). Bounded by capping to top-2000 pairs on
+    /// insert when the map grows past 8000 entries — keeps memory
+    /// linear while preserving the strongest signals.
+    ///
+    /// Lifecycle: in-memory only, lost on restart. The dashboard
+    /// rebuilds the strongest signal within a few queries because the
+    /// inbox/sessions polling drives retrieve calls naturally.
+    pub connection_log: Arc<tokio::sync::RwLock<HashMap<(String, String), u32>>>,
+    /// Per-fragment-id embedding cache. Populated lazily by the
+    /// `/api/v1/fragments?with_embedding=true` handler. Lets a refresh
+    /// of the /field view skip the EmbeddingService entirely on its
+    /// second-and-later calls, turning a 1–5s rebuild into ~50ms map
+    /// reads. Soft-capped at 20k entries (drops oldest-ish on
+    /// overflow). Lost on restart.
+    pub embeddings_by_id: Arc<tokio::sync::RwLock<HashMap<String, Vec<f32>>>>,
+    /// Write-ahead log handle, populated **after** any startup replay so
+    /// that replaying records doesn't re-trigger WAL appends (a classic
+    /// double-log bug). `None` (uninitialised OnceCell) means no
+    /// persistence is configured — handlers skip the append and the
+    /// substrate stays purely in-memory, matching pre-WAL behaviour.
+    ///
+    /// `Arc<OnceCell<...>>` rather than a field swap because
+    /// [`ContextNestServices`] is cloned into every Axum handler's
+    /// `State<S>`. The OnceCell sits behind the same Arc as the other
+    /// shared maps so all clones see the writer the moment it's set
+    /// post-replay.
+    pub wal: Arc<tokio::sync::OnceCell<wal::Wal>>,
     /// LLM provider abstraction (Phase J).
     /// Always present — may be [`crate::services::llm::LlmProvider::Disabled`]
     /// when no API key / provider config is present. Callers MUST check
@@ -145,6 +177,8 @@ impl ContextNestServices {
 
         let fragment_texts = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let fragment_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let connection_log = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let embeddings_by_id = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         // Construct the LLM service from environment. Returns Disabled when no
         // API key is present — never propagates an error so offline / CI starts
@@ -168,6 +202,9 @@ impl ContextNestServices {
             session_index,
             fragment_texts,
             fragment_metadata,
+            connection_log,
+            embeddings_by_id,
+            wal: Arc::new(tokio::sync::OnceCell::new()),
             llm,
         })
     }

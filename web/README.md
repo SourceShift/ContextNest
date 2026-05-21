@@ -12,7 +12,7 @@ pnpm install
 pnpm dev
 ```
 
-Dev server runs at `http://127.0.0.1:5175` (strict — won't pick a different port if taken). Point at your local substrate via `web/.env`:
+Dev server runs at `http://127.0.0.1:5057` (strict — won't pick a different port if taken). Point at your local substrate via `web/.env`:
 
 ```
 VITE_API_BASE_URL=http://localhost:28080

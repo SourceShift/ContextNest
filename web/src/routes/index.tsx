@@ -10,7 +10,9 @@ import {
   UrgencyLabel,
   type Urgency,
 } from '@/components/atoms';
-import { MOCK, type InboxItemMock } from '@/lib/mock-data';
+import type { InboxItemMock } from '@/lib/mock-data';
+import { useInbox } from '@/hooks/useInbox';
+import { useKnownProjects } from '@/hooks/useSessions';
 
 export const Route = createFileRoute('/')({
   component: InboxPage,
@@ -23,29 +25,34 @@ function InboxPage() {
   const [projFilter, setProjFilter] = useState<string>('all');
   const [ackedIds, setAckedIds] = useState<Set<string>>(new Set());
 
-  const items = useMemo(
+  const { data: inboxData, isLoading, isError, error, refetch } = useInbox();
+
+  // Show loading skeletons only on the very first load (no cached data yet)
+  const showSkeleton = isLoading && inboxData.length === 0;
+
+  const filteredItems = useMemo(
     () =>
-      MOCK.inbox.filter((it) => {
+      inboxData.filter((it) => {
         if (urgFilter !== 'all' && it.urgency !== urgFilter) return false;
         if (projFilter !== 'all' && it.project !== projFilter) return false;
         return true;
       }),
-    [urgFilter, projFilter],
+    [inboxData, urgFilter, projFilter],
   );
 
   const counts = useMemo(
     () => ({
-      all: MOCK.inbox.length,
-      now: MOCK.inbox.filter((i) => i.urgency === 'now').length,
-      soon: MOCK.inbox.filter((i) => i.urgency === 'soon').length,
-      later: MOCK.inbox.filter((i) => i.urgency === 'later').length,
+      all: inboxData.length,
+      now: inboxData.filter((i) => i.urgency === 'now').length,
+      soon: inboxData.filter((i) => i.urgency === 'soon').length,
+      later: inboxData.filter((i) => i.urgency === 'later').length,
     }),
-    [],
+    [inboxData],
   );
 
   const { grouped, sessionOrder } = useMemo(() => {
     const g: Record<string, InboxItemMock[]> = {};
-    for (const it of items) {
+    for (const it of filteredItems) {
       (g[it.sessionId] ||= []).push(it);
     }
     Object.values(g).forEach((arr) =>
@@ -57,13 +64,26 @@ function InboxPage() {
       return ra - rb;
     });
     return { grouped: g, sessionOrder: order };
-  }, [items]);
+  }, [filteredItems]);
 
-  const projects = useMemo(() => Array.from(new Set(MOCK.inbox.map((i) => i.project))), []);
+  // Projects in the dropdown derive from EVERY known session (not just
+  // sessions that have inbox-eligible items), so a project with no open
+  // user_actions / awaiting_decisions still appears as a filter option.
+  // Falls back to inbox-derived projects if the /api/v1/sessions call
+  // fails for any reason.
+  const knownProjects = useKnownProjects();
+  const inboxProjects = useMemo(
+    () => Array.from(new Set(inboxData.map((i) => i.project))),
+    [inboxData],
+  );
+  const projects = useMemo(
+    () => Array.from(new Set([...knownProjects, ...inboxProjects])).sort(),
+    [knownProjects, inboxProjects],
+  );
 
   const ack = (id: string) => setAckedIds((prev) => new Set(prev).add(id));
 
-  const activeSessions = new Set(MOCK.inbox.map((i) => i.sessionId)).size;
+  const activeSessions = new Set(inboxData.map((i) => i.sessionId)).size;
 
   return (
     <div>
@@ -101,30 +121,55 @@ function InboxPage() {
         <ProjectSelect value={projFilter} onChange={setProjFilter} options={projects} />
       </div>
 
-      {sessionOrder.length === 0 && (
+      {showSkeleton && (
+        <>
+          <div className="skel-card" />
+          <div className="skel-card" />
+          <div className="skel-card" />
+        </>
+      )}
+
+      {!showSkeleton && isError && (
+        <div className="empty with-card error-card">
+          <Icon.Alert style={{ width: 28, height: 28, color: 'var(--urg-now)', opacity: 0.8 }} />
+          <div className="empty-title">Inbox fetch failed</div>
+          <div className="empty-body mono" style={{ color: 'var(--ink-muted)' }}>
+            {error?.message ?? 'Unknown error'}
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={refetch}
+            style={{ marginTop: 4 }}
+            type="button"
+          >
+            <Icon.Refresh /> Retry
+          </button>
+        </div>
+      )}
+
+      {!showSkeleton && !isError && sessionOrder.length === 0 && (
         <div className="empty with-card">
           <div className="empty-title">Nothing matches this filter</div>
           <div className="empty-body">Clear the urgency or project filter to see more items.</div>
         </div>
       )}
 
-      {sessionOrder.map((sid) => {
-        const sess = MOCK.sessions.find((s) => s.id === sid);
-        return (
-          <div className="session-group" key={sid}>
-            <div className="session-group-head">
-              <span className="sid">{sid}</span>
-              <span className="proj">~/code/{sess?.project ?? '?'}</span>
-              <span className="meta">
-                {grouped[sid].length} waiting · last activity {sess?.lastActivity ?? '—'}
-              </span>
+      {!showSkeleton &&
+        sessionOrder.map((sid) => {
+          const sessionItem = inboxData.find((i) => i.sessionId === sid);
+          return (
+            <div className="session-group" key={sid}>
+              <div className="session-group-head">
+                <span className="sid">{sid}</span>
+                <span className="proj">~/code/{sessionItem?.project ?? '?'}</span>
+                <span className="meta">{grouped[sid].length} waiting</span>
+              </div>
+              {grouped[sid].map((it) => (
+                <InboxCard key={it.id} item={it} ack={ack} acked={ackedIds.has(it.id)} />
+              ))}
             </div>
-            {grouped[sid].map((it) => (
-              <InboxCard key={it.id} item={it} ack={ack} acked={ackedIds.has(it.id)} />
-            ))}
-          </div>
-        );
-      })}
+          );
+        })}
     </div>
   );
 }

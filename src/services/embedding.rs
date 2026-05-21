@@ -54,6 +54,39 @@ impl EmbeddingService {
             .ok_or_else(|| ContextNestError::Api("Default embedding model not found".to_string()))
     }
 
+    /// Resolve the embedding API key from the layered sources documented on
+    /// [`Self::generate_openai_embedding`]. Returns `None` only if every
+    /// source is empty / unset.
+    fn resolve_api_key(&self) -> Option<String> {
+        // Layer 1: literal in config.toml (typically used in tests / CI).
+        if let Some(key) = self.config.api_key.as_ref() {
+            if !key.is_empty() {
+                return Some(key.clone());
+            }
+        }
+        // Layer 2: env var name from config (lets the operator point at any
+        // var name without code change — useful for $VENDOR_KEY conventions).
+        if let Some(env_name) = self.config.api_key_env.as_deref() {
+            if let Ok(val) = std::env::var(env_name) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        // Layer 3: well-known fallbacks. Order is intentional —
+        // DeepInfra-first reflects our current production default (Qwen3
+        // embeddings via DeepInfra). OpenAI second so existing callers
+        // with only $OPENAI_API_KEY set keep working.
+        for env_name in ["DEEPINFRA_API_KEY", "OPENAI_API_KEY"] {
+            if let Ok(val) = std::env::var(env_name) {
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
     /// Generate embedding for text
     pub async fn generate_embedding(&self, text: &str) -> ContextNestResult<Vec<f32>> {
         // Check cache first
@@ -109,21 +142,46 @@ impl EmbeddingService {
         Ok(embeddings)
     }
 
-    /// Generate embedding using OpenAI API
+    /// Generate embedding using an OpenAI-shaped embeddings endpoint.
+    ///
+    /// Despite the historical name, this handler also serves drop-in
+    /// OpenAI-compatible providers (DeepInfra, Together, Anyscale, …) —
+    /// the request/response shape is identical and only the base URL +
+    /// model string change. The provider is chosen by setting
+    /// `EmbeddingServicesConfig::base_url`; when unset, falls back to
+    /// the real OpenAI endpoint for backward compatibility.
+    ///
+    /// API key resolution order (first match wins):
+    ///   1. `EmbeddingServicesConfig::api_key` (literal in config)
+    ///   2. Env var named by `EmbeddingServicesConfig::api_key_env`
+    ///   3. `DEEPINFRA_API_KEY` (convention for DeepInfra deployments)
+    ///   4. `OPENAI_API_KEY` (convention for OpenAI deployments)
+    /// This chain lets you keep secrets out of `config.toml` (preferred)
+    /// while still supporting the literal-config path for tests / CI.
     async fn generate_openai_embedding(&self, text: &str) -> ContextNestResult<Vec<f32>> {
-        let api_key =
-            self.config.api_key.as_ref().ok_or_else(|| {
-                ContextNestError::Api("OpenAI API key not configured".to_string())
-            })?;
+        let api_key = self.resolve_api_key().ok_or_else(|| {
+            ContextNestError::Api(
+                "no embedding API key found in config.api_key, $DEEPINFRA_API_KEY, or \
+                 $OPENAI_API_KEY"
+                    .to_string(),
+            )
+        })?;
 
         let request = OpenAIEmbeddingRequest {
             input: text.to_string(),
             model: self.config.model.clone(),
         };
 
+        let url = self
+            .config
+            .base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.openai.com/v1/embeddings");
+
         let response = self
             .client
-            .post("https://api.openai.com/v1/embeddings")
+            .post(url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request)
@@ -536,10 +594,13 @@ impl EmbeddingService {
             }
         }
 
-        // Check for root similarity (simple)
-        if w1.len() > 3 && w2.len() > 3 {
-            let root1 = &w1[..3];
-            let root2 = &w2[..3];
+        // Check for root similarity (first 3 chars match). Use char-aware
+        // slicing — `str::len()` is byte-length, so `&w[..3]` on multibyte
+        // input (math symbols, CJK, emoji) panics at the char boundary.
+        // Example panic seen in prod: "η²" is 4 bytes but only 2 chars;
+        // `len() > 3` was true but `&w[..3]` landed inside the `²` byte
+        // sequence.
+        if let (Some(root1), Some(root2)) = (first_n_chars(w1, 3), first_n_chars(w2, 3)) {
             if root1 == root2 {
                 relation_score += 0.4;
             }
@@ -682,19 +743,26 @@ impl EmbeddingService {
         }
     }
 
-    /// Health check for embedding service
+    /// Health check for embedding service.
+    ///
+    /// Strategy: ask "can we actually serve a request right now?" rather
+    /// than string-match the `provider` config tag. The legacy version
+    /// rejected any provider literal other than `"openai"` / `"local"`,
+    /// which mis-reported `provider = "deepinfra"` (or anything served via
+    /// the OpenAI-compat HTTP path) as unhealthy even when fully working.
     pub async fn health_check(&self) -> ContextNestResult<bool> {
-        match self.config.provider.as_str() {
-            "openai" => {
-                // Check if API key is configured
-                Ok(self.config.api_key.is_some())
+        // The local TF-IDF path needs no key — always serviceable.
+        if let Ok(model) = self.get_default_model() {
+            if matches!(model.model_type, crate::config::EmbeddingModelType::Local) {
+                return Ok(true);
             }
-            "local" => {
-                // For local models, always return true for now
-                Ok(true)
-            }
-            _ => Ok(false),
         }
+
+        // Any remote provider (OpenAI, DeepInfra, Together, Anyscale, ...)
+        // routes through the OpenAI-shaped HTTP handler, which resolves
+        // the key from the same layered chain `generate_openai_embedding`
+        // uses. If that chain yields a key, the service is ready.
+        Ok(self.resolve_api_key().is_some())
     }
 
     /// Batch generate embeddings with rate limiting
@@ -1014,6 +1082,101 @@ impl EmbeddingService {
             attractors_created,
             processing_timestamp: Utc::now(),
         })
+    }
+}
+
+/// Return the first `n` Unicode scalars (chars) of `s` as a slice, or `None`
+/// if `s` has fewer than `n + 1` chars (i.e. there's nothing past the cut
+/// point — preserves the original `> N` length-guard semantics).
+///
+/// Char-aware replacement for `&s[..n]`, which panics if byte index `n`
+/// lands inside a multibyte UTF-8 sequence (`η²` → 4 bytes, 2 chars).
+fn first_n_chars(s: &str, n: usize) -> Option<&str> {
+    let end = s.char_indices().nth(n).map(|(i, _)| i)?;
+    Some(&s[..end])
+}
+
+#[cfg(test)]
+mod first_n_chars_tests {
+    use super::first_n_chars;
+
+    #[test]
+    fn ascii_word_returns_first_n_chars() {
+        assert_eq!(first_n_chars("hello", 3), Some("hel"));
+    }
+
+    #[test]
+    fn multibyte_word_does_not_panic() {
+        // Regression: the pre-fix code panicked here because byte index 3
+        // lands inside the second char of `η²` (η=2B, ²=2B).
+        assert_eq!(first_n_chars("η²", 3), None);
+    }
+
+    #[test]
+    fn cjk_input_returns_first_n_chars_safely() {
+        assert_eq!(first_n_chars("中文测试", 2), Some("中文"));
+    }
+
+    #[test]
+    fn word_with_exactly_n_chars_returns_none() {
+        // Mirrors original guard (`len() > 3` ⇒ require at least 4 chars).
+        assert_eq!(first_n_chars("cat", 3), None);
+    }
+
+    #[test]
+    fn empty_input_returns_none() {
+        assert_eq!(first_n_chars("", 3), None);
+    }
+}
+
+#[cfg(test)]
+mod multibyte_regression_tests {
+    use super::*;
+    use crate::config::EmbeddingServicesConfig;
+
+    /// End-to-end regression for the `byte index 3 is not a char boundary`
+    /// panic seen in prod logs at 2026-05-20T21:29:31Z. The path:
+    ///
+    /// `generate_embedding` → `generate_local_embedding` →
+    /// `extract_word_features` (bigram loop) → `calculate_bigram_score` →
+    /// `estimate_semantic_relation` → unsafe `&w[..3]` byte slice
+    ///
+    /// Triggers when input contains multibyte UTF-8 words like `η²` that
+    /// have `len() > 3` (4 bytes) but a char boundary inside that range.
+    #[tokio::test]
+    async fn generate_embedding_handles_multibyte_words_without_panic() {
+        let service = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("default local config builds");
+
+        // Mix of multibyte math symbols and ASCII — matches the kind of
+        // content the substrate sees from research/learning sessions.
+        let text = "η² ψ² normalized eta squared partial χ²";
+        let embedding = service
+            .generate_embedding(text)
+            .await
+            .expect("multibyte input must not panic or error");
+        assert!(!embedding.is_empty());
+        assert_eq!(embedding.len(), service.config.dimensions);
+    }
+
+    #[tokio::test]
+    async fn generate_embedding_handles_cjk_input() {
+        let service = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("default local config builds");
+        let _ = service
+            .generate_embedding("中文 输入 测试 文字 处理 路径")
+            .await
+            .expect("CJK input must not panic");
+    }
+
+    #[tokio::test]
+    async fn generate_embedding_handles_emoji_input() {
+        let service = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("default local config builds");
+        let _ = service
+            .generate_embedding("hello 🚀 world 🌍 testing 🔥 stuff")
+            .await
+            .expect("emoji input must not panic");
     }
 }
 

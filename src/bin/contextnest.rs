@@ -18,7 +18,7 @@ use contextnest::ingest::claude_code::{
 use contextnest::services::ContextNestServices;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
@@ -211,6 +211,7 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
             substrate,
             projects_dir,
             install_hooks,
+            project_paths,
         } => {
             if install_hooks {
                 // --install-hooks is a one-shot configuration write —
@@ -218,28 +219,73 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
                 // accidentally start a transcript scan they didn't ask
                 // for. Errors here are user-facing (likely a bad path
                 // or unreadable settings.json), so surface them clearly.
-                install_cc_hooks(&substrate)?;
+                install_cc_hooks(&substrate, &project_paths)?;
                 return Ok(());
+            }
+            if !project_paths.is_empty() {
+                return Err("--project-path requires --install-hooks (the flag is meaningful only when installing hooks).".into());
             }
             ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await
         }
     }
 }
 
-/// Write the four real-time hooks (SessionStart, UserPromptSubmit,
-/// Stop, TaskCompleted) into `~/.claude/settings.json`, pointing each
-/// at `<substrate>/api/v1/cc/hook/<event>`. Backs the existing file up
-/// with a `.bak-<unix-ts>` suffix before writing, and is idempotent —
-/// existing entries whose command contains `/api/v1/cc/hook/` are
-/// detected and skipped so re-running doesn't create duplicates.
-fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+/// Install the four real-time hooks (SessionStart, UserPromptSubmit,
+/// Stop, TaskCompleted) into the user-level Claude settings AND into
+/// every explicitly-named project's local settings. Each target file is
+/// backed up before write; the merge is idempotent (existing entries
+/// detected by their `cc/hook/` URL substring are skipped).
+///
+/// Project paths are explicit — there is no filesystem scan. This is a
+/// deliberate trust boundary: ContextNest never writes to a project's
+/// settings file you haven't pointed it at.
+fn install_cc_hooks(
+    substrate: &str,
+    project_paths: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var_os("HOME")
         .ok_or("install-hooks: $HOME is not set; cannot locate ~/.claude/settings.json")?;
-    let settings_path = PathBuf::from(home).join(".claude/settings.json");
+    let user_settings = PathBuf::from(home).join(".claude/settings.json");
 
-    let existing_text = match std::fs::read_to_string(&settings_path) {
+    let mut targets: Vec<(String, PathBuf)> = Vec::with_capacity(1 + project_paths.len());
+    targets.push(("user".into(), user_settings));
+    for p in project_paths {
+        let project_settings = p.join(".claude/settings.local.json");
+        targets.push((format!("project {}", p.display()), project_settings));
+    }
+
+    let mut any_change = false;
+    for (label, settings_path) in &targets {
+        match install_to_target(substrate, label, settings_path)? {
+            HookInstallOutcome::Wrote => {
+                any_change = true;
+            }
+            HookInstallOutcome::AlreadyInstalled => {}
+        }
+    }
+
+    if !any_change {
+        println!("All ContextNest hooks already present in every target. Nothing to do.");
+    }
+    Ok(())
+}
+
+enum HookInstallOutcome {
+    Wrote,
+    AlreadyInstalled,
+}
+
+/// Append ContextNest hook entries to one settings file. Creates the
+/// file (and its parent dir) if missing. Backs up any pre-existing
+/// content with a `.bak-<unix-ts>` suffix before writing.
+fn install_to_target(
+    substrate: &str,
+    label: &str,
+    settings_path: &Path,
+) -> Result<HookInstallOutcome, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let existing_text = match std::fs::read_to_string(settings_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
         Err(e) => return Err(format!("read {}: {}", settings_path.display(), e).into()),
@@ -251,19 +297,27 @@ fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if added.is_empty() {
         println!(
-            "All four ContextNest hooks already present in {}. Nothing to do.",
+            "[{}] All four ContextNest hooks already present in {}. Skipping.",
+            label,
             settings_path.display()
         );
-        return Ok(());
+        return Ok(HookInstallOutcome::AlreadyInstalled);
     }
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup_path = settings_path.with_extension(format!("json.bak-{}", ts));
+    let backup_path = settings_path.with_extension(format!(
+        "{}.bak-{}",
+        settings_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("json"),
+        ts
+    ));
     if settings_path.exists() {
-        std::fs::copy(&settings_path, &backup_path)
+        std::fs::copy(settings_path, &backup_path)
             .map_err(|e| format!("backup to {}: {}", backup_path.display(), e))?;
     }
 
@@ -271,26 +325,29 @@ fn install_cc_hooks(substrate: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&settings_path, format!("{}\n", pretty))
+    std::fs::write(settings_path, format!("{}\n", pretty))
         .map_err(|e| format!("write {}: {}", settings_path.display(), e))?;
 
     println!(
-        "Installed ContextNest hooks into {}",
+        "[{}] Installed ContextNest hooks into {}",
+        label,
         settings_path.display()
     );
     if backup_path.exists() {
-        println!("Previous file backed up to       {}", backup_path.display());
+        println!(
+            "        Previous file backed up to {}",
+            backup_path.display()
+        );
     }
-    println!("Added entries:");
     for ev in &added {
         println!(
-            "  {:<22} -> {}/api/v1/cc/hook/{}",
+            "        + {:<22} -> {}/api/v1/cc/hook/{}",
             ev,
             substrate.trim_end_matches('/'),
             cc_hook_path_segment(ev)
         );
     }
-    Ok(())
+    Ok(HookInstallOutcome::Wrote)
 }
 
 /// Merge ContextNest hook entries into a settings JSON value. Returns
@@ -324,10 +381,14 @@ fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'sta
     let mut added: Vec<&'static str> = Vec::new();
     for (event_name, path_seg) in EVENTS {
         let url = format!("{}/api/v1/cc/hook/{}", substrate, path_seg);
-        let cmd = format!(
-            "curl -s -m 1 -X POST {} -H 'content-type: application/json' --data-binary @- &",
-            url
-        );
+        // Drain stdin into a tempfile BEFORE backgrounding the curl.
+        // The naive `curl --data-binary @- &` pattern races: bash
+        // backgrounds curl before it has read stdin, the parent sh
+        // exits, the pipe closes, curl reads zero bytes, the substrate
+        // sees an empty POST and returns 400. This tempfile dance
+        // guarantees the body is fully captured before the parent shell
+        // returns control to Claude.
+        let cmd = render_hook_command(&url);
 
         let entries = hooks_obj
             .entry((*event_name).to_string())
@@ -558,6 +619,20 @@ async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::
     let services = ContextNestServices::new(config).await?;
     tracing::info!("Core services initialized successfully");
 
+    // WAL bootstrap: replay any persisted records BEFORE opening the writer.
+    // The writer is intentionally `None` during replay so that
+    // `store_with_id` (called from the replay loop) does not re-log records
+    // to disk. Once replay finishes we open the writer in append mode and
+    // set it in the OnceCell; from that point onward every successful
+    // `store` HTTP call appends a fresh record.
+    if let Some(wal_path) = wal_path_from_env() {
+        bootstrap_wal(&services, &wal_path).await?;
+    } else {
+        tracing::info!(
+            "WAL disabled (set CONTEXTNEST_WAL_PATH to enable persistence across restarts)"
+        );
+    }
+
     let app = create_app(services).await?;
 
     tracing::info!("Configured API endpoints:");
@@ -599,6 +674,97 @@ async fn load_configuration() -> Result<Config, Box<dyn std::error::Error>> {
     }
 }
 
+/// Render the bash command body that Claude Code's hook system invokes
+/// per event. The shape is locked in `~/.claude/settings.json` once
+/// `install-hooks` runs, so any change here only takes effect on
+/// **re-running** the install command.
+///
+/// Constraints — every one of these is a real bug we paid for once:
+///
+/// 1. `mktemp` template puts the `X` placeholders at the END. macOS
+///    `mktemp` refuses templates like `/tmp/cnhk-XXXXXX.json` (X's
+///    followed by a literal suffix) — it treats the whole thing as a
+///    literal name, succeeds on the first call by creating the file,
+///    and fails on every subsequent call with "File exists" returning
+///    an empty path. `cat > ""` then errors silently and the body
+///    never reaches the substrate. **Symptom: hooks appear to fire
+///    (Claude sees a fast no-op) but the WAL never grows.**
+/// 2. The body is drained into a tempfile BEFORE the backgrounded
+///    curl runs. The naive `curl --data-binary @- &` pattern races:
+///    bash backgrounds curl before it has read stdin, the parent sh
+///    exits, the pipe closes, curl reads zero bytes, the substrate
+///    sees an empty POST and returns 400. The tempfile dance
+///    guarantees the body is fully captured before the parent shell
+///    returns control to Claude.
+/// 3. Curl is `-s -m 1` + redirected to `/dev/null 2>&1` so a server
+///    outage never blocks Claude Code's main loop. We accept that this
+///    is "silent" — operators detect outages via `~/.contextnest/
+///    wal.jsonl` growth, not via hook stderr.
+/// 4. Trailing `&` detaches the curl from the hook's foreground call so
+///    Claude Code's hook protocol gets its instant ack.
+fn render_hook_command(url: &str) -> String {
+    format!(
+        r#"F=$(mktemp /tmp/cnhk-XXXXXX); cat > "$F"; (curl -s -m 1 -X POST {url} -H "content-type: application/json" --data-binary @"$F" >/dev/null 2>&1; rm -f "$F") &"#,
+    )
+}
+
+#[cfg(test)]
+mod render_hook_command_tests {
+    use super::render_hook_command;
+
+    #[test]
+    fn url_is_substituted_into_curl_target() {
+        let cmd = render_hook_command("http://localhost:28080/api/v1/cc/hook/stop");
+        assert!(cmd.contains("http://localhost:28080/api/v1/cc/hook/stop"));
+        assert!(cmd.contains("-X POST"));
+    }
+
+    #[test]
+    fn mktemp_template_does_not_have_suffix_after_placeholder() {
+        // Regression: any `.json` (or other literal suffix) after the
+        // `X` chars breaks macOS mktemp. This test fails loudly if
+        // someone "fixes" the template by re-adding an extension.
+        let cmd = render_hook_command("http://x.test/y");
+        assert!(
+            cmd.contains("mktemp /tmp/cnhk-XXXXXX)"),
+            "mktemp template must end in X's, no trailing literal suffix; got: {cmd}",
+        );
+        assert!(
+            !cmd.contains("XXXXXX.json"),
+            "mktemp must not have a literal extension after the X placeholder",
+        );
+    }
+
+    #[test]
+    fn body_is_drained_into_tempfile_before_curl_runs() {
+        let cmd = render_hook_command("http://x.test/y");
+        // Order check: `cat >` must appear before `curl ... --data-binary @`
+        // so the body is on disk before the network call happens.
+        let cat_pos = cmd.find(r#"cat > "$F""#).expect("cat segment present");
+        let curl_pos = cmd.find("curl").expect("curl segment present");
+        assert!(
+            cat_pos < curl_pos,
+            "stdin drain must precede curl invocation"
+        );
+        assert!(cmd.contains(r#"--data-binary @"$F""#));
+    }
+
+    #[test]
+    fn tempfile_is_cleaned_up_after_curl() {
+        let cmd = render_hook_command("http://x.test/y");
+        assert!(cmd.contains(r#"rm -f "$F""#));
+    }
+
+    #[test]
+    fn hook_subshell_is_backgrounded() {
+        let cmd = render_hook_command("http://x.test/y");
+        assert!(
+            cmd.trim_end().ends_with('&'),
+            "trailing & required so Claude's hook protocol gets an instant ack",
+        );
+    }
+}
+
 fn init_logging(verbose: bool) {
     let default_filter = if verbose {
         "contextnest=debug,tower_http=debug"
@@ -613,4 +779,199 @@ fn init_logging(verbose: bool) {
         )
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .try_init();
+}
+
+/// Resolve the WAL path from `CONTEXTNEST_WAL_PATH` or the default
+/// `~/.contextnest/wal.jsonl`. Returns `None` when neither env nor `$HOME`
+/// is set — in that case the server runs without persistence.
+fn wal_path_from_env() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("CONTEXTNEST_WAL_PATH") {
+        let p = PathBuf::from(explicit);
+        if p.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")?;
+    let p = PathBuf::from(home).join(".contextnest").join("wal.jsonl");
+    Some(p)
+}
+
+/// Replay mode for the WAL on startup.
+///
+/// `Sidecars` (default) is the fast, practical path: drops every record
+/// into the three sidecars in bulk and skips the canonical attractor
+/// pipeline entirely. Replay throughput is HashMap-insert bound — 12k
+/// records finish in well under a second. `/api/v1/inbox` and sessions
+/// metadata work immediately; `/api/v1/tools/retrieve` returns empty
+/// hits until the attractor store is repopulated by live writes.
+///
+/// `Full` runs each record through the real `store_with_id` pipeline,
+/// which includes `process_memories` and (when LLM is enabled) a
+/// blocking HTTP round-trip to OpenAI per fragment. Use only with
+/// LLM disabled or for small WALs where you specifically need
+/// canonical attractor state restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalReplayMode {
+    Sidecars,
+    Full,
+}
+
+impl WalReplayMode {
+    /// Resolve from `CONTEXTNEST_WAL_REPLAY_MODE` env. Unknown values
+    /// fall back to the safe default with a warning rather than aborting
+    /// the server — operators get a hint, the server still starts.
+    fn from_env() -> Self {
+        match std::env::var("CONTEXTNEST_WAL_REPLAY_MODE").ok().as_deref() {
+            Some("full") => Self::Full,
+            Some("sidecars") | None | Some("") => Self::Sidecars,
+            Some(other) => {
+                tracing::warn!(
+                    mode = %other,
+                    "Unknown CONTEXTNEST_WAL_REPLAY_MODE; defaulting to 'sidecars'",
+                );
+                Self::Sidecars
+            }
+        }
+    }
+}
+
+/// Replay any existing WAL records into `services`, then open the WAL
+/// file for append-only writes and install the writer into the services'
+/// OnceCell. Subsequent successful `store` HTTP calls will append.
+async fn bootstrap_wal(
+    services: &contextnest::services::ContextNestServices,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use contextnest::services::wal::{Wal, WalRecord};
+
+    let mode = WalReplayMode::from_env();
+    let records = Wal::read_records(path)?;
+    let total = records.len();
+
+    if total == 0 {
+        tracing::info!(
+            wal_path = %path.display(),
+            "WAL replay: no prior records (cold start)",
+        );
+    } else {
+        tracing::info!(
+            wal_path = %path.display(),
+            records = total,
+            mode = ?mode,
+            "WAL replay: starting",
+        );
+    }
+
+    let start = std::time::Instant::now();
+    let (replayed, failed) = match mode {
+        WalReplayMode::Sidecars => replay_sidecars(services, records).await,
+        WalReplayMode::Full => replay_full(services, records).await,
+    };
+
+    if total > 0 {
+        tracing::info!(
+            replayed,
+            failed,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "WAL replay: complete",
+        );
+    }
+
+    // Open writer for live appends, install in OnceCell. After this point,
+    // every store HTTP call writes through to disk before the response.
+    let writer = Wal::open_for_append(path.to_path_buf())?;
+    services
+        .wal
+        .set(writer)
+        .map_err(|_| "WAL OnceCell already initialized".to_string())?;
+    tracing::info!(wal_path = %path.display(), "WAL writer opened for append");
+
+    Ok(())
+}
+
+/// Sidecars-only fast replay. Bulk-inserts into the three sidecars; does
+/// not touch the canonical attractor manager. Returns (replayed, failed).
+async fn replay_sidecars(
+    services: &contextnest::services::ContextNestServices,
+    records: Vec<contextnest::services::wal::WalRecord>,
+) -> (usize, usize) {
+    use contextnest::services::wal::WalRecord;
+
+    // Project records into the tuple shape `restore_sidecars_bulk` wants.
+    // Importance is dropped — sidecars-only doesn't store it (canonical
+    // fragments do, and those are skipped in this mode).
+    let projected: Vec<_> = records
+        .into_iter()
+        .map(|r| match r {
+            WalRecord::Store {
+                fragment_id,
+                session_id,
+                content,
+                importance: _,
+                metadata,
+            } => (fragment_id, session_id, content, metadata),
+        })
+        .collect();
+
+    let count = projected.len();
+    contextnest::api::tools::restore_sidecars_bulk(services, projected).await;
+    (count, 0)
+}
+
+/// Full replay — runs each record through the live `store_with_id`
+/// pipeline. Slow when the LLM provider is enabled; only use for small
+/// WALs or with LLM disabled. Emits a progress log every 100 records so
+/// operators can see whether it's still making progress.
+async fn replay_full(
+    services: &contextnest::services::ContextNestServices,
+    records: Vec<contextnest::services::wal::WalRecord>,
+) -> (usize, usize) {
+    use contextnest::services::wal::WalRecord;
+
+    let total = records.len();
+    let mut replayed = 0usize;
+    let mut failed = 0usize;
+
+    for (idx, record) in records.into_iter().enumerate() {
+        match record {
+            WalRecord::Store {
+                fragment_id,
+                session_id,
+                content,
+                importance,
+                metadata,
+            } => match contextnest::api::tools::store_with_id(
+                services,
+                &fragment_id,
+                &session_id,
+                &content,
+                importance,
+                metadata,
+            )
+            .await
+            {
+                Ok(()) => replayed += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(
+                        fragment_id = %fragment_id,
+                        error = %e,
+                        "WAL replay: store_with_id failed; skipping record",
+                    );
+                }
+            },
+        }
+        if (idx + 1) % 100 == 0 {
+            tracing::info!(
+                done = idx + 1,
+                total,
+                replayed,
+                failed,
+                "WAL replay: progress",
+            );
+        }
+    }
+
+    (replayed, failed)
 }

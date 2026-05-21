@@ -146,7 +146,21 @@ async fn dispatch(
                 tracker.set(&sid, 0).await;
             });
         }
-        "user_prompt_submit" | "stop" => {
+        // user_prompt_submit, stop, and subagent_stop all share the same
+        // ingest path: read whatever's new in the (sub)session's transcript
+        // since the last fired event and extract memories from it.
+        //
+        // Why subagent_stop is now wired (was a no-op pre-fix): spawned
+        // subagents (via the Task tool) have their own JSONL transcript
+        // and their own z-insight blocks. Ignoring them meant inbox
+        // never saw the actionable items they produced — exactly the
+        // gap the researcher autopilot's todos[] currently work around
+        // by emitting from the main session.
+        //
+        // The SessionTracker keys on `session_id`, which is the
+        // subagent's own session id distinct from the parent's, so
+        // offsets don't collide.
+        "user_prompt_submit" | "stop" | "subagent_stop" => {
             let services = services.clone();
             tokio::spawn(async move {
                 if let Err(e) = tail_and_ingest(&services, &tracker, &payload).await {
@@ -161,12 +175,6 @@ async fn dispatch(
                     tracing::warn!(error = %e, "cc_hooks: store_task_completion failed");
                 }
             });
-        }
-        "subagent_stop" => {
-            tracing::debug!(
-                session_id = %payload.session_id,
-                "cc_hooks: subagent_stop received (no-op for MVP)"
-            );
         }
         other => {
             tracing::warn!(event = %other, "cc_hooks: unknown event, ignoring");
@@ -191,9 +199,24 @@ async fn tail_and_ingest(
         return Ok(());
     };
 
-    let bytes = tokio::fs::read(transcript_path)
-        .await
-        .map_err(|e| format!("read {}: {}", transcript_path.display(), e))?;
+    let bytes = match tokio::fs::read(transcript_path).await {
+        Ok(b) => b,
+        // Transcript file isn't there yet (or was rotated/deleted out from
+        // under us). Claude Code occasionally fires `user_prompt_submit`
+        // with a path that hasn't been flushed, or the session may have
+        // been pruned by the user. Treat as no-op — same shape as the
+        // "no transcript_path" early-return above. We deliberately do NOT
+        // bump the offset tracker: if the file reappears later (rare but
+        // possible on rename-into-place), we'll pick it up from byte 0.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                path = %transcript_path.display(),
+                "cc_hooks: transcript not found, skipping",
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("read {}: {}", transcript_path.display(), e)),
+    };
     let total_len = bytes.len() as u64;
 
     let last_offset = tracker.get(&payload.session_id).await;

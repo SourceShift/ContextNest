@@ -13,39 +13,51 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Core context management configuration
+    #[serde(default)]
     pub context: ContextConfig,
 
     /// Neural field configuration
+    #[serde(default)]
     pub neural_field: NeuralFieldConfig,
 
     /// Memory system configuration
+    #[serde(default)]
     pub memory: MemoryConfig,
 
     /// Protocol system configuration
+    #[serde(default)]
     pub protocols: ProtocolConfig,
 
     /// Service configurations
+    #[serde(default)]
     pub services: ServicesConfig,
 
     /// API configuration
+    #[serde(default)]
     pub api: ApiConfig,
 
     /// Logging and monitoring configuration
+    #[serde(default)]
     pub monitoring: MonitoringConfig,
 
     /// Performance and resource configuration
+    #[serde(default)]
     pub performance: PerformanceConfig,
 
     /// Database configuration
+    #[serde(default)]
     pub database: DatabaseConfig,
 
     /// Enhanced security configuration
+    #[serde(default)]
     pub security: SecurityConfig,
 
     /// Real-time synchronization configuration
+    #[serde(default)]
     pub synchronization: SynchronizationConfig,
 
     /// Plugin system configuration
+    #[serde(default)]
     pub plugins: PluginConfig,
 }
 
@@ -1036,6 +1048,7 @@ pub struct QueryOptimizationConfig {
 
 /// Embedding services configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EmbeddingServicesConfig {
     /// Enable embedding services
     pub enabled: bool,
@@ -1046,8 +1059,27 @@ pub struct EmbeddingServicesConfig {
     /// Provider type (openai, local, etc.)
     pub provider: String,
 
-    /// API key for external providers
+    /// API key for external providers (literal). Prefer leaving this `None`
+    /// and supplying the key via [`Self::api_key_env`] or the well-known
+    /// `DEEPINFRA_API_KEY` / `OPENAI_API_KEY` env vars — keeping secrets
+    /// out of `config.toml` reduces accidental-commit risk.
     pub api_key: Option<String>,
+
+    /// Name of the env var to read the API key from. Checked after
+    /// [`Self::api_key`] and before the `DEEPINFRA_API_KEY` / `OPENAI_API_KEY`
+    /// fallbacks. Useful when integrating against a provider whose
+    /// conventional env var differs (e.g. `TOGETHER_API_KEY`).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+
+    /// Base URL for the OpenAI-shaped embeddings endpoint. `None` falls
+    /// back to `https://api.openai.com/v1/embeddings`. Set this when
+    /// pointing at a drop-in compatible provider:
+    ///   - DeepInfra: `https://api.deepinfra.com/v1/openai/embeddings`
+    ///   - Together AI: `https://api.together.xyz/v1/embeddings`
+    ///   - Anyscale: `https://api.endpoints.anyscale.com/v1/embeddings`
+    #[serde(default)]
+    pub base_url: Option<String>,
 
     /// Model name/identifier
     pub model: String,
@@ -3142,6 +3174,8 @@ impl Default for EmbeddingServicesConfig {
             default_model: "local".to_string(),
             provider: "local".to_string(),
             api_key: None,
+            api_key_env: None,
+            base_url: None,
             model: "local".to_string(),
             models,
             cache: EmbeddingCacheConfig::default(),

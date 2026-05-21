@@ -312,9 +312,15 @@ impl ParserService {
         }
     }
 
-    /// Health check for parser service
+    /// Health check for parser service.
+    ///
+    /// The tree-sitter parser path is always available — Dart-analyzer is
+    /// an **optional enhancement** for Flutter-specific parsing. Treating
+    /// a missing Dart binary as "unhealthy" mis-reported the substrate as
+    /// down on every machine that doesn't have Dart installed (i.e. almost
+    /// all of them). We still probe the configured binary so the operator
+    /// can see degradation in the logs, but never fail health for it.
     pub async fn health_check(&self) -> ContextNestResult<bool> {
-        // Check if dart analyzer is available
         if !self.config.dart_analyzer_path.is_empty() {
             let analyzer_path = &self.config.dart_analyzer_path;
             match Command::new(analyzer_path)
@@ -324,13 +330,24 @@ impl ParserService {
                 .status()
                 .await
             {
-                Ok(status) => Ok(status.success()),
-                Err(_) => Ok(false),
+                Ok(status) if status.success() => {
+                    tracing::debug!(
+                        analyzer = %analyzer_path,
+                        "Dart analyzer reachable; parser running in enhanced mode"
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    // Configured but not runnable — degraded, not failed.
+                    tracing::debug!(
+                        analyzer = %analyzer_path,
+                        "Dart analyzer configured but not runnable; falling back to tree-sitter"
+                    );
+                }
             }
-        } else {
-            // Tree-sitter parser is always available
-            Ok(true)
         }
+        // Tree-sitter is always available, so the parser service is always
+        // ready to handle requests — possibly in degraded (non-Dart) mode.
+        Ok(true)
     }
 
     /// Find project root by walking up looking for a manifest

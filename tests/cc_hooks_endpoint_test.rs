@@ -262,6 +262,79 @@ async fn re_firing_user_prompt_submit_is_idempotent() {
 }
 
 #[tokio::test]
+async fn subagent_stop_triggers_ingest_and_lands_fragments() {
+    // Regression: pre-fix, subagent_stop was a no-op debug log.
+    // Task-spawned subagents have their own transcript JSONL and emit
+    // z-insight blocks just like the parent — but ContextNest threw
+    // them away. This test exercises the new dispatch arm.
+    //
+    // The substrate's `/api/v1/tools/retrieve` is the universal
+    // visibility surface for stored fragments — after the sidecar
+    // fallback added in this PR it returns hits (with similarity=0)
+    // for ServicesSink-stored fragments even though those don't go
+    // through the canonical attractor pipeline. Polling /retrieve
+    // here keeps this test self-contained within the substrate
+    // hardening PR.
+    let server = make_server().await;
+    let transcript = fixture_path();
+    assert!(
+        transcript.exists(),
+        "fixture transcript must exist at {}",
+        transcript.display()
+    );
+
+    // A subagent has its OWN session_id, distinct from the parent's.
+    let sub_session_uuid = "subagent01-fake-session-id";
+
+    // Register subagent session start (production hook layout always
+    // fires SessionStart before SubagentStop). Belt-and-suspenders.
+    server
+        .post("/api/v1/cc/hook/session_start")
+        .json(&json!({
+            "session_id": sub_session_uuid,
+            "cwd": "/work/example",
+            "hook_event_name": "SessionStart",
+        }))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // Fire subagent_stop. With the fix, this triggers tail_and_ingest
+    // on the supplied transcript — the same code path user_prompt_submit
+    // / stop use. Without the fix, it is a no-op and no fragments land.
+    server
+        .post("/api/v1/cc/hook/subagent_stop")
+        .json(&json!({
+            "session_id": sub_session_uuid,
+            "cwd": "/work/example",
+            "transcript_path": transcript.to_string_lossy(),
+            "hook_event_name": "SubagentStop",
+        }))
+        .await
+        .assert_status(axum::http::StatusCode::NO_CONTENT);
+
+    // The fixture's z-insight blocks include user_action entries.
+    // Look for them under the subagent's substrate session id.
+    let sub_substrate_session = format!("cc-{}", &sub_session_uuid[..8]);
+    let hits = poll_retrieve(
+        &server,
+        &sub_substrate_session,
+        json!({"kind": "user_action"}),
+        1,
+        Duration::from_secs(3),
+    )
+    .await;
+    let count = hits
+        .get("hits")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "subagent_stop must have produced at least one user_action fragment for {sub_substrate_session} (got {count} :: {hits})"
+    );
+}
+
+#[tokio::test]
 async fn task_completed_stores_accomplishment_without_transcript() {
     let server = make_server().await;
     let res = server

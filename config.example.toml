@@ -1,0 +1,68 @@
+# ContextNest example runtime config.
+#
+# Copy this file to `config.toml` (which is git-ignored) and edit to taste.
+# The substrate's binary loads `./config.toml` by default — if absent, it
+# falls back to the in-memory Config::default (local TF-IDF embeddings, no
+# persistence). Override the path via $CONTEXTNEST_CONFIG.
+#
+# This example wires the embedding service to DeepInfra's
+# `Qwen/Qwen3-Embedding-0.6B` (OpenAI-compatible API surface). To use a
+# different provider:
+#   - OpenAI:      base_url unset, model = "text-embedding-3-small"
+#   - DeepInfra:   base_url = "https://api.deepinfra.com/v1/openai/embeddings"
+#   - Together AI: base_url = "https://api.together.xyz/v1/embeddings"
+#   - Local TF-IDF: delete the [services.embedding] section entirely — the
+#                   Config::default kicks in and no API key is required.
+#
+# Secrets policy: NO API keys belong in this file. The substrate resolves
+# the key from (in order): config.api_key literal, the env var named by
+# config.api_key_env, $DEEPINFRA_API_KEY, $OPENAI_API_KEY. Set whichever
+# matches your provider in your shell (or in a chmod-600 file you source
+# from your shell rc).
+
+[services.embedding]
+enabled = true
+
+# `default_model` selects which entry in [services.embedding.models.*]
+# decides the model_type (OpenAI vs Local vs Custom). Pointing it at our
+# `qwen3-deepinfra` entry routes through the OpenAI-shaped HTTP handler
+# in src/services/embedding.rs::generate_openai_embedding.
+default_model = "qwen3-deepinfra"
+
+# Provider tag is informational only — the dispatch happens via
+# `default_model` → `models[default_model].model_type`.
+provider = "deepinfra"
+
+# Override the OpenAI base URL with DeepInfra's OpenAI-compat endpoint.
+# Same request shape (`{input, model}`), same response shape
+# (`{data: [{embedding: [...]}]}`), only this URL + the auth bearer differ.
+base_url = "https://api.deepinfra.com/v1/openai/embeddings"
+
+# Empty literal — api_key resolution falls through to $DEEPINFRA_API_KEY
+# (well-known fallback in src/services/embedding.rs::resolve_api_key).
+api_key = ""
+
+# Model string sent in the request body. DeepInfra accepts the exact
+# HuggingFace path. Other Qwen3 sizes can be swapped here without code
+# change: Qwen/Qwen3-Embedding-1.5B, Qwen/Qwen3-Embedding-8B.
+model = "Qwen/Qwen3-Embedding-0.6B"
+
+# Native output dimension for Qwen3-0.6B. Used by callers that pre-size
+# vectors; not sent in the request (DeepInfra returns native dims unless
+# explicitly truncated, which we don't currently request).
+dimensions = 1024
+
+# Per-model entry referenced by default_model. The `OpenAI` model_type
+# routes to the OpenAI-shaped HTTP handler regardless of the actual
+# upstream provider — DeepInfra speaks the same protocol.
+[services.embedding.models.qwen3-deepinfra]
+model_type = "OpenAI"
+dimensions = 1024
+
+[services.embedding.models.qwen3-deepinfra.parameters]
+
+[services.embedding.models.qwen3-deepinfra.settings]
+batch_size = 16
+max_input_length = 8192
+normalization = true
+pooling_strategy = "Mean"
