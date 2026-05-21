@@ -6,8 +6,11 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
 use crate::api::cc_hooks::{self, SessionTracker};
+use crate::api::field;
+use crate::api::inbox;
 use crate::api::services::ServiceContainer;
 use crate::api::sessions;
+use crate::api::stats;
 use crate::api::tools;
 use crate::services::ContextNestServices;
 
@@ -28,6 +31,9 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     // router's State<S> signature.
     let cc_hooks_router = cc_hooks::create_cc_hooks_router();
     let sessions_router = sessions::create_sessions_router();
+    let inbox_router = inbox::create_inbox_router();
+    let stats_router = stats::create_stats_router();
+    let field_router = field::create_field_router();
     let session_tracker = Arc::new(SessionTracker::new());
 
     let base_router = Router::new()
@@ -36,6 +42,9 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .merge(tools_router)
         .merge(cc_hooks_router)
         .merge(sessions_router)
+        .merge(inbox_router)
+        .merge(stats_router)
+        .merge(field_router)
         .layer(Extension(session_tracker))
         .with_state(services);
 

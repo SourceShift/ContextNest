@@ -1,17 +1,23 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
-import { MOCK } from '@/lib/mock-data';
+import { api } from '@/lib/api';
+import { useSessions, useKnownProjects } from '@/hooks/useSessions';
+import type { RetrieveHit, SessionListItem } from '@/lib/types';
 
 export const Route = createFileRoute('/search')({
   component: SearchPage,
 });
 
 type Chip = { k: string; v: string };
-
 const CHIP_KEYS = ['kind', 'project', 'session', 'urgency'] as const;
-const VALUES_FOR: Record<(typeof CHIP_KEYS)[number], string[]> = {
+
+// Static menu of kinds + urgencies (these are the substrate's enums,
+// not data values). Project / session lists are populated live from
+// useSessions / useKnownProjects so they reflect the actual substrate.
+const STATIC_VALUES: Partial<Record<(typeof CHIP_KEYS)[number], string[]>> = {
   kind: [
     'learning',
     'accomplishment',
@@ -20,18 +26,53 @@ const VALUES_FOR: Record<(typeof CHIP_KEYS)[number], string[]> = {
     'todo',
     'user_action',
     'goal_phase',
-    'fact',
+    'state',
+    'current_task',
+    'summary',
   ],
-  project: ['contextnest', 'z-insight', 'ratchet', 'scratch-llm'],
-  session: ['cc-7f3a2e91', 'cc-a812bc40', 'cc-d4f0e8b2'],
   urgency: ['now', 'soon', 'later'],
 };
 
+function basename(p: string | null | undefined): string {
+  if (!p) return '?';
+  const segs = p.replace(/\/+$/, '').split('/');
+  return segs[segs.length - 1] || '?';
+}
+
+function shortTs(ts: string | undefined): string {
+  if (!ts) return '';
+  // ISO → 2026-05-21 · 09:30
+  const m = ts.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  return m ? `${m[1]} · ${m[2]}` : ts.slice(0, 16);
+}
+
+// Light highlight — wraps every occurrence of the query (case-insensitive)
+// in <mark>. Not robust HTML escaping; the substrate's content is
+// trusted user-written text from the same machine.
+function highlight(text: string, query: string): string {
+  if (!query) return text;
+  const safeQuery = query.trim();
+  if (!safeQuery) return text;
+  try {
+    const re = new RegExp(safeQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    return text.replace(re, (m) => `<mark>${m}</mark>`);
+  } catch {
+    return text;
+  }
+}
+
+type SearchResultRow = RetrieveHit & {
+  session_id: string;
+  project: string;
+};
+
 function SearchPage() {
-  const [q, setQ] = useState('mpsc back-pressure');
-  const [chips, setChips] = useState<Chip[]>([{ k: 'kind', v: 'learning' }]);
+  const [q, setQ] = useState('');
+  const [chips, setChips] = useState<Chip[]>([]);
   const [focused, setFocused] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const sessions = useSessions();
+  const knownProjects = useKnownProjects();
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -40,18 +81,81 @@ function SearchPage() {
   const removeChip = (i: number) => setChips((c) => c.filter((_, j) => j !== i));
   const addChip = (k: string, v: string) => setChips((c) => [...c, { k, v }]);
 
-  const all = MOCK.searchResults;
-  const results =
-    q.length === 0
-      ? []
-      : all.filter((r) => {
-          for (const c of chips) {
-            if (c.k === 'kind' && r.kind !== c.v) return false;
-            if (c.k === 'project' && r.project !== c.v) return false;
-            if (c.k === 'session' && r.sessionId !== c.v) return false;
+  const sessionChip = chips.find((c) => c.k === 'session');
+  const kindChip = chips.find((c) => c.k === 'kind');
+  const projectChip = chips.find((c) => c.k === 'project');
+  const urgencyChip = chips.find((c) => c.k === 'urgency');
+
+  // Build the metadata_filter the substrate's retrieve handler accepts.
+  // Kind and urgency map directly to metadata keys. Project requires a
+  // project_cwd match — but the chip value is a basename, not the full
+  // path, so we filter client-side after retrieval instead.
+  const metadataFilter: Record<string, unknown> = useMemo(() => {
+    const f: Record<string, unknown> = {};
+    if (kindChip) f.kind = kindChip.v;
+    if (urgencyChip) f.urgency = urgencyChip.v;
+    return f;
+  }, [kindChip, urgencyChip]);
+
+  // Pick the target sessions: explicit chip > "first 10 newest sessions".
+  // We fan out to multiple sessions because the substrate's retrieve is
+  // session-scoped. For most substrates this is a handful of sessions,
+  // but for a heavily-populated dashboard (your 96+ sessions) we cap at
+  // 10 newest by last_ts to keep the query cheap.
+  const targetSessions: SessionListItem[] = useMemo(() => {
+    if (sessionChip) {
+      return sessions.data.filter((s) => s.id === sessionChip.v);
+    }
+    const sorted = [...sessions.data].sort((a, b) => {
+      const at = a.last_ts ? Date.parse(a.last_ts) : 0;
+      const bt = b.last_ts ? Date.parse(b.last_ts) : 0;
+      return bt - at;
+    });
+    return sorted.slice(0, 10);
+  }, [sessions.data, sessionChip]);
+
+  const searchQuery = useQuery({
+    queryKey: ['search', q, metadataFilter, targetSessions.map((s) => s.id)],
+    enabled: q.trim().length > 0 && targetSessions.length > 0,
+    staleTime: 5_000,
+    queryFn: async (): Promise<SearchResultRow[]> => {
+      // Fan-out: one retrieve call per session in scope. Returns are
+      // merged and sorted by similarity desc. For session-scoped queries
+      // this is one call; for "all sessions" mode it's capped at 10.
+      const perSession = await Promise.all(
+        targetSessions.map(async (s) => {
+          try {
+            const res = await api.retrieve({
+              session_id: s.id,
+              query: q,
+              top_k: 20,
+              metadata_filter:
+                Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
+            });
+            const proj = basename(s.project_cwd);
+            return res.hits.map(
+              (hit): SearchResultRow => ({
+                ...hit,
+                session_id: s.id,
+                project: proj,
+              }),
+            );
+          } catch {
+            return [];
           }
-          return true;
-        });
+        }),
+      );
+      const flat = perSession.flat();
+      // Apply client-side project filter (chip is a basename).
+      const filtered = projectChip
+        ? flat.filter((r) => r.project === projectChip.v)
+        : flat;
+      filtered.sort((a, b) => b.similarity - a.similarity);
+      return filtered.slice(0, 40);
+    },
+  });
+
+  const results: SearchResultRow[] = searchQuery.data ?? [];
 
   return (
     <div>
@@ -94,10 +198,18 @@ function SearchPage() {
             </span>
           </span>
         ))}
-        <ChipAdder onAdd={addChip} />
+        <ChipAdder
+          onAdd={addChip}
+          knownProjects={knownProjects}
+          knownSessions={sessions.data.map((s) => s.id).slice(0, 25)}
+        />
         <div className="grow" />
         <span className="mono dim" style={{ fontSize: 11 }}>
-          {q ? `${results.length} hits · ${chips.length} filters` : 'type to search'}
+          {q
+            ? searchQuery.isLoading
+              ? 'searching…'
+              : `${results.length} hits · ${chips.length} filters · ${targetSessions.length} session(s) searched`
+            : 'type to search'}
         </span>
       </div>
 
@@ -139,37 +251,44 @@ function SearchPage() {
             <div className="empty-body">Try removing a filter or broadening the query.</div>
           </div>
         ) : (
-          results.map((r, i) => (
-            <div
-              key={i}
-              className={`search-result${focused === i ? ' focused' : ''}`}
-              onMouseEnter={() => setFocused(i)}
-            >
-              <div>
-                <div className="meta-row">
-                  <KindBadge kind={r.kind} />
-                  <SessionPill id={r.sessionId} />
-                  <ProjBadge p={r.project} />
-                  <span>· {r.stored}</span>
+          results.map((r, i) => {
+            const kind = (r.metadata.kind as string | undefined) ?? 'unknown';
+            const stored = shortTs(r.metadata.ts as string | undefined);
+            return (
+              <div
+                key={r.id}
+                className={`search-result${focused === i ? ' focused' : ''}`}
+                onMouseEnter={() => setFocused(i)}
+              >
+                <div>
+                  <div className="meta-row">
+                    <KindBadge kind={kind} />
+                    <SessionPill id={r.session_id} />
+                    <ProjBadge p={r.project} />
+                    {stored && <span>· {stored}</span>}
+                  </div>
+                  <div
+                    className="snippet"
+                    dangerouslySetInnerHTML={{ __html: highlight(r.content, q) }}
+                  />
                 </div>
-                <div className="snippet" dangerouslySetInnerHTML={{ __html: r.snippet }} />
+                <div className="sim">
+                  <div className="mono" style={{ fontSize: 10.5 }}>
+                    sim · {r.similarity.toFixed(2)}
+                  </div>
+                  <div className="sim-bar">
+                    <span style={{ width: `${Math.max(0, Math.min(1, r.similarity)) * 100}%` }} />
+                  </div>
+                  <div
+                    className="mono"
+                    style={{ fontSize: 9.5, color: 'var(--ink-faint)', marginTop: 2 }}
+                  >
+                    tf-idf · 256d
+                  </div>
+                </div>
               </div>
-              <div className="sim">
-                <div className="mono" style={{ fontSize: 10.5 }}>
-                  sim · {r.similarity.toFixed(2)}
-                </div>
-                <div className="sim-bar">
-                  <span style={{ width: `${r.similarity * 100}%` }} />
-                </div>
-                <div
-                  className="mono"
-                  style={{ fontSize: 9.5, color: 'var(--ink-faint)', marginTop: 2 }}
-                >
-                  tf-idf · 256d
-                </div>
-              </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 
@@ -188,10 +307,27 @@ function SearchPage() {
   );
 }
 
-function ChipAdder({ onAdd }: { onAdd: (k: string, v: string) => void }) {
+function ChipAdder({
+  onAdd,
+  knownProjects,
+  knownSessions,
+}: {
+  onAdd: (k: string, v: string) => void;
+  knownProjects: string[];
+  knownSessions: string[];
+}) {
   const [open, setOpen] = useState(false);
   const [key, setKey] = useState<(typeof CHIP_KEYS)[number] | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+
+  // Merge static enums (kind, urgency) with live values (project, session)
+  // so the dropdown reflects whatever is actually in the substrate.
+  const valuesFor: Record<(typeof CHIP_KEYS)[number], string[]> = {
+    kind: STATIC_VALUES.kind ?? [],
+    urgency: STATIC_VALUES.urgency ?? [],
+    project: knownProjects,
+    session: knownSessions,
+  };
 
   useEffect(() => {
     const fn = (e: MouseEvent) => {
@@ -254,7 +390,7 @@ function ChipAdder({ onAdd }: { onAdd: (k: string, v: string) => void }) {
               >
                 {key} ·
               </div>
-              {VALUES_FOR[key].map((v) => (
+              {valuesFor[key].map((v) => (
                 <div
                   key={v}
                   onClick={() => {

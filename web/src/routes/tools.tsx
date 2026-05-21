@@ -1,7 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { Icon } from '@/components/atoms';
+import { ApiError, substrateUrl } from '@/lib/api';
 import { MOCK } from '@/lib/mock-data';
 
 export const Route = createFileRoute('/tools')({
@@ -37,43 +38,161 @@ type Resp =
   | { kind: 'ok'; body: unknown; status: number; ms: number }
   | { kind: 'err'; body: unknown; status: number; ms: number };
 
+type RecentCall = {
+  t: string;
+  verb: ToolName;
+  ms: number;
+  status: number;
+  ok: boolean;
+};
+
+// Each tool maps to its `api.<method>` client call. We POST raw JSON
+// rather than going through the typed client for every tool because:
+// 1. Users on the Tools page are intentionally driving raw API calls
+//    and need to see status/timing exactly as the wire returns them.
+// 2. The typed client doesn't expose summarize/reconstruct/resonate yet.
+// 3. Constructing a generic fetch keeps the playground future-proof:
+//    new tools added to the backend's seven-tool API surface here
+//    without a client release.
+async function sendRaw(
+  tool: ToolName,
+  body: unknown,
+): Promise<{ status: number; body: unknown; ms: number }> {
+  const url = `${substrateUrl}/api/v1/tools/${tool}`;
+  const start = performance.now();
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const ms = Math.round(performance.now() - start);
+  let parsed: unknown = null;
+  try {
+    parsed = await res.json();
+  } catch {
+    parsed = { _note: 'non-JSON response body' };
+  }
+  return { status: res.status, body: parsed, ms };
+}
+
 function ToolsPage() {
   const [tool, setTool] = useState<ToolName>('retrieve');
   const [tmpl, setTmpl] = useState('basic');
   const [resp, setResp] = useState<Resp>({ kind: 'idle' });
+  const [recent, setRecent] = useState<RecentCall[]>([]);
+  const [bodyText, setBodyText] = useState('');
+  const [parseErr, setParseErr] = useState<string | null>(null);
 
-  const reqText = useMemo(
+  // Default body comes from MOCK.toolTemplates — these are starter
+  // values, not "data". Users can edit before Send.
+  const defaultText = useMemo(
     () => JSON.stringify(MOCK.toolTemplates[tool] ?? {}, null, 2),
-    // tmpl participates in the request key so swapping it forces a fresh
-    // template body, even though we don't yet vary the body by tmpl.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tool, tmpl],
+    [tool],
   );
+
+  // When the user switches tool or template, reset the editor to the
+  // tool's default body. They've already-edited bodies are not
+  // preserved across tool switches (intentional — different tools take
+  // different shapes; carrying over creates more confusion than it
+  // saves).
+  useEffect(() => {
+    setBodyText(defaultText);
+    setResp({ kind: 'idle' });
+    setParseErr(null);
+  }, [tool, tmpl, defaultText]);
+
+  // Parse-check on every keystroke so the footer can show validity.
+  useEffect(() => {
+    try {
+      JSON.parse(bodyText);
+      setParseErr(null);
+    } catch (e) {
+      setParseErr(e instanceof Error ? e.message : String(e));
+    }
+  }, [bodyText]);
 
   const handleSelectTool = (t: ToolName) => {
     setTool(t);
-    setResp({ kind: 'idle' });
   };
 
   const handleSelectTmpl = (t: string) => {
     setTmpl(t);
-    setResp({ kind: 'idle' });
   };
 
-  const send = () => {
+  const send = async () => {
+    if (parseErr) return; // button is disabled, but belt-and-suspenders
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch (e) {
+      setResp({
+        kind: 'err',
+        status: 0,
+        body: { error: 'request body is not valid JSON', detail: String(e) },
+        ms: 0,
+      });
+      return;
+    }
+
     setResp({ kind: 'sending' });
-    setTimeout(() => {
-      const r = (MOCK.toolResponses as Record<string, unknown>)[tool];
-      if (r) setResp({ kind: 'ok', body: r, status: 200, ms: 142 });
-      else
-        setResp({
-          kind: 'ok',
-          body: { ok: true, note: `${tool} executed (mocked response)` },
-          status: 200,
-          ms: 88,
-        });
-    }, 600);
+    try {
+      const { status, body, ms } = await sendRaw(tool, parsed);
+      const ok = status >= 200 && status < 300;
+      setResp({ kind: ok ? 'ok' : 'err', status, body, ms });
+      setRecent((prev) =>
+        [
+          {
+            t: new Date().toLocaleTimeString(undefined, { hour12: false }),
+            verb: tool,
+            ms,
+            status,
+            ok,
+          },
+          ...prev,
+        ].slice(0, 20),
+      );
+    } catch (e) {
+      const detail =
+        e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+      setResp({
+        kind: 'err',
+        status: 0,
+        body: { error: 'network failure', detail },
+        ms: 0,
+      });
+      setRecent((prev) =>
+        [
+          {
+            t: new Date().toLocaleTimeString(undefined, { hour12: false }),
+            verb: tool,
+            ms: 0,
+            status: 0,
+            ok: false,
+          },
+          ...prev,
+        ].slice(0, 20),
+      );
+    }
   };
+
+  // Cmd/Ctrl+Enter to send. Mounting it at the page level so the
+  // shortcut works whether the textarea is focused or not.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        void send();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // send closes over current state via the function identity; React
+    // re-creates it each render. Re-binding is cheap.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bodyText, tool, parseErr]);
+
+  const respText =
+    resp.kind === 'ok' || resp.kind === 'err' ? JSON.stringify(resp.body, null, 2) : '';
 
   return (
     <div>
@@ -123,7 +242,7 @@ function ToolsPage() {
               <span className="mono dim" style={{ fontSize: 10 }}>
                 templates:
               </span>
-              {['basic', 'inbox-item', 'goal-phase'].map((t) => (
+              {['basic'].map((t) => (
                 <span
                   key={t}
                   className={`chip${tmpl === t ? ' active' : ''}`}
@@ -133,19 +252,52 @@ function ToolsPage() {
                   ▸ {t}
                 </span>
               ))}
+              <button
+                className="btn btn-ghost sm"
+                title="reset to template"
+                onClick={() => setBodyText(defaultText)}
+                type="button"
+              >
+                <Icon.Refresh />
+              </button>
             </div>
           </div>
-          <div className="json-editor">
-            <Gutter text={reqText} />
-            <pre className="json-body" style={{ margin: 0 }}>
-              <JsonHL src={reqText} />
-            </pre>
-          </div>
+          <textarea
+            value={bodyText}
+            onChange={(e) => setBodyText(e.target.value)}
+            spellCheck={false}
+            className="json-body"
+            style={{
+              width: '100%',
+              minHeight: 280,
+              fontFamily: 'var(--font-mono)',
+              fontSize: 12.5,
+              padding: 14,
+              background: 'var(--surface)',
+              color: 'var(--ink)',
+              border: 'none',
+              borderTop: '1px solid var(--border-subtle)',
+              outline: 'none',
+              resize: 'vertical',
+            }}
+          />
           <div className="tools-foot">
-            <span className="mono dim" style={{ fontSize: 10.5 }}>
-              {reqText.split('\n').length} lines · {reqText.length} bytes · valid json
+            <span
+              className="mono dim"
+              style={{
+                fontSize: 10.5,
+                color: parseErr ? 'var(--urg-now)' : undefined,
+              }}
+            >
+              {bodyText.split('\n').length} lines · {bodyText.length} bytes ·{' '}
+              {parseErr ? `invalid: ${parseErr}` : 'valid json'}
             </span>
-            <button className="btn btn-primary" onClick={send} type="button">
+            <button
+              className="btn btn-primary"
+              onClick={send}
+              type="button"
+              disabled={!!parseErr || resp.kind === 'sending'}
+            >
               <Icon.Send /> Send{' '}
               <span className="kbd" style={{ marginLeft: 4 }}>
                 ⌘↵
@@ -165,12 +317,19 @@ function ToolsPage() {
               )}
               {resp.kind === 'err' && (
                 <span className="status-pill err">
-                  {resp.status} · {resp.ms}ms
+                  {resp.status || 'ERR'} · {resp.ms}ms
                 </span>
               )}
               {resp.kind === 'idle' && <span className="status-pill idle">idle</span>}
               {resp.kind === 'sending' && <span className="status-pill idle">sending…</span>}
-              <button className="btn btn-ghost sm" title="copy" type="button">
+              <button
+                className="btn btn-ghost sm"
+                title="copy"
+                onClick={() => {
+                  if (respText) void navigator.clipboard?.writeText(respText);
+                }}
+                type="button"
+              >
                 <Icon.Copy />
               </button>
             </div>
@@ -193,7 +352,7 @@ function ToolsPage() {
                 ↳ Send a request to see the typed response here.
               </div>
               <div className="mono" style={{ fontSize: 10, color: 'var(--ink-faint)' }}>
-                shortcuts · cmd+↵ send · cmd+/ focus body · cmd+1..7 switch tool
+                shortcuts · cmd+↵ send
               </div>
             </div>
           )}
@@ -208,11 +367,11 @@ function ToolsPage() {
               ))}
             </div>
           )}
-          {resp.kind === 'ok' && (
+          {(resp.kind === 'ok' || resp.kind === 'err') && (
             <div className="json-editor">
-              <Gutter text={JSON.stringify(resp.body, null, 2)} />
+              <Gutter text={respText} />
               <pre className="json-body" style={{ margin: 0 }}>
-                <JsonHL src={JSON.stringify(resp.body, null, 2)} />
+                <JsonHL src={respText} />
               </pre>
             </div>
           )}
@@ -221,18 +380,28 @@ function ToolsPage() {
 
       <div style={{ marginTop: 18 }} className="section-h">
         <h3>Recent calls · this session</h3>
-        <span className="hint">last 5</span>
+        <span className="hint">last {Math.min(recent.length, 20)} · client-side only</span>
       </div>
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-        {MOCK.recentActivity.slice(0, 5).map((a, i) => (
-          <div className="activity-row" key={i}>
-            <span className="t">{a.t}</span>
-            <span className={`verb v-${a.verb}`}>{a.verb}</span>
-            <span>{a.target}</span>
-            <span className="t">{a.ms}ms</span>
-            <span className="ok">200</span>
+        {recent.length === 0 ? (
+          <div className="empty">
+            <div className="empty-title">No calls yet</div>
+            <div className="empty-sub">
+              Press <span className="kbd">⌘ ↵</span> with a valid request body to send your first
+              call. Calls are tracked only in this page; reload clears them.
+            </div>
           </div>
-        ))}
+        ) : (
+          recent.map((a, i) => (
+            <div className="activity-row" key={i}>
+              <span className="t">{a.t}</span>
+              <span className={`verb v-${a.verb}`}>{a.verb}</span>
+              <span>POST /api/v1/tools/{a.verb}</span>
+              <span className="t">{a.ms}ms</span>
+              <span className={a.ok ? 'ok' : 'err'}>{a.status || 'ERR'}</span>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

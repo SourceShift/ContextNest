@@ -67,8 +67,13 @@ impl InboxItem {
         let metadata = hit.get("metadata")?.as_object()?;
         let kind = metadata.get("kind")?.as_str()?.to_string();
 
-        // Only `user_action` and `decision` belong in the inbox.
-        if kind != "user_action" && kind != "decision" {
+        // Only `user_action`, `todo`, and `decision` belong in the inbox.
+        // Kept in sync with the backend endpoint
+        // (`src/api/inbox.rs::is_inbox_eligible`) and the frontend filter
+        // (`web/src/hooks/useInbox.ts`). Researcher-style autopilot data
+        // contains `todo` entries that read as "user needs to pick X" —
+        // semantically inbox-worthy even without an explicit user_action tag.
+        if kind != "user_action" && kind != "decision" && kind != "todo" {
             return None;
         }
 

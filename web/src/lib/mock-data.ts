@@ -23,7 +23,7 @@ export type InboxItemMock = {
   id: string;
   sessionId: string;
   project: string;
-  kind: 'user_action' | 'decision';
+  kind: 'user_action' | 'decision' | 'todo';
   awaiting?: boolean;
   urgency: Urgency;
   action: string;

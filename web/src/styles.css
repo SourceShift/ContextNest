@@ -1732,6 +1732,34 @@ body {
   max-width: none;
 }
 
+.field-scrubber {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 6px;
+  background: rgba(10, 10, 10, 0.82);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px 4px;
+  z-index: 4;
+}
+.field-scrubber .scrubber-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.field-scrubber .scrubber-marks {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  margin-top: -2px;
+}
+
 .field-overlay-tr {
   position: absolute;
   top: 14px;

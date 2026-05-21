@@ -2,11 +2,15 @@ import { useQuery } from '@tanstack/react-query';
 
 import { api } from '@/lib/api';
 import type { InboxItemMock } from '@/lib/mock-data';
-import type { RetrieveHit } from '@/lib/types';
+import type { InboxHit } from '@/lib/types';
 import { agoFrom, isWithinMinutes } from '@/lib/relative-time';
 
-type ValidKind = 'user_action' | 'decision';
-const VALID_KINDS: ReadonlySet<string> = new Set<ValidKind>(['user_action', 'decision']);
+type ValidKind = 'user_action' | 'decision' | 'todo';
+const VALID_KINDS: ReadonlySet<string> = new Set<ValidKind>([
+  'user_action',
+  'decision',
+  'todo',
+]);
 const VALID_URGENCIES = new Set(['now', 'soon', 'later']);
 
 function basename(p: string | undefined): string {
@@ -15,12 +19,13 @@ function basename(p: string | undefined): string {
   return segs[segs.length - 1] || '?';
 }
 
-function mapHit(hit: RetrieveHit, sessionId: string): InboxItemMock | null {
+function mapHit(hit: InboxHit): InboxItemMock | null {
   const kind = hit.metadata.kind;
   if (!kind || !VALID_KINDS.has(kind)) return null;
 
   const rawUrgency = hit.metadata.urgency;
   const isDecision = kind === 'decision';
+  const isTodo = kind === 'todo';
   const awaiting = hit.metadata.awaiting_decision ?? false;
 
   let urgency: 'now' | 'soon' | 'later';
@@ -28,6 +33,10 @@ function mapHit(hit: RetrieveHit, sessionId: string): InboxItemMock | null {
     urgency = rawUrgency as 'now' | 'soon' | 'later';
   } else if (isDecision && awaiting) {
     urgency = 'now';
+  } else if (isTodo) {
+    // Open todos default to `soon` — they're actionable but not as
+    // blocking as a decision that's literally awaiting the user.
+    urgency = 'soon';
   } else {
     urgency = 'later';
   }
@@ -36,7 +45,7 @@ function mapHit(hit: RetrieveHit, sessionId: string): InboxItemMock | null {
 
   return {
     id: hit.id,
-    sessionId,
+    sessionId: hit.session_id,
     project: basename(hit.metadata.project_cwd),
     kind: kind as ValidKind,
     awaiting: awaiting || undefined,
@@ -53,52 +62,19 @@ function mapHit(hit: RetrieveHit, sessionId: string): InboxItemMock | null {
   };
 }
 
+// Single round-trip — replaces the previous `1 sessions + 2N retrieves` fan-out.
+// All inbox filtering (kind, awaiting_decision, soft-delete visibility) is done
+// server-side in `GET /api/v1/inbox` so the dashboard pays one HTTP call per
+// poll regardless of how many sessions the substrate is tracking.
 async function fetchInbox(): Promise<InboxItemMock[]> {
-  const { sessions } = await api.sessions();
+  const { items } = await api.inbox();
 
-  if (sessions.length === 0) return [];
-
-  const perSessionResults = await Promise.all(
-    sessions.map(async (s) => {
-      try {
-        const [userActionsRes, decisionsRes] = await Promise.all([
-          api.retrieve({
-            session_id: s.id,
-            query: 'user_action',
-            top_k: 50,
-            metadata_filter: { kind: 'user_action' },
-          }),
-          api.retrieve({
-            session_id: s.id,
-            query: 'awaiting decision',
-            top_k: 50,
-            metadata_filter: { kind: 'decision', awaiting_decision: true },
-          }),
-        ]);
-        return { ok: true as const, hits: [...userActionsRes.hits, ...decisionsRes.hits], sessionId: s.id };
-      } catch (err) {
-        console.warn(`[useInbox] session ${s.id} retrieve failed:`, err);
-        return { ok: false as const, err, sessionId: s.id };
-      }
-    }),
-  );
-
-  const failures = perSessionResults.filter((r) => !r.ok);
-  if (failures.length === perSessionResults.length) {
-    const firstFail = failures[0];
-    throw firstFail.err instanceof Error ? firstFail.err : new Error(String(firstFail.err));
+  const result: InboxItemMock[] = [];
+  for (const hit of items) {
+    const mapped = mapHit(hit);
+    if (mapped) result.push(mapped);
   }
-
-  const items: InboxItemMock[] = [];
-  for (const result of perSessionResults) {
-    if (!result.ok) continue;
-    for (const hit of result.hits) {
-      const mapped = mapHit(hit, result.sessionId);
-      if (mapped) items.push(mapped);
-    }
-  }
-
-  return items;
+  return result;
 }
 
 export type UseInboxResult = {
