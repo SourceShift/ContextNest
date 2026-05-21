@@ -219,6 +219,26 @@ impl SessionIndex {
         result.sort();
         result
     }
+
+    /// Snapshot every active `(fragment_id, session_id)` pair under a **single**
+    /// read lock on the `active` map. Returned `HashMap` is owned by the caller;
+    /// subsequent index mutations do not affect it.
+    ///
+    /// This exists as the one-pass primitive backing the cross-session inbox
+    /// endpoint. Building the same map by composing `list_all_sessions` +
+    /// per-session `list_active` would acquire the `active` lock once per
+    /// session — fine for a few sessions, expensive at scale and under the
+    /// dashboard's polling load.
+    pub async fn active_fragments_session_map(&self) -> HashMap<String, String> {
+        let active = self.active.read().await;
+        let mut map = HashMap::new();
+        for (session_id, frag_ids) in active.iter() {
+            for frag_id in frag_ids {
+                map.insert(frag_id.clone(), session_id.clone());
+            }
+        }
+        map
+    }
 }
 
 impl Default for SessionIndex {

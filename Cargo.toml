@@ -152,3 +152,43 @@ wiremock = "0.5"
 criterion = "0.5"
 proptest = "1.0"
 axum-test = "15.0"
+
+# ─── Build profiles ──────────────────────────────────────────────────────
+#
+# Default cargo profiles (`dev`, `release`) are tuned for two extremes:
+# fast-to-compile-but-slow-to-run, and slow-to-compile-but-fast-to-run.
+# Neither fits "I just edited one file and want to restart the server
+# in 30 seconds with a usable optimized binary." These overrides + the
+# custom `fast` profile fill that gap on workstations where the project
+# target/ lives on a slower volume (e.g. docker-ssd).
+
+# `cargo build --release` — used for the binary you actually run + publish.
+# Override the upstream default (`incremental = false`) because every
+# small edit otherwise triggers a full re-codegen of every touched
+# crate. Incremental cuts the per-edit work to roughly the crates whose
+# .rs files actually changed, which on this repo turns a 3-minute
+# rebuild into ~20-30 seconds. The runtime cost is sub-1% — well below
+# the inbox + retrieve lock-contention floor we already pay.
+[profile.release]
+incremental = true
+
+# `cargo build --profile fast` — for the inner dev loop when you don't
+# need maximum runtime speed but DO want an optimized-enough binary
+# (no debug_assertions, no overflow checks, real opt level). codegen
+# units are cranked to 256 so the 11 cores stay fed during clean
+# builds. Use this when iterating on the server: produces
+# `target/fast/contextnest` instead of `target/release/contextnest`.
+#
+# Trade-off: ~5-15% slower runtime than `--release` because the
+# higher codegen-units count gives the optimizer less inter-function
+# visibility. For ContextNest's IO + lock bound workloads the
+# difference is invisible.
+[profile.fast]
+inherits = "release"
+opt-level = 2
+codegen-units = 256
+lto = "off"
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = true

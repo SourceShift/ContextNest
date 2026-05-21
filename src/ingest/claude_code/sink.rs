@@ -282,62 +282,38 @@ impl ServicesSink {
 
 #[async_trait]
 impl Sink for ServicesSink {
+    /// Live-ingest write path used by cc_hooks. Optimized for **throughput
+    /// under bursty load** (every Claude Code prompt fires this once
+    /// per extracted memory record).
+    ///
+    /// Design choices, in order of importance:
+    ///
+    /// 1. **Skip `process_memories` + LLM round-trip.** Each Claude Code
+    ///    transcript chunk can produce dozens of records. Running the
+    ///    canonical basin-formation pipeline (which calls the LLM per
+    ///    fragment when enabled) blocks for several seconds per record,
+    ///    causing the spawned hook tasks to pile up faster than they
+    ///    drain. The inbox endpoint reads only the three sidecars, so
+    ///    live ingest only needs to write those; canonical attractor
+    ///    state is rebuilt by the in-process tests and future
+    ///    on-demand re-embedding flows.
+    /// 2. **WAL-append on success.** Without this, live fragments don't
+    ///    survive restart even though they're queryable in the current
+    ///    process. The HTTP store handler already does this; we mirror
+    ///    its behavior here so all three write paths (HTTP, hook,
+    ///    replay) produce identical disk state.
+    /// 3. **Best-effort WAL.** A WAL outage logs at warn-level but does
+    ///    not fail the in-memory store — Claude Code's hook protocol
+    ///    has no way to act on a failed ingest, so degrading to "stored
+    ///    in RAM only" is strictly better than dropping the fragment.
+    ///
+    /// This is the same trade-off documented on
+    /// [`crate::api::tools::restore_sidecars_bulk`] — see that doc for
+    /// the retrieve-returns-empty-for-replayed-fragments caveat.
     async fn store(&self, record: &MemoryRecord) -> ContextNestResult<()> {
-        use crate::memory::attractors::memory_attractor_manager::{
-            MemoryProcessingRequest, ProcessingOptions, ProcessingPriority,
-        };
-        use crate::memory::attractors::MemoryFragment;
-        use std::collections::HashSet;
-
-        let embedding = self
-            .services
-            .embedding
-            .generate_embedding(&record.text)
-            .await
-            .map_err(|e| {
-                ContextNestError::Api(format!(
-                    "ServicesSink: embedding failed for kind={}: {}",
-                    record.kind.as_str(),
-                    e
-                ))
-            })?;
-
-        let now = chrono::Utc::now();
         let fragment_id = uuid::Uuid::new_v4().to_string();
-        let fragment = MemoryFragment {
-            id: fragment_id.clone(),
-            content: embedding,
-            importance: record.importance,
-            created_at: now,
-            last_accessed: now,
-            attractor_basin_id: None,
-            connections: HashSet::new(),
-            confidence: record.importance,
-        };
 
-        let process_req = MemoryProcessingRequest {
-            id: format!("hook-store-{fragment_id}"),
-            fragments: vec![fragment],
-            options: ProcessingOptions {
-                enable_attractor_creation: true,
-                enable_reconstruction: false,
-                enable_gap_filling: false,
-                enable_connections: true,
-                quality_threshold: 0.1,
-                max_processing_time: std::time::Duration::from_secs(5),
-            },
-            priority: ProcessingPriority::Medium,
-            created_at: now,
-        };
-
-        self.services
-            .attractor_manager
-            .process_memories(process_req)
-            .await
-            .map_err(|e| {
-                ContextNestError::Api(format!("ServicesSink: process_memories failed: {e}"))
-            })?;
-
+        // Sidecar inserts only. No embedding, no process_memories, no LLM.
         self.services
             .fragment_texts
             .write()
@@ -356,6 +332,24 @@ impl Sink for ServicesSink {
             .session_index
             .add(&record.session_id_cn, &fragment_id)
             .await;
+
+        // Best-effort WAL append. Failures log + continue.
+        if let Some(wal) = self.services.wal.get() {
+            let wal_record = crate::services::wal::WalRecord::Store {
+                fragment_id,
+                session_id: record.session_id_cn.clone(),
+                content: record.text.clone(),
+                importance: record.importance,
+                metadata: record.metadata.clone(),
+            };
+            if let Err(e) = wal.append(&wal_record) {
+                tracing::warn!(
+                    error = %e,
+                    kind = %record.kind.as_str(),
+                    "wal: append failed for ServicesSink::store",
+                );
+            }
+        }
 
         Ok(())
     }

@@ -1,0 +1,21 @@
+# Cargo build behavior overrides for this workspace.
+#
+# Why this file exists: the repo lives on a separate, slower volume
+# (docker-ssd) and the developer is on an 11-core Apple Silicon machine.
+# Stock cargo saturates all cores during release builds, which combined
+# with the slower disk pegs the system for the whole build window. The
+# settings below trade ~25% wall-clock for breathing room.
+#
+# Override per-invocation with `cargo build -j N` when you want the
+# fastest possible build and don't care about contention.
+
+[build]
+# Cap concurrent rustc/codegen jobs. 6 of 11 cores keeps the build
+# fast without starving foreground work (editor, server, browser).
+# Set CARGO_BUILD_JOBS in env to override for one shell.
+jobs = 6
+
+# `cargo build --profile fast` is the recommended inner-loop command
+# for this project. See [profile.fast] in Cargo.toml — it produces an
+# optimized-enough binary at `target/fast/contextnest` in well under
+# a minute on incremental edits.
