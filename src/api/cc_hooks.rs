@@ -220,11 +220,44 @@ async fn tail_and_ingest(
     let total_len = bytes.len() as u64;
 
     let last_offset = tracker.get(&payload.session_id).await;
-    if total_len <= last_offset {
-        // File hasn't grown since last read. The hook may have fired on
-        // a non-content event (rare but possible). Nothing to do.
+
+    // Two interesting cases when `total_len < last_offset`:
+    //
+    // 1. **Truncation / rotation.** Some workflows (notably Claude
+    //    Code's `/clear` in versions that re-use the same session_id,
+    //    or a manual file rotation) shrink the transcript out from
+    //    under us. If we silently early-return here we will never
+    //    catch up; the offset is permanently past the file end. The
+    //    only safe move is to reset the offset to 0 and re-read.
+    //
+    //    We accept the cost: any z-insight blocks that survived the
+    //    truncation may re-ingest (duplicating the substrate side),
+    //    but the dashboard's inbox dedup at view time absorbs that.
+    //    A duplicate fragment is far less harmful than a permanently-
+    //    silent session.
+    //
+    // 2. **No new content** (total_len == last_offset). File hasn't
+    //    grown; nothing to do.
+    if total_len < last_offset {
+        tracing::warn!(
+            session_id = %payload.session_id,
+            path = %transcript_path.display(),
+            old_offset = last_offset,
+            new_len = total_len,
+            "cc_hooks: transcript shrank (likely truncation or /clear); resetting offset to 0",
+        );
+        tracker.set(&payload.session_id, 0).await;
+        // Fall through with last_offset effectively reset; the
+        // alignment block below treats 0 as "start of file".
+    } else if total_len == last_offset {
+        // No new content — fast no-op.
         return Ok(());
     }
+    let last_offset = if total_len < last_offset {
+        0
+    } else {
+        last_offset
+    };
 
     // Slice the new portion. `last_offset` was always set to the full
     // post-read file length, so we should land at a line boundary —
