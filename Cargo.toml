@@ -151,7 +151,7 @@ tokio-test = "0.4"
 wiremock = "0.5"
 criterion = "0.5"
 proptest = "1.0"
-axum-test = "15.0"
+axum-test = "20.0"
 
 # ─── Build profiles ──────────────────────────────────────────────────────
 #
