@@ -1,4 +1,14 @@
-import type { HealthResponse, RetrieveResponse, SessionListResponse, StatusResponse } from './types';
+import type {
+  BasinsResponse,
+  ConnectionsResponse,
+  FragmentsResponse,
+  HealthResponse,
+  InboxResponse,
+  RetrieveResponse,
+  SessionListResponse,
+  StatsResponse,
+  StatusResponse,
+} from './types';
 
 const SUBSTRATE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
 
@@ -50,6 +60,44 @@ export const api = {
     }),
 
   sessions: () => request<SessionListResponse>('/api/v1/sessions', { method: 'GET' }),
+
+  inbox: () => request<InboxResponse>('/api/v1/inbox', { method: 'GET' }),
+
+  stats: () => request<StatsResponse>('/api/v1/stats', { method: 'GET' }),
+
+  fragments: (params: {
+    session_id?: string;
+    project?: string;
+    kind?: string;
+    with_embedding?: boolean;
+    limit?: number;
+  } = {}) => {
+    const q = new URLSearchParams();
+    if (params.session_id) q.set('session_id', params.session_id);
+    if (params.project) q.set('project', params.project);
+    if (params.kind) q.set('kind', params.kind);
+    if (params.with_embedding) q.set('with_embedding', 'true');
+    if (params.limit) q.set('limit', String(params.limit));
+    const qs = q.toString();
+    return request<FragmentsResponse>(
+      `/api/v1/fragments${qs ? `?${qs}` : ''}`,
+      { method: 'GET' },
+    );
+  },
+
+  basins: () =>
+    request<BasinsResponse>('/api/v1/field/basins', { method: 'GET' }),
+
+  connections: (params: { session_id?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.session_id) q.set('session_id', params.session_id);
+    if (params.limit) q.set('limit', String(params.limit));
+    const qs = q.toString();
+    return request<ConnectionsResponse>(
+      `/api/v1/connections${qs ? `?${qs}` : ''}`,
+      { method: 'GET' },
+    );
+  },
 
   store: (params: {
     content: string;

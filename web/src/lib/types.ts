@@ -56,8 +56,68 @@ export type SessionListItem = {
   project_cwd: string;
   src_session_uuid: string;
   last_ts: string | null;
+  by_kind: Record<string, number>;
 };
 
 export type SessionListResponse = {
   sessions: SessionListItem[];
+};
+
+export type StatsResponse = {
+  total_fragments: number;
+  total_sessions: number;
+  by_kind: Record<string, number>;
+};
+
+export type FragmentRow = {
+  id: string;
+  session_id: string;
+  content: string;
+  metadata: FragmentMetadata;
+  importance: number;
+  embedding?: number[];
+};
+
+export type FragmentsResponse = {
+  fragments: FragmentRow[];
+  truncated: boolean;
+};
+
+export type BasinSource = 'attractor' | 'project';
+
+export type BasinSummary = {
+  id: string;
+  label: string;
+  source: BasinSource;
+  mass: number;
+  centroid: number[];
+  by_kind: Record<string, number>;
+  sessions: string[];
+};
+
+export type BasinsResponse = {
+  basins: BasinSummary[];
+};
+
+export type ConnectionRow = {
+  source: string;
+  target: string;
+  count: number;
+};
+
+export type ConnectionsResponse = {
+  connections: ConnectionRow[];
+  total_known: number;
+};
+
+export type InboxHit = {
+  id: string;
+  session_id: string;
+  content: string;
+  importance: number;
+  metadata: FragmentMetadata;
+};
+
+export type InboxResponse = {
+  items: InboxHit[];
 };

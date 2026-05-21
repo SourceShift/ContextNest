@@ -1,7 +1,9 @@
 import { Link, useRouterState } from '@tanstack/react-router';
 
 import { BrandMark, Icon } from './atoms';
-import { MOCK } from '@/lib/mock-data';
+import { useInbox } from '@/hooks/useInbox';
+import { useSessions } from '@/hooks/useSessions';
+import { useStats } from '@/hooks/useStats';
 
 type NavKey = 'inbox' | 'sessions' | 'search' | 'phases' | 'field' | 'tools' | 'substrate';
 
@@ -15,75 +17,75 @@ type NavItem = {
   urgent?: boolean;
 };
 
-// Counts derive from MOCK so the sidebar stays consistent with the
-// data the routes render — match `design/app.jsx::counts`.
-const COUNTS = {
-  inbox: MOCK.inbox.length,
-  sessions: MOCK.sessions.length,
-  phases: MOCK.phases.length,
-  basins: 6,
-};
-
-const NAV: NavItem[] = [
-  {
-    k: 'inbox',
-    to: '/',
-    label: 'Inbox',
-    icon: <Icon.Inbox className="nav-icon" />,
-    kbd: 'g i',
-    count: COUNTS.inbox,
-    urgent: MOCK.inbox.some((i) => i.urgency === 'now'),
-  },
-  {
-    k: 'sessions',
-    to: '/sessions',
-    label: 'Sessions',
-    icon: <Icon.List className="nav-icon" />,
-    kbd: 'g s',
-    count: COUNTS.sessions,
-  },
-  {
-    k: 'search',
-    to: '/search',
-    label: 'Search',
-    icon: <Icon.Search className="nav-icon" />,
-    kbd: 'g /',
-  },
-  {
-    k: 'phases',
-    to: '/phases',
-    label: 'Phases',
-    icon: <Icon.Layers className="nav-icon" />,
-    kbd: 'g p',
-    count: COUNTS.phases,
-  },
-  {
-    k: 'field',
-    to: '/field',
-    label: 'Field',
-    icon: <Icon.Atom className="nav-icon" />,
-    kbd: 'g f',
-    count: COUNTS.basins,
-  },
-  {
-    k: 'tools',
-    to: '/tools',
-    label: 'Tools',
-    icon: <Icon.Terminal className="nav-icon" />,
-    kbd: 'g t',
-  },
-  {
-    k: 'substrate',
-    to: '/substrate',
-    label: 'Substrate',
-    icon: <Icon.Cpu className="nav-icon" />,
-    kbd: 'g o',
-  },
-];
-
 export function Sidebar() {
   const { location } = useRouterState();
   const pathname = location.pathname;
+  const inbox = useInbox();
+  const sessions = useSessions();
+  const stats = useStats();
+
+  // Phases count is derived from substrate stats — every kind=goal_phase
+  // fragment is a "phase" in the dashboard's vocabulary. When the stats
+  // endpoint hasn't returned yet we just omit the badge rather than
+  // flashing a 0; once it lands the badge appears.
+  const phasesCount = stats.data?.by_kind.goal_phase;
+  const urgent = inbox.data.some((i) => i.urgency === 'now');
+
+  const nav: NavItem[] = [
+    {
+      k: 'inbox',
+      to: '/',
+      label: 'Inbox',
+      icon: <Icon.Inbox className="nav-icon" />,
+      kbd: 'g i',
+      count: inbox.data.length,
+      urgent,
+    },
+    {
+      k: 'sessions',
+      to: '/sessions',
+      label: 'Sessions',
+      icon: <Icon.List className="nav-icon" />,
+      kbd: 'g s',
+      count: sessions.data.length,
+    },
+    {
+      k: 'search',
+      to: '/search',
+      label: 'Search',
+      icon: <Icon.Search className="nav-icon" />,
+      kbd: 'g /',
+    },
+    {
+      k: 'phases',
+      to: '/phases',
+      label: 'Phases',
+      icon: <Icon.Layers className="nav-icon" />,
+      kbd: 'g p',
+      count: phasesCount,
+    },
+    {
+      k: 'field',
+      to: '/field',
+      label: 'Field',
+      icon: <Icon.Atom className="nav-icon" />,
+      kbd: 'g f',
+    },
+    {
+      k: 'tools',
+      to: '/tools',
+      label: 'Tools',
+      icon: <Icon.Terminal className="nav-icon" />,
+      kbd: 'g t',
+    },
+    {
+      k: 'substrate',
+      to: '/substrate',
+      label: 'Substrate',
+      icon: <Icon.Cpu className="nav-icon" />,
+      kbd: 'g o',
+    },
+  ];
 
   return (
     <aside className="sidebar" role="navigation">
@@ -95,7 +97,7 @@ export function Sidebar() {
         </div>
       </div>
       <div className="sidebar-section-label">Views</div>
-      {NAV.map((it) => {
+      {nav.map((it) => {
         const active = it.to === '/' ? pathname === '/' : pathname.startsWith(it.to);
         return (
           <Link
@@ -108,7 +110,7 @@ export function Sidebar() {
             {it.icon}
             <span>{it.label}</span>
             {it.count !== undefined ? (
-              <span className="nav-count">{it.count}</span>
+              <span className="nav-count">{it.count.toLocaleString()}</span>
             ) : (
               <span className="nav-kbd">{it.kbd}</span>
             )}
@@ -123,7 +125,7 @@ export function Sidebar() {
         </div>
         <div className="row">
           <span>fragments</span>
-          <span className="v">619</span>
+          <span className="v">{stats.data?.total_fragments?.toLocaleString() ?? '—'}</span>
         </div>
         <div className="row">
           <span>embed</span>

@@ -1,40 +1,1563 @@
 import { createFileRoute } from '@tanstack/react-router';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { BrandMark, Icon } from '@/components/atoms';
+import { useFieldData } from '@/hooks/useFieldData';
+import { useSessions } from '@/hooks/useSessions';
+import type { FieldFragment } from '@/hooks/useFieldData';
+import { cosineSimilarity } from '@/lib/pca';
+import type { BasinSummary } from '@/lib/types';
 
 export const Route = createFileRoute('/field')({
   component: FieldPage,
+  validateSearch: (search: Record<string, unknown>) => ({
+    session: typeof search.session === 'string' ? search.session : undefined,
+    project: typeof search.project === 'string' ? search.project : undefined,
+  }),
 });
 
+// =============================================================================
+// Visual constants
+// =============================================================================
+
+const KIND_COLOR: Record<string, string> = {
+  learning: '#a78bfa',
+  decision: '#ffd166',
+  accomplishment: '#00d4aa',
+  fact: '#a1a1aa',
+  blocker: '#ff6b6b',
+  todo: '#60a5fa',
+  goal_phase: '#f472b6',
+  user_action: '#ff6b6b',
+  state: '#cbd5e1',
+  current_task: '#fbbf24',
+  summary: '#c4b5fd',
+  initial_prompt_window: '#94a3b8',
+  session_title: '#a1a1aa',
+  ack: '#71717a',
+  unknown: '#475569',
+};
+
+const VB_W = 1000;
+const VB_H = 600;
+const VB_MARGIN = 60;
+
+// Pan/zoom state.
+type ViewState = { scale: number; tx: number; ty: number };
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 6;
+const ZOOM_STEP = 1.4;
+const IDENTITY_VIEW: ViewState = { scale: 1, tx: 0, ty: 0 };
+
+function clientToDesign(
+  evt: { clientX: number; clientY: number },
+  rect: DOMRect,
+  view: ViewState,
+): { x: number; y: number } {
+  const aspect = VB_W / VB_H;
+  const containerAspect = rect.width / rect.height;
+  let innerW = rect.width;
+  let innerH = rect.height;
+  let offX = 0;
+  let offY = 0;
+  if (containerAspect > aspect) {
+    innerW = rect.height * aspect;
+    offX = (rect.width - innerW) / 2;
+  } else {
+    innerH = rect.width / aspect;
+    offY = (rect.height - innerH) / 2;
+  }
+  const fx = Math.max(0, Math.min(1, (evt.clientX - rect.left - offX) / innerW));
+  const fy = Math.max(0, Math.min(1, (evt.clientY - rect.top - offY) / innerH));
+  return {
+    x: view.tx + fx * (VB_W / view.scale),
+    y: view.ty + fy * (VB_H / view.scale),
+  };
+}
+
+function clampView(view: ViewState): ViewState {
+  const scale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, view.scale));
+  const vbW = VB_W / scale;
+  const vbH = VB_H / scale;
+  return {
+    scale,
+    tx: Math.max(-vbW / 2, Math.min(VB_W - vbW / 2, view.tx)),
+    ty: Math.max(-vbH / 2, Math.min(VB_H - vbH / 2, view.ty)),
+  };
+}
+
+// =============================================================================
+// Page
+// =============================================================================
+
 function FieldPage() {
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
+  const focusedSession = search.session ?? undefined;
+  const focusedProject = search.project ?? undefined;
+
+  const field = useFieldData({
+    sessionId: focusedSession,
+    project: focusedProject,
+  });
+  const sessionsHook = useSessions();
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  // === filter helpers ===
+  // Project options come from /api/v1/field/basins (sorted by mass).
+  // Session options narrow to the chosen project when one is set,
+  // otherwise show every session known to the substrate.
+  const projectOptions = useMemo(() => {
+    return field.data.basins.map((b) => ({ label: b.label, mass: b.mass }));
+  }, [field.data.basins]);
+
+  const sessionOptions = useMemo(() => {
+    const all = sessionsHook.data;
+    if (!focusedProject) return all;
+    return all.filter((s) => {
+      const cwd = s.project_cwd ?? '';
+      const last = cwd.trim().replace(/\/+$/, '').split('/').pop();
+      return last === focusedProject;
+    });
+  }, [sessionsHook.data, focusedProject]);
+
+  const setProjectFilter = useCallback(
+    (project: string | undefined) => {
+      // Changing project also clears session filter (the session
+      // might not belong to the new project, which would render an
+      // empty field).
+      void navigate({
+        to: '/field',
+        search: { project, session: undefined },
+      });
+    },
+    [navigate],
+  );
+
+  const setSessionFilter = useCallback(
+    (session: string | undefined) => {
+      void navigate({
+        to: '/field',
+        search: { project: focusedProject, session },
+      });
+    },
+    [navigate, focusedProject],
+  );
+
+  // Interaction state.
+  const [selectedFragment, setSelectedFragment] = useState<string | null>(null);
+  const [selectedBasin, setSelectedBasin] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<{
+    fragmentId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [maxAgeDays, setMaxAgeDays] = useState(30);
+  const [scrubberMinutesAgo, setScrubberMinutesAgo] = useState<number | null>(
+    null,
+  );
+  const [disabledKinds, setDisabledKinds] = useState<Set<string>>(new Set());
+  const [view, setView] = useState<ViewState>(IDENTITY_VIEW);
+  const dragRef = useRef<{
+    startView: ViewState;
+    startClient: { x: number; y: number };
+    rect: DOMRect;
+  } | null>(null);
+
+  // Track previously-seen fragment ids so freshly-arrived ones can pulse
+  // briefly on entry. Using a ref so the pulse doesn't fire on every
+  // unrelated re-render.
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const [pulsingIds, setPulsingIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const next = new Set<string>();
+    const fresh: string[] = [];
+    for (const f of field.data.fragments) {
+      next.add(f.id);
+      if (!seenIdsRef.current.has(f.id)) fresh.push(f.id);
+    }
+    seenIdsRef.current = next;
+    if (fresh.length > 0) {
+      setPulsingIds((prev) => {
+        const merged = new Set(prev);
+        for (const id of fresh) merged.add(id);
+        return merged;
+      });
+      // Clear pulse after the CSS animation has time to run.
+      const t = window.setTimeout(() => {
+        setPulsingIds((prev) => {
+          const next2 = new Set(prev);
+          for (const id of fresh) next2.delete(id);
+          return next2;
+        });
+      }, 2000);
+      return () => window.clearTimeout(t);
+    }
+  }, [field.data.fragments]);
+
+  // ===== layout — embedding-space PCA mapped to canvas pixels =====
+  const { fragmentXY, basinXY } = useMemo(() => {
+    const xyRaw = field.data.layout.xy;
+    if (xyRaw.length === 0) return { fragmentXY: {}, basinXY: {} };
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const p of xyRaw) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+    // Guard zero-extent.
+    const dx = Math.max(maxX - minX, 1e-6);
+    const dy = Math.max(maxY - minY, 1e-6);
+    const sx = (VB_W - VB_MARGIN * 2) / dx;
+    const sy = (VB_H - VB_MARGIN * 2) / dy;
+    // Preserve aspect ratio so semantic distance isn't stretched on one axis.
+    const s = Math.min(sx, sy);
+    const projectedW = dx * s;
+    const projectedH = dy * s;
+    const offsetX = (VB_W - projectedW) / 2 - minX * s;
+    const offsetY = (VB_H - projectedH) / 2 - minY * s;
+
+    const fXY: Record<string, { x: number; y: number }> = {};
+    field.data.fragments.forEach((f, i) => {
+      const p = xyRaw[i];
+      fXY[f.id] = {
+        x: p.x * s + offsetX,
+        y: p.y * s + offsetY,
+      };
+    });
+
+    // Basin position = mean of its member fragment positions.
+    const bXY: Record<string, { x: number; y: number; count: number }> = {};
+    for (const f of field.data.fragments) {
+      const proj = f.project;
+      const p = fXY[f.id];
+      if (!p) continue;
+      const acc = bXY[proj] ?? { x: 0, y: 0, count: 0 };
+      acc.x += p.x;
+      acc.y += p.y;
+      acc.count += 1;
+      bXY[proj] = acc;
+    }
+    const basinPositions: Record<string, { x: number; y: number }> = {};
+    for (const [proj, acc] of Object.entries(bXY)) {
+      basinPositions[proj] = { x: acc.x / acc.count, y: acc.y / acc.count };
+    }
+    return { fragmentXY: fXY, basinXY: basinPositions };
+  }, [field.data]);
+
+  // Compute the active fragment set after applying age filter + scrubber.
+  const visibleFragments = useMemo(() => {
+    const cutoffMs = scrubberMinutesAgo == null
+      ? null
+      : Date.now() - scrubberMinutesAgo * 60_000;
+    return field.data.fragments.filter((f) => {
+      if (disabledKinds.has(f.metadata.kind ?? 'unknown')) return false;
+      if (f.ageDays != null && f.ageDays > maxAgeDays) return false;
+      if (cutoffMs != null) {
+        const ts =
+          typeof f.metadata.ts === 'string'
+            ? Date.parse(f.metadata.ts as string)
+            : NaN;
+        // If filtering by scrubber, drop fragments newer than cutoff.
+        if (!Number.isNaN(ts) && ts > cutoffMs) return false;
+      }
+      return true;
+    });
+  }, [field.data.fragments, disabledKinds, maxAgeDays, scrubberMinutesAgo]);
+  const visibleIds = useMemo(
+    () => new Set(visibleFragments.map((f) => f.id)),
+    [visibleFragments],
+  );
+
+  // ===== nearest neighbors for the selected/hovered fragment =====
+  const neighborIds = useMemo<Set<string>>(() => {
+    const focus = selectedFragment ?? hovered?.fragmentId ?? null;
+    if (!focus) return new Set();
+    const center = field.data.fragments.find((f) => f.id === focus);
+    if (!center || !center.embedding || center.embedding.length === 0) {
+      return new Set();
+    }
+    const scores: Array<{ id: string; sim: number }> = [];
+    for (const f of field.data.fragments) {
+      if (f.id === center.id) continue;
+      if (!f.embedding || f.embedding.length === 0) continue;
+      scores.push({ id: f.id, sim: cosineSimilarity(center.embedding, f.embedding) });
+    }
+    scores.sort((a, b) => b.sim - a.sim);
+    return new Set(scores.slice(0, 5).map((s) => s.id));
+  }, [selectedFragment, hovered, field.data.fragments]);
+
+  // ===== zoom controls =====
+  const zoomBy = useCallback(
+    (factor: number, anchor?: { x: number; y: number }) => {
+      setView((prev) => {
+        const newScale = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, prev.scale * factor));
+        if (newScale === prev.scale) return prev;
+        const ax = anchor?.x ?? prev.tx + VB_W / prev.scale / 2;
+        const ay = anchor?.y ?? prev.ty + VB_H / prev.scale / 2;
+        const fx = (ax - prev.tx) / (VB_W / prev.scale);
+        const fy = (ay - prev.ty) / (VB_H / prev.scale);
+        return clampView({
+          scale: newScale,
+          tx: ax - fx * (VB_W / newScale),
+          ty: ay - fy * (VB_H / newScale),
+        });
+      });
+    },
+    [],
+  );
+  const resetView = useCallback(() => setView(IDENTITY_VIEW), []);
+
+  const handleWheel = useCallback(
+    (e: React.WheelEvent<SVGSVGElement>) => {
+      e.preventDefault();
+      const rect = svgRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const anchor = clientToDesign(e, rect, view);
+      const factor = Math.pow(1.0015, -e.deltaY);
+      zoomBy(factor, anchor);
+    },
+    [view, zoomBy],
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (e.button !== 0) return;
+      const target = e.target as Element;
+      // Don't start panning when clicking a fragment or basin marker.
+      if (target.closest('[data-frag]')) return;
+      if (target.closest('[data-basin]')) return;
+      const rect = svgRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      dragRef.current = {
+        startView: view,
+        startClient: { x: e.clientX, y: e.clientY },
+        rect,
+      };
+    },
+    [view],
+  );
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragRef.current) return;
+      const { startView, startClient, rect } = dragRef.current;
+      const dx = e.clientX - startClient.x;
+      const dy = e.clientY - startClient.y;
+      const aspect = VB_W / VB_H;
+      const containerAspect = rect.width / rect.height;
+      const innerW =
+        containerAspect > aspect ? rect.height * aspect : rect.width;
+      const innerH =
+        containerAspect > aspect ? rect.height : rect.width / aspect;
+      const vbW = VB_W / startView.scale;
+      const vbH = VB_H / startView.scale;
+      setView(
+        clampView({
+          scale: startView.scale,
+          tx: startView.tx - (dx / innerW) * vbW,
+          ty: startView.ty - (dy / innerH) * vbH,
+        }),
+      );
+    };
+    const onUp = () => {
+      dragRef.current = null;
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as Element | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+      if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        zoomBy(ZOOM_STEP);
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        zoomBy(1 / ZOOM_STEP);
+      } else if (e.key === '0') {
+        e.preventDefault();
+        resetView();
+      } else if (e.key === 'Escape') {
+        setSelectedFragment(null);
+        setSelectedBasin(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomBy, resetView]);
+
+  // ===== focus mode controls =====
+  const exitFocus = useCallback(() => {
+    void navigate({
+      to: '/field',
+      search: { session: undefined, project: undefined },
+    });
+  }, [navigate]);
+
+  // ===== derived for header / side =====
+  const visibleCount = visibleFragments.length;
+  const selectedFragmentObj = selectedFragment
+    ? field.data.fragments.find((f) => f.id === selectedFragment) ?? null
+    : null;
+  const selectedBasinObj = selectedBasin
+    ? field.data.basins.find((b) => b.id === selectedBasin) ?? null
+    : null;
+
+  // Edge filter: at most 250 strongest connections to keep render snappy.
+  const visibleEdges = useMemo(() => {
+    return field.data.connections
+      .filter((e) => visibleIds.has(e.source) && visibleIds.has(e.target))
+      .slice(0, 250);
+  }, [field.data.connections, visibleIds]);
+
+  const hasEmbeddings = field.data.fragments.some(
+    (f) => f.embedding && f.embedding.length > 0,
+  );
+
+  const fragmentOpacity = (f: FieldFragment): number => {
+    if (!visibleIds.has(f.id)) return 0.05;
+    // Highlight states take priority over decay.
+    if (selectedFragment && f.id === selectedFragment) return 1;
+    if (selectedFragment && neighborIds.has(f.id)) return 1;
+    if (selectedFragment) return 0.18;
+    if (hovered && hovered.fragmentId === f.id) return 1;
+    if (hovered && neighborIds.has(f.id)) return 0.95;
+    if (selectedBasin && f.project !== selectedBasinObj?.label) return 0.18;
+    const ageFade =
+      f.ageDays == null ? 0.7 : Math.max(0.35, 1 - f.ageDays / 30);
+    return ageFade;
+  };
+
   return (
     <div>
       <div className="page-header">
         <div>
           <h1 className="page-title">Field</h1>
           <div className="page-sub">
-            Neural-field visualization · basin layout · attractor activation map
+            {hasEmbeddings ? (
+              <>
+                Semantic space · top-2 PCA of fragment embeddings ·{' '}
+                <span className="mono">
+                  {(field.data.layout.varianceRatio * 100).toFixed(0)}%
+                </span>{' '}
+                variance captured ·{' '}
+              </>
+            ) : (
+              <>Loading embeddings… · </>
+            )}
+            <span className="mono">{visibleCount}</span> /{' '}
+            <span className="mono">{field.data.fragments.length}</span>{' '}
+            fragments visible
+            {field.totalFragments != null && (
+              <>
+                {' '}
+                · <span className="mono">{field.totalFragments.toLocaleString()}</span>{' '}
+                total in substrate
+              </>
+            )}
+            {(focusedProject || focusedSession) && (
+              <>
+                {' '}
+                · focus:{' '}
+                {focusedProject && (
+                  <span className="mono">project={focusedProject}</span>
+                )}
+                {focusedProject && focusedSession && ' '}
+                {focusedSession && (
+                  <span className="mono">session={focusedSession}</span>
+                )}{' '}
+                <button
+                  className="btn btn-ghost sm"
+                  onClick={exitFocus}
+                  type="button"
+                  style={{ marginLeft: 4 }}
+                >
+                  <Icon.X /> clear all
+                </button>
+              </>
+            )}
           </div>
         </div>
         <div className="page-actions">
-          <span className="mono dim" style={{ fontSize: 11 }}>
-            38 basins · 1,204 fragments
-          </span>
+          <button
+            className="btn"
+            onClick={() => field.refetch()}
+            type="button"
+            title="Re-sample fragments and refresh layout"
+          >
+            <Icon.Refresh /> Re-sample
+          </button>
         </div>
       </div>
 
-      <div className="empty with-card">
-        <BrandMark size={44} dim />
-        <div className="empty-title">Field viz lands in the next port pass</div>
-        <div className="empty-body">
-          The d3-based attractor field — basin-of-attraction layout, activation glow, and
-          decay-shading — is the most complex view in the design. It ships in a follow-up PR so this
-          one can land cleanly. See <span className="mono">design/routes/field.jsx</span> for the
-          working hi-fi prototype.
+      {/* Filter bar — project (folder) + optional session */}
+      <div
+        className="filter-bar"
+        style={{ marginBottom: 14, gap: 12, alignItems: 'center' }}
+      >
+        <label
+          className="mono dim"
+          style={{
+            fontSize: 10,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          folder
+        </label>
+        <select
+          value={focusedProject ?? ''}
+          onChange={(e) =>
+            setProjectFilter(e.target.value || undefined)
+          }
+          className="mono"
+          style={{
+            background: 'var(--surface-2)',
+            color: 'var(--ink)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            padding: '5px 10px',
+            fontSize: 12,
+            minWidth: 220,
+          }}
+        >
+          <option value="">all folders ({projectOptions.length})</option>
+          {projectOptions.map((p) => (
+            <option key={p.label} value={p.label}>
+              {p.label} · {p.mass}
+            </option>
+          ))}
+        </select>
+
+        <label
+          className="mono dim"
+          style={{
+            fontSize: 10,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+            marginLeft: 8,
+          }}
+        >
+          session <span style={{ textTransform: 'none' }}>(optional)</span>
+        </label>
+        <select
+          value={focusedSession ?? ''}
+          onChange={(e) =>
+            setSessionFilter(e.target.value || undefined)
+          }
+          className="mono"
+          style={{
+            background: 'var(--surface-2)',
+            color: 'var(--ink)',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            padding: '5px 10px',
+            fontSize: 12,
+            minWidth: 280,
+          }}
+        >
+          <option value="">
+            all {sessionOptions.length} session
+            {sessionOptions.length === 1 ? '' : 's'}
+            {focusedProject ? ` in "${focusedProject}"` : ''}
+          </option>
+          {sessionOptions.map((s) => {
+            const cwd = s.project_cwd ?? '';
+            const proj =
+              cwd.trim().replace(/\/+$/, '').split('/').pop() || '?';
+            return (
+              <option key={s.id} value={s.id}>
+                {s.id} · {proj} · {s.fragment_count} frags
+              </option>
+            );
+          })}
+        </select>
+
+        {(focusedProject || focusedSession) && (
+          <button
+            className="btn btn-ghost sm"
+            onClick={exitFocus}
+            type="button"
+            title="clear all filters"
+          >
+            <Icon.X /> reset
+          </button>
+        )}
+
+        <div className="grow" />
+        <span className="mono dim" style={{ fontSize: 11 }}>
+          {field.data.fragments.length} fragments rendered
+          {field.truncated ? ' (truncated)' : ''}
+        </span>
+      </div>
+
+      {field.isLoading && field.data.fragments.length === 0 ? (
+        <div className="empty with-card">
+          <BrandMark size={36} dim />
+          <div className="empty-title">Computing layout…</div>
+          <div className="empty-body">
+            Fetching embeddings and projecting them into 2D. Takes a few seconds the first
+            time.
+          </div>
         </div>
-        <a className="btn btn-ghost" style={{ marginTop: 2 }}>
-          <Icon.Info /> design/screenshots/field.png
-        </a>
+      ) : field.data.fragments.length === 0 ? (
+        <div className="empty with-card">
+          <BrandMark size={36} dim />
+          <div className="empty-title">No fragments in this view</div>
+          <div className="empty-body">
+            {focusedSession ? (
+              <>
+                Session <span className="mono">{focusedSession}</span> has no fragments with
+                embeddings yet. <button
+                  className="btn-ghost sm"
+                  onClick={exitFocus}
+                  type="button"
+                >
+                  clear filter
+                </button>
+              </>
+            ) : (
+              <>
+                Run <span className="mono">make cn-ingest</span> or wait for live cc_hooks
+                to populate the substrate.
+              </>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="field-layout">
+          <div className="field-canvas-wrap">
+            <svg
+              ref={svgRef}
+              className="field-svg"
+              viewBox={`${view.tx} ${view.ty} ${VB_W / view.scale} ${
+                VB_H / view.scale
+              }`}
+              preserveAspectRatio="xMidYMid meet"
+              onClick={() => {
+                setSelectedFragment(null);
+                setSelectedBasin(null);
+              }}
+              onWheel={handleWheel}
+              onMouseDown={handleMouseDown}
+              style={{ cursor: dragRef.current ? 'grabbing' : 'grab' }}
+            >
+              <defs>
+                {field.data.basins.map((b) => {
+                  const dominantKind = Object.entries(b.by_kind).sort(
+                    (a, c) => c[1] - a[1],
+                  )[0]?.[0];
+                  const color = dominantKind
+                    ? KIND_COLOR[dominantKind] ?? KIND_COLOR.unknown
+                    : KIND_COLOR.unknown;
+                  return (
+                    <radialGradient
+                      key={b.id}
+                      id={`basin-grad-${b.id}`}
+                      cx="50%"
+                      cy="50%"
+                      r="50%"
+                    >
+                      <stop offset="0%" stopColor={color} stopOpacity="0.32" />
+                      <stop offset="40%" stopColor={color} stopOpacity="0.12" />
+                      <stop offset="100%" stopColor={color} stopOpacity="0" />
+                    </radialGradient>
+                  );
+                })}
+                <pattern
+                  id="field-grid"
+                  width="40"
+                  height="40"
+                  patternUnits="userSpaceOnUse"
+                >
+                  <path
+                    d="M 40 0 L 0 0 0 40"
+                    fill="none"
+                    stroke="#1a1a1a"
+                    strokeWidth="0.5"
+                  />
+                </pattern>
+              </defs>
+
+              <rect width={VB_W} height={VB_H} fill="url(#field-grid)" />
+
+              {/* Basin halos at the centroid of each basin's fragments */}
+              {field.data.basins.map((b) => {
+                const p = basinXY[b.label];
+                if (!p) return null;
+                const r = 40 + Math.min(100, Math.sqrt(b.mass) * 4);
+                return (
+                  <circle
+                    key={b.id}
+                    cx={p.x}
+                    cy={p.y}
+                    r={r}
+                    fill={`url(#basin-grad-${b.id})`}
+                    style={{ pointerEvents: 'none' }}
+                  />
+                );
+              })}
+
+              {/* Real resonance edges (retrieve co-occurrence) */}
+              {visibleEdges.map((e) => {
+                const s = fragmentXY[e.source];
+                const t = fragmentXY[e.target];
+                if (!s || !t) return null;
+                const w = Math.min(2, 0.4 + e.count * 0.2);
+                const isFocusEdge =
+                  selectedFragment != null &&
+                  (e.source === selectedFragment || e.target === selectedFragment);
+                return (
+                  <line
+                    key={`${e.source}-${e.target}`}
+                    x1={s.x}
+                    y1={s.y}
+                    x2={t.x}
+                    y2={t.y}
+                    stroke={isFocusEdge ? '#00d4aa' : '#52525b'}
+                    strokeOpacity={
+                      selectedFragment ? (isFocusEdge ? 0.7 : 0.05) : 0.25
+                    }
+                    strokeWidth={w}
+                  />
+                );
+              })}
+
+              {/* Fragment dots */}
+              {field.data.fragments.map((f) => {
+                const p = fragmentXY[f.id];
+                if (!p) return null;
+                const kind = f.metadata.kind ?? 'unknown';
+                const color = KIND_COLOR[kind] ?? KIND_COLOR.unknown;
+                const pulsing = pulsingIds.has(f.id);
+                return (
+                  <g key={f.id} data-frag={f.id}>
+                    {pulsing && (
+                      <circle
+                        cx={p.x}
+                        cy={p.y}
+                        r={14}
+                        fill="none"
+                        stroke={color}
+                        strokeOpacity={0.8}
+                        strokeWidth={1.5}
+                      >
+                        <animate
+                          attributeName="r"
+                          from="4"
+                          to="22"
+                          dur="1.6s"
+                          repeatCount="1"
+                        />
+                        <animate
+                          attributeName="stroke-opacity"
+                          from="0.9"
+                          to="0"
+                          dur="1.6s"
+                          repeatCount="1"
+                        />
+                      </circle>
+                    )}
+                    <circle
+                      cx={p.x}
+                      cy={p.y}
+                      r={
+                        selectedFragment === f.id
+                          ? 6
+                          : neighborIds.has(f.id)
+                            ? 4.5
+                            : 3
+                      }
+                      fill={color}
+                      opacity={fragmentOpacity(f)}
+                      stroke={
+                        selectedFragment === f.id ? '#ffffff' : 'none'
+                      }
+                      strokeWidth={selectedFragment === f.id ? 1.5 : 0}
+                      style={{
+                        cursor: 'pointer',
+                        transition: 'opacity 150ms ease, r 150ms ease',
+                      }}
+                      onMouseEnter={() =>
+                        setHovered({ fragmentId: f.id, x: p.x, y: p.y })
+                      }
+                      onMouseLeave={() => setHovered(null)}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        setSelectedFragment((s) =>
+                          s === f.id ? null : f.id,
+                        );
+                        setSelectedBasin(null);
+                      }}
+                    />
+                  </g>
+                );
+              })}
+
+              {/* Basin centroid markers + labels */}
+              {field.data.basins.map((b) => {
+                const p = basinXY[b.label];
+                if (!p) return null;
+                const dominantKind = Object.entries(b.by_kind).sort(
+                  (a, c) => c[1] - a[1],
+                )[0]?.[0];
+                const color = dominantKind
+                  ? KIND_COLOR[dominantKind] ?? KIND_COLOR.unknown
+                  : KIND_COLOR.unknown;
+                const isSel = selectedBasin === b.id;
+                return (
+                  <g
+                    key={b.id}
+                    data-basin={b.id}
+                    transform={`translate(${p.x},${p.y})`}
+                    style={{
+                      cursor: 'pointer',
+                      opacity:
+                        selectedBasin && !isSel
+                          ? 0.4
+                          : selectedFragment
+                            ? 0.55
+                            : 1,
+                      transition: 'opacity 200ms ease',
+                    }}
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      setSelectedBasin((s) => (s === b.id ? null : b.id));
+                      setSelectedFragment(null);
+                    }}
+                  >
+                    <circle
+                      r={8}
+                      fill="#0a0a0a"
+                      stroke={color}
+                      strokeWidth={1.5}
+                      strokeOpacity={0.7}
+                    />
+                    <text
+                      x={0}
+                      y={-14}
+                      textAnchor="middle"
+                      fill={color}
+                      fontFamily="JetBrains Mono, monospace"
+                      fontSize={10.5}
+                      letterSpacing={0.4}
+                      style={{ pointerEvents: 'none' }}
+                    >
+                      {b.label} · {b.mass}
+                    </text>
+                  </g>
+                );
+              })}
+            </svg>
+
+            {hovered && (() => {
+              const f = field.data.fragments.find((x) => x.id === hovered.fragmentId);
+              if (!f) return null;
+              return (
+                <FieldTooltip
+                  fragment={f}
+                  xPct={(hovered.x / VB_W) * 100}
+                  yPct={(hovered.y / VB_H) * 100}
+                />
+              );
+            })()}
+
+            <div className="field-overlay-tr">
+              <div className="zoom-nav">
+                <button
+                  className="znav-btn"
+                  onClick={() => zoomBy(ZOOM_STEP)}
+                  title="zoom in (+ key or scroll up over canvas)"
+                  type="button"
+                  disabled={view.scale >= ZOOM_MAX - 0.001}
+                >
+                  +
+                </button>
+                <button
+                  className="znav-btn"
+                  onClick={() => zoomBy(1 / ZOOM_STEP)}
+                  title="zoom out (− key or scroll down over canvas)"
+                  type="button"
+                  disabled={view.scale <= ZOOM_MIN + 0.001}
+                >
+                  −
+                </button>
+                <div className="znav-divider" />
+                <button
+                  className="znav-btn znav-reset"
+                  onClick={resetView}
+                  title="reset view (0)"
+                  type="button"
+                  disabled={
+                    view.scale === 1 && view.tx === 0 && view.ty === 0
+                  }
+                >
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6" />
+                  </svg>
+                </button>
+                <div className="znav-zoomlabel">
+                  {Math.round(view.scale * 100)}%
+                </div>
+              </div>
+            </div>
+
+            <div className="field-overlay-bl">
+              <div className="legend">
+                <div className="legend-row">
+                  <span className="legend-label">filter by kind</span>
+                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                    {field.data.kinds.map((k) => (
+                      <button
+                        key={k}
+                        className="kind-swatch"
+                        onClick={() =>
+                          setDisabledKinds((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(k)) next.delete(k);
+                            else next.add(k);
+                            return next;
+                          })
+                        }
+                        title={`${k}${disabledKinds.has(k) ? ' (hidden)' : ''}`}
+                        style={{
+                          background: KIND_COLOR[k] ?? KIND_COLOR.unknown,
+                          opacity: disabledKinds.has(k) ? 0.2 : 1,
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div className="legend-row">
+                  <span className="legend-label">axes</span>
+                  <span className="legend-decay">
+                    semantic similarity (PC1 ↔, PC2 ↕)
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="field-overlay-br">
+              <div className="age-slider">
+                <div className="age-label">
+                  <span>decay window</span>
+                  <span className="mono" style={{ color: 'var(--ink)' }}>
+                    ≤ {maxAgeDays}d
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={90}
+                  value={maxAgeDays}
+                  onChange={(e) => setMaxAgeDays(+e.target.value)}
+                  className="field-slider"
+                />
+                <div className="age-marks">
+                  <span>1d</span>
+                  <span>30d</span>
+                  <span>60d</span>
+                  <span>90d</span>
+                </div>
+              </div>
+            </div>
+
+            <TimelineScrubber
+              minutesAgo={scrubberMinutesAgo}
+              onChange={setScrubberMinutesAgo}
+            />
+          </div>
+
+          <aside className="field-side">
+            {selectedFragmentObj ? (
+              <FragmentDetail
+                fragment={selectedFragmentObj}
+                neighborIds={neighborIds}
+                allFragments={field.data.fragments}
+                onClose={() => setSelectedFragment(null)}
+                onFocusSession={(sessionId) => setSessionFilter(sessionId)}
+              />
+            ) : selectedBasinObj ? (
+              <BasinDetail
+                basin={selectedBasinObj}
+                onClose={() => setSelectedBasin(null)}
+                onFocusSession={(sessionId) => setSessionFilter(sessionId)}
+              />
+            ) : (
+              <ValuePanel
+                hasEmbeddings={hasEmbeddings}
+                varianceRatio={field.data.layout.varianceRatio}
+                connectionsCount={field.data.connections.length}
+                focusedSession={focusedSession}
+              />
+            )}
+          </aside>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
+// Timeline scrubber
+// =============================================================================
+
+// Stops at common-sense intervals: now, 5m, 15m, 1h, 6h, 24h, 7d. Mapped
+// to the underlying minutes-ago value with a non-linear curve so the
+// "now" end of the slider has more resolution than the deep-past end.
+const SCRUBBER_STOPS: Array<{ label: string; minutesAgo: number | null }> = [
+  { label: 'now', minutesAgo: null },
+  { label: '5m', minutesAgo: 5 },
+  { label: '15m', minutesAgo: 15 },
+  { label: '1h', minutesAgo: 60 },
+  { label: '6h', minutesAgo: 6 * 60 },
+  { label: '24h', minutesAgo: 24 * 60 },
+  { label: '7d', minutesAgo: 7 * 24 * 60 },
+  { label: '30d', minutesAgo: 30 * 24 * 60 },
+];
+
+function TimelineScrubber({
+  minutesAgo,
+  onChange,
+}: {
+  minutesAgo: number | null;
+  onChange: (val: number | null) => void;
+}) {
+  const idx = SCRUBBER_STOPS.findIndex(
+    (s) =>
+      (s.minutesAgo == null && minutesAgo == null) ||
+      s.minutesAgo === minutesAgo,
+  );
+  return (
+    <div className="field-scrubber">
+      <div className="scrubber-label">
+        <span className="mono dim" style={{ fontSize: 11 }}>
+          Time scrubber — slide right to wind the substrate back
+        </span>
+        <span className="mono" style={{ fontSize: 11, color: 'var(--ink)' }}>
+          {SCRUBBER_STOPS[idx >= 0 ? idx : 0].label}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={SCRUBBER_STOPS.length - 1}
+        value={idx >= 0 ? idx : 0}
+        onChange={(e) => onChange(SCRUBBER_STOPS[+e.target.value].minutesAgo)}
+        className="field-slider"
+      />
+      <div className="scrubber-marks">
+        {SCRUBBER_STOPS.map((s, i) => (
+          <span key={i}>{s.label}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// Sidebar variants
+// =============================================================================
+
+function ValuePanel({
+  hasEmbeddings,
+  varianceRatio,
+  connectionsCount,
+  focusedSession,
+}: {
+  hasEmbeddings: boolean;
+  varianceRatio: number;
+  connectionsCount: number;
+  focusedSession: string | undefined;
+}) {
+  return (
+    <div className="field-side-empty">
+      <div
+        className="mono dim"
+        style={{
+          fontSize: 10.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+        }}
+      >
+        ● How to read this view
+      </div>
+      <div style={{ marginTop: 12 }}>
+        <Hint
+          title="Position = semantic similarity"
+          body={
+            hasEmbeddings
+              ? `Each dot's (x, y) is the top-2 PCA projection of its 256-d embedding. ${(
+                  varianceRatio * 100
+                ).toFixed(0)}% of total variance lives in this plane — two dots near each other are about the same thing, regardless of which project they came from.`
+              : 'Loading embeddings — once they arrive, position will reflect semantic similarity, not project membership.'
+          }
+        />
+        <Hint
+          title="Color = kind"
+          body="Each fragment's metadata.kind decides its color. Click swatches in the bottom-left legend to hide/show kinds. The dominant color of a basin halo tells you what that cluster is mostly made of."
+        />
+        <Hint
+          title="Lines = real co-retrieval"
+          body={
+            connectionsCount > 0
+              ? `${connectionsCount} edges drawn from substrate co-retrieval log. Two fragments connected = they were returned together in the same /retrieve call. The more queries that hit both, the stronger the line.`
+              : 'No co-retrieval data yet — run a few /retrieve calls (the dashboard does this automatically when polling inbox + sessions) and edges will appear here.'
+          }
+        />
+        <Hint
+          title="Hover = nearest neighbors"
+          body="Mouse over any dot. Its 5 cosine-nearest neighbors in embedding space light up — even if they're in different basins. This is how you find related work across sessions you forgot existed."
+        />
+        <Hint
+          title="Click = focus + explore"
+          body="Click a dot to lock it. The side panel shows its content + neighbors + session. Click a basin (the ring + label) to scope rendering to that project."
+        />
+        <Hint
+          title="Time scrubber"
+          body="Drag the slider at the bottom of the canvas backward in time. Fragments stored after that point hide, so you see exactly what the substrate knew at any past moment."
+        />
+        <Hint
+          title="Live pulse"
+          body="New fragments since your last refresh pulse briefly when they enter the field. Watch the substrate grow while you work — every Claude Code Stop hook fires one in."
+        />
+      </div>
+
+      <div className="divider-h" />
+      <div
+        className="mono dim"
+        style={{
+          fontSize: 10.5,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+        }}
+      >
+        ● What this is for
+      </div>
+      <div style={{ marginTop: 10, color: 'var(--ink-muted)', fontSize: 12.5, lineHeight: 1.55 }}>
+        <p style={{ margin: '0 0 8px' }}>
+          <strong style={{ color: 'var(--ink)' }}>See your sessions grow.</strong> The
+          field is your substrate's shape rendered live. When you ship a feature, you
+          should see the relevant basin densify. When you switch contexts, you'll see a
+          new cluster form on the edge.
+        </p>
+        <p style={{ margin: '0 0 8px' }}>
+          <strong style={{ color: 'var(--ink)' }}>Find connections you forgot.</strong>{' '}
+          Hover any fragment to see the 5 things in your substrate most similar to it —
+          including from sessions you haven't touched in weeks. This is the killer
+          interaction for "didn't I do something like this before?"
+        </p>
+        <p style={{ margin: '0 0 8px' }}>
+          <strong style={{ color: 'var(--ink)' }}>
+            Audit project boundaries.
+          </strong>{' '}
+          When two project basins overlap heavily, the work is actually one topic in two
+          repos. When one basin has scattered satellites far from its center, those
+          fragments are conceptual outliers worth examining.
+        </p>
+        {focusedSession ? (
+          <p style={{ margin: '0 0 8px', color: 'var(--accent)' }}>
+            Currently focused on session{' '}
+            <span className="mono">{focusedSession}</span>. Clear the filter in the page
+            header to see the whole substrate again.
+          </p>
+        ) : (
+          <p style={{ margin: '0 0 8px', color: 'var(--ink-muted)' }}>
+            Pass <span className="mono">?session=cc-XXXXXX</span> in the URL (or use the
+            "focus" button on a fragment) to scope the field to a single session.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Hint({ title, body }: { title: string; body: string }) {
+  return (
+    <div style={{ padding: '8px 0', borderBottom: '1px dashed var(--border-subtle)' }}>
+      <div style={{ fontSize: 12.5, color: 'var(--ink)', fontWeight: 500 }}>{title}</div>
+      <div style={{ fontSize: 11.5, color: 'var(--ink-muted)', marginTop: 3, lineHeight: 1.5 }}>
+        {body}
+      </div>
+    </div>
+  );
+}
+
+function BasinDetail({
+  basin,
+  onClose,
+  onFocusSession,
+}: {
+  basin: BasinSummary;
+  onClose: () => void;
+  onFocusSession: (id: string) => void;
+}) {
+  const kindEntries = Object.entries(basin.by_kind).sort((a, b) => b[1] - a[1]);
+  return (
+    <div className="field-side-detail">
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 8,
+        }}
+      >
+        <div
+          className="mono dim"
+          style={{
+            fontSize: 10.5,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          ● Basin · {basin.source}
+        </div>
+        <button className="btn sm btn-ghost" onClick={onClose} type="button">
+          <Icon.X />
+        </button>
+      </div>
+      <div style={{ fontSize: 15, fontWeight: 500, color: 'var(--ink)' }}>
+        {basin.label}
+      </div>
+      <dl className="kv" style={{ marginTop: 12 }}>
+        <dt>mass</dt>
+        <dd>{basin.mass.toLocaleString()} active fragments</dd>
+        <dt>sessions</dt>
+        <dd>{basin.sessions.length}</dd>
+        <dt>source</dt>
+        <dd>
+          {basin.source === 'attractor'
+            ? 'canonical attractor centroid'
+            : 'project_cwd fallback'}
+        </dd>
+      </dl>
+      <div className="section-h" style={{ margin: '16px 0 8px' }}>
+        <h3
+          style={{
+            fontSize: 11.5,
+            color: 'var(--ink-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          kind distribution
+        </h3>
+      </div>
+      <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+        {kindEntries.slice(0, 8).map(([k, n]) => (
+          <li
+            key={k}
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              padding: '4px 0',
+              fontSize: 12,
+            }}
+          >
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: 999,
+                  background: KIND_COLOR[k] ?? KIND_COLOR.unknown,
+                }}
+              />
+              <span className="mono">{k}</span>
+            </span>
+            <span className="mono dim">{n}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="section-h" style={{ margin: '16px 0 8px' }}>
+        <h3
+          style={{
+            fontSize: 11.5,
+            color: 'var(--ink-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          sessions
+        </h3>
+      </div>
+      <ul
+        style={{
+          margin: 0,
+          padding: 0,
+          listStyle: 'none',
+          maxHeight: 280,
+          overflowY: 'auto',
+        }}
+      >
+        {basin.sessions.slice(0, 20).map((s) => (
+          <li key={s} style={{ padding: '4px 0' }}>
+            <button
+              className="btn-ghost sm"
+              onClick={() => onFocusSession(s)}
+              type="button"
+              style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}
+            >
+              {s} →
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function FragmentDetail({
+  fragment,
+  neighborIds,
+  allFragments,
+  onClose,
+  onFocusSession,
+}: {
+  fragment: FieldFragment;
+  neighborIds: Set<string>;
+  allFragments: FieldFragment[];
+  onClose: () => void;
+  onFocusSession: (id: string) => void;
+}) {
+  const kind = (fragment.metadata.kind as string | undefined) ?? 'unknown';
+  const color = KIND_COLOR[kind] ?? KIND_COLOR.unknown;
+  const neighbors = allFragments.filter((f) => neighborIds.has(f.id));
+  return (
+    <div className="field-side-detail">
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: 8,
+        }}
+      >
+        <div
+          className="mono dim"
+          style={{
+            fontSize: 10.5,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          ● Fragment · {kind}
+        </div>
+        <button className="btn sm btn-ghost" onClick={onClose} type="button">
+          <Icon.X />
+        </button>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          gap: 10,
+          alignItems: 'flex-start',
+          marginTop: 4,
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: 999,
+            background: color,
+            marginTop: 6,
+            flexShrink: 0,
+          }}
+        />
+        <div
+          style={{
+            fontSize: 13.5,
+            color: 'var(--ink)',
+            lineHeight: 1.5,
+            wordBreak: 'break-word',
+          }}
+        >
+          {fragment.content}
+        </div>
+      </div>
+      <dl className="kv" style={{ marginTop: 14 }}>
+        <dt>session</dt>
+        <dd>
+          <button
+            className="btn-ghost sm"
+            onClick={() => onFocusSession(fragment.session_id)}
+            type="button"
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}
+          >
+            {fragment.session_id} →
+          </button>
+        </dd>
+        <dt>project</dt>
+        <dd className="mono">{fragment.project}</dd>
+        <dt>age</dt>
+        <dd>{fragment.ageDays != null ? `${fragment.ageDays}d` : 'unknown'}</dd>
+        <dt>importance</dt>
+        <dd>{fragment.importance.toFixed(2)}</dd>
+      </dl>
+      <div className="section-h" style={{ margin: '16px 0 8px' }}>
+        <h3
+          style={{
+            fontSize: 11.5,
+            color: 'var(--ink-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          nearest neighbors in embedding space
+        </h3>
+      </div>
+      {neighbors.length === 0 ? (
+        <div className="muted" style={{ fontSize: 11.5 }}>
+          No neighbors found — this fragment may be isolated.
+        </div>
+      ) : (
+        <ul style={{ margin: 0, padding: 0, listStyle: 'none' }}>
+          {neighbors.map((n) => {
+            const nKind =
+              (n.metadata.kind as string | undefined) ?? 'unknown';
+            return (
+              <li
+                key={n.id}
+                style={{
+                  padding: '6px 0',
+                  borderBottom: '1px dashed var(--border-subtle)',
+                  cursor: 'pointer',
+                }}
+              >
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <span
+                    style={{
+                      width: 6,
+                      height: 6,
+                      borderRadius: 999,
+                      background: KIND_COLOR[nKind] ?? KIND_COLOR.unknown,
+                    }}
+                  />
+                  <span
+                    className="mono dim"
+                    style={{ fontSize: 10, textTransform: 'uppercase' }}
+                  >
+                    {nKind}
+                  </span>
+                  <span
+                    className="mono dim"
+                    style={{ fontSize: 10, marginLeft: 'auto' }}
+                  >
+                    {n.session_id.slice(0, 11)}
+                  </span>
+                </div>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--ink-muted)',
+                    marginTop: 3,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    display: '-webkit-box',
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: 'vertical',
+                  }}
+                >
+                  {n.content}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
+// Tooltip
+// =============================================================================
+
+function FieldTooltip({
+  fragment,
+  xPct,
+  yPct,
+}: {
+  fragment: FieldFragment;
+  xPct: number;
+  yPct: number;
+}) {
+  const kind = (fragment.metadata.kind as string | undefined) ?? 'unknown';
+  return (
+    <div
+      className="field-tooltip frag"
+      style={{
+        position: 'absolute',
+        left: `${xPct}%`,
+        top: `${yPct}%`,
+        transform: 'translate(12px, -50%)',
+        pointerEvents: 'none',
+        zIndex: 5,
+      }}
+    >
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <span
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: 999,
+            background: KIND_COLOR[kind] ?? KIND_COLOR.unknown,
+          }}
+        />
+        <span
+          className="mono"
+          style={{
+            fontSize: 10,
+            color: 'var(--ink-muted)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          {kind}
+        </span>
+        {fragment.ageDays != null && (
+          <span className="mono dim" style={{ fontSize: 10, marginLeft: 'auto' }}>
+            {fragment.ageDays}d ago
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          fontSize: 12,
+          marginTop: 6,
+          color: 'var(--ink)',
+          maxWidth: 320,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          display: '-webkit-box',
+          WebkitLineClamp: 4,
+          WebkitBoxOrient: 'vertical',
+        }}
+      >
+        {fragment.content}
+      </div>
+      <div className="mono dim" style={{ fontSize: 10, marginTop: 6 }}>
+        {fragment.session_id} · {fragment.project}
       </div>
     </div>
   );

@@ -120,6 +120,23 @@ cp .env.example .env
 cargo run -- serve
 ```
 
+For the convenience workflow used during development — config template, WAL
+persistence, server lifecycle, and `~/.claude/projects/` ingest — the
+`cn-*` targets in the [Makefile](Makefile) capture the common incantations:
+
+```bash
+make cn-config          # one-time: copy config.example.toml → config.toml
+make cn-build
+make cn-serve           # release binary, WAL on, config.toml loaded
+make cn-ingest SINCE=7d PROJECT=researcher    # backfill from local sessions
+make cn-help            # full target list
+```
+
+The bundled `config.example.toml` documents the embedding-provider options
+(local TF-IDF default, or any OpenAI-compatible endpoint — OpenAI,
+DeepInfra, Together AI, etc.). Secrets stay in your shell env
+(`DEEPINFRA_API_KEY` / `OPENAI_API_KEY`), never in committed files.
+
 The server binds to `0.0.0.0:8080` by default. All seven tools are immediately
 available:
 

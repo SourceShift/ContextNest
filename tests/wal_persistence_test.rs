@@ -144,11 +144,11 @@ async fn replay_restores_state_visible_to_inbox_endpoint() {
     let app = create_simple_app(services).await.unwrap();
     let server = TestServer::new(app).unwrap();
 
-    // Verify round-trip via /api/v1/tools/retrieve (the universal
-    // visibility surface in this PR). The sidecar fallback added in
-    // this PR means every active fragment is returned with similarity=0
-    // — kind-based inbox filtering is verified in the follow-up PR
-    // that introduces /api/v1/inbox.
+    // Retrieve via the canonical pipeline now falls back to sidecar data
+    // (this PR's fix), so all 3 fragments come back regardless of kind.
+    // The earlier draft polled /api/v1/inbox to check kind-filtering,
+    // but that endpoint ships in a follow-up PR; here we just verify
+    // the round-trip via the universal retrieve surface.
     let res: Value = server
         .post("/api/v1/tools/retrieve")
         .json(&json!({"query": "anything", "session_id": "cc-restart", "top_k": 50}))
@@ -286,8 +286,8 @@ async fn sidecars_only_replay_restores_active_fragments() {
     // The bulk sidecar path is what `serve` uses by default at startup —
     // it skips embedding + process_memories so a 12k-record WAL does not
     // pay 12k network embedding round-trips. Every active fragment must
-    // still be queryable via /retrieve; canonical attractor state is
-    // intentionally left empty.
+    // still be queryable; canonical attractor state is intentionally
+    // left empty.
     let services = ContextNestServices::new_default().await.unwrap();
 
     let records = vec![

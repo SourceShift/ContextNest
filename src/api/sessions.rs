@@ -36,6 +36,11 @@ pub struct SessionSummary {
     /// fragments. Lexicographic max works correctly for ISO 8601 strings.
     /// `null` when no fragment carries a `ts` metadata key.
     pub last_ts: Option<String>,
+    /// Per-session count of active fragments grouped by `metadata.kind`.
+    /// Fragments without a `kind` go under `"unknown"`. Always populated
+    /// (possibly with a single `"unknown"` entry) so dashboard consumers
+    /// can render the per-row count strip without a separate request.
+    pub by_kind: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,18 +77,30 @@ pub async fn list_sessions(
         let active_ids = services.session_index.list_active(session_id).await;
         let fragment_count = active_ids.len();
 
-        // Accumulators for the three metadata fields.
+        // Accumulators for the three metadata fields + per-kind counts.
         let mut cwd_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut src_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut by_kind: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut last_ts: Option<String> = None;
 
         for frag_id in &active_ids {
             let Some(meta) = metadata_map.get(frag_id) else {
-                // Fragment has no metadata entry at all — skip silently.
+                // Fragment has no metadata entry at all — count under "unknown"
+                // and skip the rest of the metadata aggregation for this row.
+                *by_kind.entry("unknown".to_string()).or_insert(0) += 1;
                 continue;
             };
+
+            // kind bucketing — drives the dashboard's per-session counts strip.
+            let kind = meta
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            *by_kind.entry(kind).or_insert(0) += 1;
 
             // project_cwd
             if let Some(cwd_val) = meta.get("project_cwd") {
@@ -139,6 +156,7 @@ pub async fn list_sessions(
             project_cwd,
             src_session_uuid,
             last_ts,
+            by_kind,
         });
     }
 
