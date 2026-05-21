@@ -164,26 +164,63 @@ function FieldPage() {
     rect: DOMRect;
   } | null>(null);
 
-  // Track previously-seen fragment ids so freshly-arrived ones can pulse
-  // briefly on entry. Using a ref so the pulse doesn't fire on every
-  // unrelated re-render.
-  const seenIdsRef = useRef<Set<string>>(new Set());
+  // Pulse only fragments whose stored timestamp is newer than the
+  // newest one we have ever seen. This is the SUBSTRATE-growth signal,
+  // distinct from "the visible set changed" (which happens on initial
+  // mount, filter changes, refetch — none of which should pulse the
+  // whole field).
+  //
+  // The previous implementation diffed against a `seenIdsRef` Set
+  // that started empty, so the first render treated every fragment
+  // as fresh and pulsed all of them at once. Same bug fired when the
+  // folder/session filter changed: the new visible set is "new" to
+  // the ref but the user just toggled a filter — nothing about the
+  // substrate actually grew.
+  //
+  // `metadata.ts` is the only honest "when this fragment was stored"
+  // signal we have. Tracking the high-water mark gives us:
+  //   - first load                : record baseline, no pulse
+  //   - filter change              : same baseline, only items newer
+  //                                   than it pulse (typically zero)
+  //   - new substrate write       : items newer than baseline pulse,
+  //                                   baseline advances
+  const lastNewestTsRef = useRef<string | null>(null);
   const [pulsingIds, setPulsingIds] = useState<Set<string>>(new Set());
   useEffect(() => {
-    const next = new Set<string>();
+    if (field.data.fragments.length === 0) return;
+
+    // Compute the newest ts in this batch up-front.
+    let batchNewest = '';
+    for (const f of field.data.fragments) {
+      const ts = typeof f.metadata.ts === 'string' ? (f.metadata.ts as string) : '';
+      if (ts > batchNewest) batchNewest = ts;
+    }
+
+    // First poll: just set the baseline. No pulse — the user just
+    // opened the view; everything they see is incumbent, not new.
+    if (lastNewestTsRef.current === null) {
+      lastNewestTsRef.current = batchNewest;
+      return;
+    }
+
+    // Subsequent polls: pulse only items strictly newer than the
+    // baseline. Lexicographic compare works for ISO-8601 ts.
+    const baseline = lastNewestTsRef.current;
     const fresh: string[] = [];
     for (const f of field.data.fragments) {
-      next.add(f.id);
-      if (!seenIdsRef.current.has(f.id)) fresh.push(f.id);
+      const ts = typeof f.metadata.ts === 'string' ? (f.metadata.ts as string) : '';
+      if (ts && ts > baseline) fresh.push(f.id);
     }
-    seenIdsRef.current = next;
+    // Advance the baseline regardless (so a filter swap doesn't make
+    // the next poll re-pulse the same items).
+    lastNewestTsRef.current = batchNewest > baseline ? batchNewest : baseline;
+
     if (fresh.length > 0) {
       setPulsingIds((prev) => {
         const merged = new Set(prev);
         for (const id of fresh) merged.add(id);
         return merged;
       });
-      // Clear pulse after the CSS animation has time to run.
       const t = window.setTimeout(() => {
         setPulsingIds((prev) => {
           const next2 = new Set(prev);
