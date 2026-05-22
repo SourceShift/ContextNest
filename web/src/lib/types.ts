@@ -33,6 +33,10 @@ export type RetrieveHit = {
   importance: number;
   similarity: number;
   metadata: FragmentMetadata;
+  /** Populated by the substrate only when the caller asked for
+   * cross-session retrieval (via `session_ids`). Single-session callers
+   * receive hits without this field. */
+  session_id?: string;
 };
 
 export type RetrieveResponse = {

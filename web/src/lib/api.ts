@@ -52,6 +52,11 @@ export const api = {
     query: string;
     top_k?: number;
     session_id?: string;
+    /** Cross-session mode: when set (and non-empty) the substrate
+     * snapshots all active fragments under one lock and filters to the
+     * listed sessions. Each `RetrieveHit` then carries its owning
+     * `session_id`. `session_id` (singular) is ignored when this is set. */
+    session_ids?: string[];
     metadata_filter?: Record<string, unknown>;
   }) =>
     request<RetrieveResponse>('/api/v1/tools/retrieve', {

@@ -5,7 +5,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
 import { api } from '@/lib/api';
 import { useSessions, useKnownProjects } from '@/hooks/useSessions';
-import type { RetrieveHit, SessionListItem } from '@/lib/types';
+import type { RetrieveHit } from '@/lib/types';
 
 export const Route = createFileRoute('/search')({
   component: SearchPage,
@@ -68,6 +68,13 @@ type SearchResultRow = RetrieveHit & {
 
 function SearchPage() {
   const [q, setQ] = useState('');
+  // `qDebounced` is what we hand to React Query as the query key. Keeping
+  // it separate from `q` (which drives the input) means the input stays
+  // snappy while the actual retrieve fires at most once per ~250ms.
+  // Combined with the substrate's single-call cross-session retrieve,
+  // this reduces a fast typist's 6+ keystrokes worth of fan-out from
+  // 60+ HTTP requests down to 1.
+  const [qDebounced, setQDebounced] = useState('');
   const [chips, setChips] = useState<Chip[]>([]);
   const [focused, setFocused] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -77,6 +84,11 @@ function SearchPage() {
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => setQDebounced(q), 250);
+    return () => clearTimeout(t);
+  }, [q]);
 
   const removeChip = (i: number) => setChips((c) => c.filter((_, j) => j !== i));
   const addChip = (k: string, v: string) => setChips((c) => [...c, { k, v }]);
@@ -97,59 +109,58 @@ function SearchPage() {
     return f;
   }, [kindChip, urgencyChip]);
 
-  // Pick the target sessions: explicit chip > "first 10 newest sessions".
-  // We fan out to multiple sessions because the substrate's retrieve is
-  // session-scoped. For most substrates this is a handful of sessions,
-  // but for a heavily-populated dashboard (your 96+ sessions) we cap at
-  // 10 newest by last_ts to keep the query cheap.
-  const targetSessions: SessionListItem[] = useMemo(() => {
-    if (sessionChip) {
-      return sessions.data.filter((s) => s.id === sessionChip.v);
-    }
-    const sorted = [...sessions.data].sort((a, b) => {
-      const at = a.last_ts ? Date.parse(a.last_ts) : 0;
-      const bt = b.last_ts ? Date.parse(b.last_ts) : 0;
-      return bt - at;
-    });
-    return sorted.slice(0, 10);
+  // Build a fragment_id → project lookup so we can stamp `project` onto
+  // each hit cheaply. The substrate gives us the owning session_id back
+  // on each hit (in cross-session mode); we then resolve that to a
+  // project_cwd via the session list we already have cached.
+  const projectBySession = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const s of sessions.data) m.set(s.id, basename(s.project_cwd));
+    return m;
+  }, [sessions.data]);
+
+  // Pick the target sessions: explicit chip → single-session retrieve;
+  // otherwise hand the substrate the full session list. The substrate's
+  // cross-session mode (POST /api/v1/tools/retrieve with `session_ids`)
+  // does the merge under a single snapshot lock, so we no longer need
+  // the per-session HTTP fan-out the old UI relied on.
+  const targetSessionIds: string[] = useMemo(() => {
+    if (sessionChip) return [sessionChip.v];
+    return sessions.data.map((s) => s.id);
   }, [sessions.data, sessionChip]);
 
   const searchQuery = useQuery({
-    queryKey: ['search', q, metadataFilter, targetSessions.map((s) => s.id)],
-    enabled: q.trim().length > 0 && targetSessions.length > 0,
+    queryKey: ['search', qDebounced, metadataFilter, targetSessionIds],
+    enabled: qDebounced.trim().length > 0 && targetSessionIds.length > 0,
     staleTime: 5_000,
     queryFn: async (): Promise<SearchResultRow[]> => {
-      // Fan-out: one retrieve call per session in scope. Returns are
-      // merged and sorted by similarity desc. For session-scoped queries
-      // this is one call; for "all sessions" mode it's capped at 10.
-      const perSession = await Promise.all(
-        targetSessions.map(async (s) => {
-          try {
-            const res = await api.retrieve({
-              session_id: s.id,
-              query: q,
-              top_k: 20,
-              metadata_filter:
-                Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
-            });
-            const proj = basename(s.project_cwd);
-            return res.hits.map(
-              (hit): SearchResultRow => ({
-                ...hit,
-                session_id: s.id,
-                project: proj,
-              }),
-            );
-          } catch {
-            return [];
-          }
-        }),
-      );
-      const flat = perSession.flat();
+      // ONE call covers every requested session. The substrate tags
+      // each hit with its owning `session_id` so we can group/colorize
+      // results client-side.
+      const res = await api.retrieve({
+        query: qDebounced,
+        top_k: 50,
+        ...(sessionChip
+          ? { session_id: sessionChip.v }
+          : { session_ids: targetSessionIds }),
+        metadata_filter:
+          Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
+      });
+      // Single-session callers don't get `session_id` back from the
+      // substrate (wire-compat), so fall back to the chip value.
+      const fallbackSession = sessionChip?.v ?? '';
+      const rows: SearchResultRow[] = res.hits.map((hit) => {
+        const sid = hit.session_id ?? fallbackSession;
+        return {
+          ...hit,
+          session_id: sid,
+          project: projectBySession.get(sid) ?? '?',
+        };
+      });
       // Apply client-side project filter (chip is a basename).
       const filtered = projectChip
-        ? flat.filter((r) => r.project === projectChip.v)
-        : flat;
+        ? rows.filter((r) => r.project === projectChip.v)
+        : rows;
       filtered.sort((a, b) => b.similarity - a.similarity);
       return filtered.slice(0, 40);
     },
@@ -208,7 +219,7 @@ function SearchPage() {
           {q
             ? searchQuery.isLoading
               ? 'searching…'
-              : `${results.length} hits · ${chips.length} filters · ${targetSessions.length} session(s) searched`
+              : `${results.length} hits · ${chips.length} filters · ${targetSessionIds.length} session(s) searched`
             : 'type to search'}
         </span>
       </div>

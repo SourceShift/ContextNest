@@ -452,6 +452,104 @@ async fn update_noop_returns_ok_with_updated_false() {
 /// to `summarize`). Catches the index-vs-manager drift case where one store
 /// is cleaned and the other isn't.
 #[tokio::test]
+async fn retrieve_with_session_ids_merges_across_sessions() {
+    let server = make_server().await;
+
+    // Store the same query-matching content into three different sessions.
+    let sessions = ["xs-alpha", "xs-beta", "xs-gamma"];
+    for (i, s) in sessions.iter().enumerate() {
+        server
+            .post("/api/v1/tools/store")
+            .json(&json!({
+                "content": format!("rollup-plugin-visualize note #{i} in {s}"),
+                "session_id": s,
+            }))
+            .await
+            .assert_status_ok();
+    }
+
+    // Also store an unrelated fragment in a session that's NOT in the list,
+    // to prove the filter is honored (its content matches the query, but
+    // its session is excluded).
+    server
+        .post("/api/v1/tools/store")
+        .json(&json!({
+            "content": "rollup-plugin-visualize note that must not appear",
+            "session_id": "xs-excluded",
+        }))
+        .await
+        .assert_status_ok();
+
+    let res = server
+        .post("/api/v1/tools/retrieve")
+        .json(&json!({
+            "query": "rollup-plugin-visualize",
+            "top_k": 20,
+            "session_ids": sessions,
+        }))
+        .await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    let hits = body["hits"].as_array().expect("hits array");
+
+    // Should see exactly the 3 included sessions, none of the excluded one.
+    let mut seen_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in hits {
+        let sid = h["session_id"]
+            .as_str()
+            .expect("cross-session hit must carry session_id")
+            .to_string();
+        assert!(
+            sessions.contains(&sid.as_str()),
+            "hit leaked from excluded session: {sid}",
+        );
+        seen_sessions.insert(sid);
+    }
+    assert_eq!(
+        seen_sessions.len(),
+        3,
+        "expected hits from all 3 requested sessions, got from: {seen_sessions:?}",
+    );
+}
+
+#[tokio::test]
+async fn retrieve_without_session_ids_preserves_single_session_shape() {
+    // Regression guard: single-session callers (cc_hooks, MCP) must keep
+    // getting hits WITHOUT a `session_id` field, so the JSON shape doesn't
+    // change underneath them.
+    let server = make_server().await;
+    let session = "wire-compat-single";
+
+    server
+        .post("/api/v1/tools/store")
+        .json(&json!({
+            "content": "single-session wire-compat probe",
+            "session_id": session,
+        }))
+        .await
+        .assert_status_ok();
+
+    let res = server
+        .post("/api/v1/tools/retrieve")
+        .json(&json!({
+            "query": "single-session wire-compat probe",
+            "top_k": 5,
+            "session_id": session,
+        }))
+        .await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    let hits = body["hits"].as_array().expect("hits array");
+    assert!(!hits.is_empty(), "single-session retrieve should hit");
+    for h in hits {
+        assert!(
+            h.get("session_id").is_none(),
+            "single-session hit must not include session_id (got {h:?})",
+        );
+    }
+}
+
+#[tokio::test]
 async fn hard_discard_removes_from_retrieve() {
     let server = make_server().await;
     let session = "hard-retrieve-session";
