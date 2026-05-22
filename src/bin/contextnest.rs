@@ -633,6 +633,34 @@ async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::
         );
     }
 
+    // Phase 1 of the neural-field epic: spawn the background
+    // consolidation worker. Runs AFTER WAL replay so its initial scan
+    // picks up every restored sidecar id. Honors
+    // CONTEXTNEST_CONSOLIDATION_* env knobs (see
+    // `src/services/consolidation.rs` for defaults).
+    {
+        use contextnest::services::consolidation::{run_worker, ConsolidationConfig};
+        let worker_services = services.clone();
+        let queue = services.consolidation_queue.clone();
+        let cfg = ConsolidationConfig::from_env();
+        if cfg.enabled {
+            tracing::info!(
+                interval_ms = cfg.interval_ms,
+                concurrency = cfg.concurrency,
+                batch_size = cfg.batch_size,
+                "Consolidation worker spawning"
+            );
+        } else {
+            tracing::warn!(
+                "Consolidation worker DISABLED via CONTEXTNEST_CONSOLIDATION_ENABLED=false — \
+                 attractor pipeline will not run for cc_hooks / WAL-replay fragments"
+            );
+        }
+        tokio::spawn(async move {
+            run_worker(worker_services, queue, cfg).await;
+        });
+    }
+
     let app = create_app(services).await?;
 
     tracing::info!("Configured API endpoints:");
@@ -646,6 +674,8 @@ async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::
     tracing::info!("    POST /api/v1/tools/discard");
     tracing::info!("    POST /api/v1/tools/reconstruct");
     tracing::info!("    POST /api/v1/tools/resonate");
+    tracing::info!("  Substrate observability:");
+    tracing::info!("    GET  /api/v1/substrate/consolidation");
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     tracing::info!("ContextNest server listening on {}", bind_address);

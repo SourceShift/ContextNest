@@ -10,6 +10,7 @@ use crate::Config;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod consolidation;
 pub mod context;
 pub mod embedding;
 pub mod embedding_providers;
@@ -109,6 +110,14 @@ pub struct ContextNestServices {
     /// shared maps so all clones see the writer the moment it's set
     /// post-replay.
     pub wal: Arc<tokio::sync::OnceCell<wal::Wal>>,
+    /// Background consolidation queue — Phase 1 of the neural-field
+    /// epic. ServicesSink + WAL replay enqueue fragment ids here after
+    /// writing sidecars; the worker drains the queue off the hot path
+    /// and runs each fragment through `process_memories` so basins +
+    /// connection-network nodes + reconstruction-store entries
+    /// actually form for cc_hooks ingest. See
+    /// `src/services/consolidation.rs` for the full design.
+    pub consolidation_queue: Arc<consolidation::ConsolidationQueue>,
     /// LLM provider abstraction (Phase J).
     /// Always present — may be [`crate::services::llm::LlmProvider::Disabled`]
     /// when no API key / provider config is present. Callers MUST check
@@ -179,6 +188,7 @@ impl ContextNestServices {
         let fragment_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let connection_log = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let embeddings_by_id = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let consolidation_queue = Arc::new(consolidation::ConsolidationQueue::new());
 
         // Construct the LLM service from environment. Returns Disabled when no
         // API key is present — never propagates an error so offline / CI starts
@@ -204,6 +214,7 @@ impl ContextNestServices {
             fragment_metadata,
             connection_log,
             embeddings_by_id,
+            consolidation_queue,
             wal: Arc::new(tokio::sync::OnceCell::new()),
             llm,
         })

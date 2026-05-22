@@ -333,6 +333,17 @@ impl Sink for ServicesSink {
             .add(&record.session_id_cn, &fragment_id)
             .await;
 
+        // Enqueue for background consolidation (Phase 1 of the
+        // neural-field epic). Fragment is now visible to the inbox /
+        // retrieve sidecar path; the worker catches up off the hot
+        // path so basin formation + connection-network nodes
+        // eventually exist without blocking ingest. Cheap
+        // sync HashSet insert — never blocks. See
+        // `src/services/consolidation.rs` for the worker design.
+        self.services
+            .consolidation_queue
+            .enqueue(fragment_id.clone());
+
         // Best-effort WAL append. Failures log + continue.
         if let Some(wal) = self.services.wal.get() {
             let wal_record = crate::services::wal::WalRecord::Store {

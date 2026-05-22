@@ -361,6 +361,14 @@ pub async fn restore_sidecars_bulk(
     // (active/deleted/reverse) per call. Could be made bulk too if it
     // becomes the bottleneck — for 12k records it's not.
     for (frag_id, session_id, _, _) in records {
+        // Enqueue every restored fragment for background consolidation
+        // (Phase 1 of the neural-field epic). This is what turns a WAL
+        // replay from "sidecars only" into eventually-full attractor
+        // state. The worker's startup scan would catch these anyway,
+        // but enqueueing inline saves the scan a pass over already-
+        // known ids and means consolidation starts the moment replay
+        // finishes rather than waiting for the worker's first tick.
+        services.consolidation_queue.enqueue(frag_id.clone());
         services.session_index.add(&session_id, &frag_id).await;
     }
 }
