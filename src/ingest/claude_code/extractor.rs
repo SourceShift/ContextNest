@@ -43,6 +43,23 @@ pub enum MemoryKind {
     CurrentTask,
     /// `summary` events written when /clear fires.
     Summary,
+    /// Aggregate list of files this session edited or created. One record
+    /// per session; `metadata.files` carries the deduplicated path array.
+    /// Lets downstream queries answer "which session touched X" without
+    /// grepping raw transcripts. Captured from `tool_use` events with
+    /// names `Edit` / `Write` / `MultiEdit` / `NotebookEdit` —
+    /// read-only `Read` is intentionally NOT included because "looked at"
+    /// is a different signal from "changed".
+    FilesTouched,
+    /// One feature/deliverable declared by the assistant in a
+    /// `z-insight.delivered_features[]` entry. The assistant's own
+    /// summary of what shipped this turn — higher-signal than walking
+    /// raw `tool_use` calls, because feature naming is the agent's job
+    /// not the substrate's. `metadata.files` carries the agent's
+    /// optional `files` array (the files THE AGENT believes the
+    /// feature lives in); `metadata.refs` carries any free-form
+    /// pointers like commit hashes or PR numbers.
+    Feature,
 }
 
 impl MemoryKind {
@@ -60,6 +77,8 @@ impl MemoryKind {
             Self::State => "state",
             Self::CurrentTask => "current_task",
             Self::Summary => "summary",
+            Self::FilesTouched => "files_touched",
+            Self::Feature => "feature",
         }
     }
 
@@ -79,6 +98,14 @@ impl MemoryKind {
             Self::CurrentTask => 0.55,
             Self::State => 0.50,
             Self::InitialPromptWindow => 0.45,
+            // Files touched is durable structural data — it should survive
+            // through the decay window so "which session edited X" answers
+            // months later still work.
+            Self::FilesTouched => 0.85,
+            // Features are the highest-signal artefact a session can leave
+            // behind — they're literally the answer to "what did this
+            // session ship". Importance just below summary.
+            Self::Feature => 0.90,
         }
     }
 }
@@ -176,6 +203,17 @@ pub fn extract_memories(
     // ^ task dedup keyed by id-if-present-else-subject, holding the latest
     // status seen for that task.
 
+    // Files-touched aggregation. We walk every assistant message part —
+    // when we see a `tool_use` whose `name` is a file-mutating tool we
+    // pull `input.file_path` into a session-level dedup set. Cheap
+    // (constant per part), and lets the substrate answer "which session
+    // edited X.tsx" without grepping raw transcripts later. See
+    // `FILE_MUTATING_TOOLS` below for the inclusion list — `Read` is
+    // intentionally excluded because "looked at" is a different signal
+    // from "changed".
+    let mut files_touched: HashSet<String> = HashSet::new();
+    let mut first_file_ts: Option<String> = None;
+
     for ev in events {
         if ev.event_type != "assistant" {
             continue;
@@ -185,13 +223,90 @@ pub fn extract_memories(
             continue;
         };
         for part in parts {
-            if part.get("type").and_then(Value::as_str) != Some("text") {
+            let part_type = part.get("type").and_then(Value::as_str);
+
+            // Branch 1 — tool_use part: capture file paths for any
+            // mutation-shaped tool (Edit/Write/MultiEdit/NotebookEdit).
+            // No allocation on the common case where the tool doesn't
+            // mutate files.
+            if part_type == Some("tool_use") {
+                if let Some(name) = part.get("name").and_then(Value::as_str) {
+                    if FILE_MUTATING_TOOLS.contains(&name) {
+                        if let Some(input) = part.get("input") {
+                            if let Some(path) = input.get("file_path").and_then(Value::as_str) {
+                                if !path.is_empty() {
+                                    if files_touched.insert(path.to_string())
+                                        && first_file_ts.is_none()
+                                    {
+                                        first_file_ts = ev.timestamp.clone();
+                                    }
+                                }
+                            }
+                            // NotebookEdit + MultiEdit also have edits arrays
+                            // that reference the same top-level file_path,
+                            // so no second pass needed here.
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Branch 2 — text part: existing z-insight extraction +
+            // (new) delivered_features extraction.
+            if part_type != Some("text") {
                 continue;
             }
             let Some(text) = part.get("text").and_then(Value::as_str) else {
                 continue;
             };
             for block in extract_zinsight_blocks(text) {
+                // delivered_features[] — one Feature record per entry.
+                // Cheap: most blocks don't carry this field.
+                if let Some(features) = block.get("delivered_features").and_then(Value::as_array) {
+                    for feat in features {
+                        let name = feat
+                            .get("feature")
+                            .or_else(|| feat.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let mut rec = MemoryRecord::new(
+                            MemoryKind::Feature,
+                            name.to_string(),
+                            cn_session_id.clone(),
+                        );
+                        rec = annotate_session_meta(
+                            rec,
+                            session_uuid,
+                            project_cwd,
+                            ev.timestamp.as_deref(),
+                        );
+                        if let Some(files_arr) = feat.get("files").and_then(Value::as_array) {
+                            let filtered: Vec<Value> = files_arr
+                                .iter()
+                                .filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                                .cloned()
+                                .collect();
+                            if !filtered.is_empty() {
+                                rec = rec.with_meta("files", Value::Array(filtered));
+                            }
+                        }
+                        if let Some(refs) = feat.get("refs").and_then(Value::as_array) {
+                            if !refs.is_empty() {
+                                rec = rec.with_meta("refs", Value::Array(refs.clone()));
+                            }
+                        }
+                        if let Some(layer) = feat.get("layer").and_then(Value::as_str) {
+                            if !layer.is_empty() {
+                                rec = rec.with_meta("layer", Value::String(layer.to_string()));
+                            }
+                        }
+                        out.push(rec);
+                    }
+                }
                 extract_block_memories(
                     &block,
                     ev.timestamp.as_deref(),
@@ -284,8 +399,43 @@ pub fn extract_memories(
         }
     }
 
+    // 7. files_touched — one aggregate record per session. Skipped
+    // entirely when no file-mutating tool ran (e.g. read-only research
+    // sessions). The text is a human-readable summary so retrieve's
+    // semantic match still has something to hit on; the structured
+    // answer lives in `metadata.files`.
+    if !files_touched.is_empty() {
+        let mut files: Vec<String> = files_touched.into_iter().collect();
+        files.sort();
+        let preview = files.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+        let summary_text = if files.len() <= 8 {
+            format!("session touched {} file(s): {}", files.len(), preview)
+        } else {
+            format!(
+                "session touched {} file(s) including: {}…",
+                files.len(),
+                preview
+            )
+        };
+        let mut rec = MemoryRecord::new(
+            MemoryKind::FilesTouched,
+            summary_text,
+            cn_session_id.clone(),
+        );
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, first_file_ts.as_deref());
+        let files_value: Vec<Value> = files.into_iter().map(Value::String).collect();
+        rec = rec.with_meta("files", Value::Array(files_value));
+        out.push(rec);
+    }
+
     out
 }
+
+/// Tool names whose presence in a `tool_use` part means "the agent
+/// mutated a file." Read-only tools (e.g. `Read`, `Grep`, `Glob`) are
+/// deliberately excluded — the substrate's job here is to record what
+/// *changed*, not what was inspected.
+const FILE_MUTATING_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// Pull memories from a single z-insight block. The goal/tasks streams are
 /// collected in the caller for post-processing (clustering + dedup), so this
