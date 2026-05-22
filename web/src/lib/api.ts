@@ -1,6 +1,7 @@
 import type {
   BasinsResponse,
   ConnectionsResponse,
+  FeaturesResponse,
   FragmentsResponse,
   HealthResponse,
   InboxResponse,
@@ -114,4 +115,15 @@ export const api = {
       method: 'POST',
       json: params,
     }),
+
+  features: (params: { since?: string; layer?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.since) q.set('since', params.since);
+    if (params.layer) q.set('layer', params.layer);
+    const qs = q.toString();
+    return request<FeaturesResponse>(
+      `/api/v1/features${qs ? `?${qs}` : ''}`,
+      { method: 'GET' },
+    );
+  },
 };

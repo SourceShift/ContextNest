@@ -125,3 +125,21 @@ export type InboxHit = {
 export type InboxResponse = {
   items: InboxHit[];
 };
+
+export type FeatureEntry = {
+  session_id: string;
+  feature: string;
+  ts: string | null;
+  files: string[];
+  refs: unknown[];
+  layer: string | null;
+  how_to_test: string | null;
+  defs: string[];
+};
+
+export type FeaturesResponse = {
+  since: string;
+  layer: string | null;
+  count: number;
+  features: FeatureEntry[];
+};
