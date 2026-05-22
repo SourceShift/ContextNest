@@ -242,9 +242,26 @@ is unset.
 - Neo4j (optional — graph service feature only)
 - Redis (optional — rate limiting only)
 
+## Substrate observability
+
+ContextNest's tagline claims a lot. These endpoints let you verify
+each claim is backed by an actually-running code path:
+
+| Endpoint | What it proves |
+|---|---|
+| `GET /api/v1/substrate/consolidation` | Background worker progress — `queued`, `consolidated_count`, `lag`. If lag stays high after a restart, the worker isn't running. |
+| `GET /api/v1/substrate/health` | Aggregate snapshot — fragments, basins (count, avg_mass), connections (edges, avg_degree, nodes), decay (half_life, median_age). If `basins.count == 0` on a populated substrate, the attractor pipeline is dormant. |
+| `GET /api/v1/field/basins` | Per-basin centroids + member counts. `source: "attractor"` means real basins; `source: "project"` is the pre-consolidation fallback. |
+
+See [docs/architecture-honest.md](docs/architecture-honest.md) for
+the full grep-verification recipe — every tagline claim should
+return at least one hit from outside `src/memory/attractors/`.
+
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — substrate internals, mermaid + sequence diagrams per tool, concurrency contract
+- [docs/architecture-honest.md](docs/architecture-honest.md) — what actually happens at runtime, per-fragment lifecycle through the attractor pipeline, all env knobs, grep-verifiable claims
+- [docs/roadmap/epics/neural-field-real.md](docs/roadmap/epics/neural-field-real.md) — 7-phase epic that brought the substrate's runtime behavior into agreement with its tagline (now complete)
 - [docs/usage.md](docs/usage.md) — copy-paste curl examples for every tool, integration recipes (Python, bash, Claude Code hooks), troubleshooting
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to add a tool, CI gates, canonical pipeline
 - [SECURITY.md](SECURITY.md) — vulnerability reporting
