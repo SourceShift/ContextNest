@@ -1,12 +1,14 @@
 import { createFileRoute } from '@tanstack/react-router';
+import { useQuery } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { BrandMark, Icon } from '@/components/atoms';
 import { useFieldData } from '@/hooks/useFieldData';
 import { useSessions } from '@/hooks/useSessions';
 import type { FieldFragment } from '@/hooks/useFieldData';
+import { api } from '@/lib/api';
 import { cosineSimilarity } from '@/lib/pca';
-import type { BasinSummary, SessionListItem } from '@/lib/types';
+import type { BasinSummary, RetrieveHit, SessionListItem } from '@/lib/types';
 
 export const Route = createFileRoute('/field')({
   component: FieldPage,
@@ -121,6 +123,49 @@ function FieldPage() {
     });
   }, [sessionsHook.data, focusedProject]);
 
+  // Debounce the typed query so we don't fire /retrieve on every
+  // keystroke. 350ms is faster than search.tsx's 250ms because the
+  // user typically pastes here rather than types — but a bit longer
+  // than zero so paste→edit→paste sequences only fire once.
+  useEffect(() => {
+    const t = setTimeout(() => setQueryDebounced(queryText), 350);
+    return () => clearTimeout(t);
+  }, [queryText]);
+
+  // Send the query against the same scope the user has filtered to.
+  // Single-session mode if a session is picked, otherwise cross-session
+  // over every session in the current project filter (or all sessions).
+  const querySessionIds = useMemo(() => {
+    if (focusedSession) return [focusedSession];
+    return sessionOptions.map((s) => s.id);
+  }, [focusedSession, sessionOptions]);
+
+  const queryActive = queryDebounced.trim().length >= 2;
+  const queryResults = useQuery({
+    queryKey: ['field-query', queryDebounced, querySessionIds, focusedSession],
+    enabled: queryActive && querySessionIds.length > 0,
+    staleTime: 10_000,
+    queryFn: async () => {
+      // top_k=40 because /field shows a lot of fragments at once; the
+      // user wants enough hits to see a cluster, not just the top 5.
+      return api.retrieve({
+        query: queryDebounced,
+        top_k: 40,
+        ...(focusedSession
+          ? { session_id: focusedSession }
+          : { session_ids: querySessionIds }),
+      });
+    },
+  });
+
+  const queryHitIds = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const h of queryResults.data?.hits ?? []) {
+      m.set(h.id, h.similarity);
+    }
+    return m;
+  }, [queryResults.data]);
+
   const setProjectFilter = useCallback(
     (project: string | undefined) => {
       // Changing project also clears session filter (the session
@@ -157,6 +202,13 @@ function FieldPage() {
     null,
   );
   const [disabledKinds, setDisabledKinds] = useState<Set<string>>(new Set());
+  // Query-overlay mode (Phase 4 → field UX). The user types something
+  // — typically the prompt they're about to send to Claude Code — and
+  // /field becomes a context picker, highlighting fragments most
+  // relevant to the query and dimming the rest hard.
+  const [queryText, setQueryText] = useState('');
+  const [queryDebounced, setQueryDebounced] = useState('');
+  const queryInputRef = useRef<HTMLInputElement>(null);
   const [view, setView] = useState<ViewState>(IDENTITY_VIEW);
   const dragRef = useRef<{
     startView: ViewState;
@@ -464,6 +516,15 @@ function FieldPage() {
 
   const fragmentOpacity = (f: FieldFragment): number => {
     if (!visibleIds.has(f.id)) return 0.05;
+    // Query-overlay mode takes priority over every other dimming
+    // logic — its whole purpose is to make the answer to "what's
+    // relevant to this query" visually impossible to miss.
+    if (queryActive) {
+      const sim = queryHitIds.get(f.id);
+      if (sim == null) return 0.05;
+      // Top hits at full opacity; weaker hits still legible.
+      return Math.max(0.55, Math.min(1, sim * 1.25 + 0.3));
+    }
     // Highlight states take priority over decay.
     if (selectedFragment && f.id === selectedFragment) return 1;
     if (selectedFragment && neighborIds.has(f.id)) return 1;
@@ -474,6 +535,21 @@ function FieldPage() {
     const ageFade =
       f.ageDays == null ? 0.7 : Math.max(0.35, 1 - f.ageDays / 30);
     return ageFade;
+  };
+
+  // Radius bump for fragments that match the active query — makes
+  // the matched cluster pop visually without needing to read the
+  // sidebar list.
+  const fragmentRadius = (f: FieldFragment): number => {
+    if (queryActive) {
+      const sim = queryHitIds.get(f.id);
+      if (sim == null) return 2.2;
+      // Linear ramp: a top-similarity hit is ~6px, weakest ~4px.
+      return 4 + Math.max(0, Math.min(1, sim)) * 2.5;
+    }
+    if (selectedFragment === f.id) return 6;
+    if (neighborIds.has(f.id)) return 4.5;
+    return 3;
   };
 
   return (
@@ -610,6 +686,47 @@ function FieldPage() {
         <span className="mono dim" style={{ fontSize: 11 }}>
           {field.data.fragments.length} fragments rendered
           {field.truncated ? ' (truncated)' : ''}
+        </span>
+      </div>
+
+      {/* Query-overlay bar — type or paste to find relevant past work.
+          Lives between the filter row and the field viz so the input
+          stays visible while the canvas reacts in real time. */}
+      <div className="field-query-bar">
+        <Icon.Search />
+        <input
+          ref={queryInputRef}
+          type="text"
+          value={queryText}
+          onChange={(e) => setQueryText(e.target.value)}
+          placeholder="paste your prompt to find relevant past work — e.g. 'context of the auth migration'"
+          className="field-query-input"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        {queryText && (
+          <button
+            type="button"
+            className="btn btn-ghost sm"
+            title="clear query"
+            onClick={() => {
+              setQueryText('');
+              queryInputRef.current?.focus();
+            }}
+          >
+            <Icon.X />
+          </button>
+        )}
+        <span className="mono dim field-query-status">
+          {queryActive
+            ? queryResults.isLoading
+              ? 'searching…'
+              : `${queryHitIds.size} relevant · scope ${
+                  focusedSession
+                    ? '1 session'
+                    : `${querySessionIds.length} sessions`
+                }`
+            : 'type to find context · 2+ characters'}
         </span>
       </div>
 
@@ -783,19 +900,23 @@ function FieldPage() {
                     <circle
                       cx={p.x}
                       cy={p.y}
-                      r={
-                        selectedFragment === f.id
-                          ? 6
-                          : neighborIds.has(f.id)
-                            ? 4.5
-                            : 3
-                      }
+                      r={fragmentRadius(f)}
                       fill={color}
                       opacity={fragmentOpacity(f)}
                       stroke={
-                        selectedFragment === f.id ? '#ffffff' : 'none'
+                        selectedFragment === f.id
+                          ? '#ffffff'
+                          : queryActive && queryHitIds.has(f.id)
+                            ? 'var(--accent)'
+                            : 'none'
                       }
-                      strokeWidth={selectedFragment === f.id ? 1.5 : 0}
+                      strokeWidth={
+                        selectedFragment === f.id
+                          ? 1.5
+                          : queryActive && queryHitIds.has(f.id)
+                            ? 1.25
+                            : 0
+                      }
                       style={{
                         cursor: 'pointer',
                         transition: 'opacity 150ms ease, r 150ms ease',
@@ -998,7 +1119,21 @@ function FieldPage() {
           </div>
 
           <aside className="field-side">
-            {selectedFragmentObj ? (
+            {queryActive ? (
+              <QueryResultsPanel
+                query={queryDebounced}
+                hits={queryResults.data?.hits ?? []}
+                isLoading={queryResults.isLoading}
+                onSelectFragment={(id) => {
+                  setSelectedFragment(id);
+                  setSelectedBasin(null);
+                }}
+                onClear={() => {
+                  setQueryText('');
+                  queryInputRef.current?.focus();
+                }}
+              />
+            ) : selectedFragmentObj ? (
               <FragmentDetail
                 fragment={selectedFragmentObj}
                 neighborIds={neighborIds}
@@ -1087,6 +1222,122 @@ function TimelineScrubber({
 // =============================================================================
 // Sidebar variants
 // =============================================================================
+
+// Query-overlay side panel. Lists the ranked retrieve hits with a
+// similarity badge and a "Copy IDs" affordance so the user can lift
+// them out of /field and into a Claude prompt verbatim. Hovering
+// individual rows focuses the corresponding fragment on the canvas.
+function QueryResultsPanel({
+  query,
+  hits,
+  isLoading,
+  onSelectFragment,
+  onClear,
+}: {
+  query: string;
+  hits: RetrieveHit[];
+  isLoading: boolean;
+  onSelectFragment: (id: string) => void;
+  onClear: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const copyIds = useCallback(() => {
+    if (hits.length === 0) return;
+    const ids = hits.map((h) => h.id).join('\n');
+    void navigator.clipboard.writeText(ids).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1400);
+    });
+  }, [hits]);
+
+  return (
+    <div className="field-side-detail field-query-panel">
+      <div className="side-detail-header">
+        <div
+          className="mono dim"
+          style={{
+            fontSize: 10,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          context for query
+        </div>
+        <button
+          type="button"
+          className="btn btn-ghost sm"
+          onClick={onClear}
+          title="exit query mode"
+        >
+          <Icon.X />
+        </button>
+      </div>
+      <div className="field-query-echo mono">{query}</div>
+
+      <div className="field-query-toolbar">
+        <span className="dim mono" style={{ fontSize: 11 }}>
+          {isLoading ? 'searching…' : `${hits.length} hits`}
+        </span>
+        <div className="grow" />
+        <button
+          type="button"
+          className="btn btn-ghost sm"
+          disabled={hits.length === 0}
+          onClick={copyIds}
+          title="copy fragment ids to clipboard"
+        >
+          {copied ? 'copied' : `copy ${hits.length} ids`}
+        </button>
+      </div>
+
+      {hits.length === 0 && !isLoading ? (
+        <div className="dim" style={{ fontSize: 12, marginTop: 12 }}>
+          No matches. Try a more specific phrase, or widen the folder /
+          session filter above the canvas.
+        </div>
+      ) : (
+        <div className="field-query-hits">
+          {hits.map((h, i) => {
+            const kind =
+              (h.metadata?.kind as string | undefined) ?? 'unknown';
+            const session =
+              (h.session_id as string | undefined) ??
+              (h.metadata?.src_session as string | undefined) ??
+              '';
+            const sessionShort = session ? session.slice(0, 8) : '';
+            return (
+              <button
+                key={h.id}
+                type="button"
+                className="field-query-hit"
+                onClick={() => onSelectFragment(h.id)}
+                title="click to focus on the canvas"
+              >
+                <div className="hit-row-top">
+                  <span className="hit-rank mono">#{i + 1}</span>
+                  <span
+                    className="hit-kind mono"
+                    style={{ color: `var(--kind-${kind}, var(--ink-muted))` }}
+                  >
+                    {kind}
+                  </span>
+                  <span className="hit-sim mono">
+                    {h.similarity.toFixed(3)}
+                  </span>
+                </div>
+                <div className="hit-content">{h.content}</div>
+                {sessionShort && (
+                  <div className="hit-session mono dim">{sessionShort}</div>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function ValuePanel({
   hasEmbeddings,

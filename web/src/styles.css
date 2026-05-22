@@ -1732,6 +1732,118 @@ body {
   max-width: none;
 }
 
+/* ============ FIELD QUERY OVERLAY ============ */
+.field-query-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+}
+.field-query-bar:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-faint);
+}
+.field-query-input {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 4px 0;
+}
+.field-query-input::placeholder {
+  color: var(--ink-faint);
+}
+.field-query-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.field-query-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+}
+.field-query-echo {
+  background: var(--surface-2);
+  border-left: 2px solid var(--accent);
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  border-radius: 0 var(--r-control) var(--r-control) 0;
+  word-break: break-word;
+}
+.field-query-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.field-query-hits {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  padding-right: 2px;
+}
+.field-query-hit {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  padding: 8px 10px;
+  gap: 4px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.field-query-hit:hover {
+  border-color: var(--accent);
+  background: var(--surface-3);
+}
+.field-query-hit .hit-row-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+}
+.field-query-hit .hit-rank {
+  color: var(--ink-faint);
+  min-width: 24px;
+}
+.field-query-hit .hit-kind {
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.field-query-hit .hit-sim {
+  margin-left: auto;
+  color: var(--accent);
+}
+.field-query-hit .hit-content {
+  font-size: 12px;
+  color: var(--ink);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.field-query-hit .hit-session {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
 .field-scrubber {
   position: absolute;
   left: 14px;
