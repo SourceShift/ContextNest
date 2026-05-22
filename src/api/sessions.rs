@@ -9,8 +9,15 @@
 //! It is the first building block for the cross-session Inbox and Sessions
 //! list UI routes.
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Json,
+    routing::get,
+    Router,
+};
 use serde::Serialize;
+use serde_json::Value;
 use tracing::warn;
 
 use crate::services::ContextNestServices;
@@ -191,8 +198,239 @@ fn most_common(counts: std::collections::HashMap<String, usize>) -> Option<Strin
 // Router
 // =============================================================================
 
+// =============================================================================
+// `GET /api/v1/sessions/by-file?path=<substring>`
+//
+// Returns the sessions whose `files_touched` fragment contains a path
+// that contains the given substring (case-insensitive). Backed by the
+// MemoryKind::FilesTouched records emitted at ingest time — see
+// `src/ingest/claude_code/extractor.rs`.
+// =============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ByFileQuery {
+    /// Substring to match against any file path in any session's
+    /// `files_touched` array. Case-insensitive. A bare basename like
+    /// `"AgentStreamRail.tsx"` matches any session that touched a file
+    /// containing that substring; a more-specific path like
+    /// `"web/src/components/AgentStreamRail.tsx"` narrows the match.
+    pub path: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionFileMatch {
+    pub session_id: String,
+    /// Subset of the session's full `files_touched` list — only the
+    /// paths that actually matched the query substring. Lets the
+    /// caller see which file in the session matched (useful when the
+    /// query is a partial basename and several files in the session
+    /// could plausibly match).
+    pub matched_files: Vec<String>,
+    pub total_files: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ByFileResponse {
+    pub query: String,
+    pub matches: Vec<SessionFileMatch>,
+}
+
+pub async fn sessions_by_file(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<ByFileQuery>,
+) -> Result<Json<ByFileResponse>, StatusCode> {
+    let needle = q.path.trim();
+    if needle.is_empty() {
+        return Ok(Json(ByFileResponse {
+            query: q.path,
+            matches: Vec::new(),
+        }));
+    }
+    let needle_low = needle.to_lowercase();
+
+    // Walk fragment_metadata once, pulling every `files_touched`
+    // fragment. The substrate doesn't have a secondary index here so
+    // this is an O(N) scan — fine for the sub-1k files_touched
+    // fragments a typical substrate has (one per session).
+    let metadata = services.fragment_metadata.read().await;
+    let mut by_session: std::collections::HashMap<String, SessionFileMatch> =
+        std::collections::HashMap::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        if meta.get("kind").and_then(|v| v.as_str()) != Some("files_touched") {
+            continue;
+        }
+        let Some(files) = meta.get("files").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let matched: Vec<String> = files
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|p| p.to_lowercase().contains(&needle_low))
+            .map(|p| p.to_string())
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // Recover the session id from the metadata sidecar. cc_hooks
+        // ingest writes `src_session` as the canonical full UUID; on
+        // the rare path where it's missing (e.g. records ingested
+        // before that field was added) we skip the row rather than
+        // pollute the response with "unknown" entries.
+        let Some(session_id) = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        else {
+            // Silence the warn — single-line drop is fine for a rare
+            // malformed-record edge case.
+            let _ = frag_id;
+            continue;
+        };
+        // If multiple files_touched fragments exist for the same
+        // session (shouldn't happen on the current ingest path, but
+        // belt-and-braces), keep the union of matched files.
+        by_session
+            .entry(session_id.clone())
+            .and_modify(|m| {
+                for p in &matched {
+                    if !m.matched_files.contains(p) {
+                        m.matched_files.push(p.clone());
+                    }
+                }
+                m.total_files = m.total_files.max(files.len());
+            })
+            .or_insert(SessionFileMatch {
+                session_id,
+                matched_files: matched,
+                total_files: files.len(),
+            });
+    }
+    drop(metadata);
+
+    let mut matches: Vec<SessionFileMatch> = by_session.into_values().collect();
+    matches.sort_by(|a, b| {
+        b.matched_files
+            .len()
+            .cmp(&a.matched_files.len())
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+
+    Ok(Json(ByFileResponse {
+        query: q.path,
+        matches,
+    }))
+}
+
+// =============================================================================
+// `GET /api/v1/sessions/by-feature?q=<substring>`
+//
+// Returns the sessions that declared a feature (in their
+// `z-insight.delivered_features[]`) whose name contains the substring.
+// Higher-signal than by-file because the agent named the feature itself.
+// =============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ByFeatureQuery {
+    pub q: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FeatureHit {
+    pub session_id: String,
+    pub feature: String,
+    pub ts: Option<String>,
+    pub files: Vec<String>,
+    pub refs: Vec<Value>,
+    pub layer: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ByFeatureResponse {
+    pub query: String,
+    pub hits: Vec<FeatureHit>,
+}
+
+pub async fn sessions_by_feature(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<ByFeatureQuery>,
+) -> Result<Json<ByFeatureResponse>, StatusCode> {
+    let needle = q.q.trim();
+    if needle.is_empty() {
+        return Ok(Json(ByFeatureResponse {
+            query: q.q,
+            hits: Vec::new(),
+        }));
+    }
+    let needle_low = needle.to_lowercase();
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+    let mut hits: Vec<FeatureHit> = Vec::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        if meta.get("kind").and_then(|v| v.as_str()) != Some("feature") {
+            continue;
+        }
+        let feature_text = texts.get(frag_id).cloned().unwrap_or_default();
+        if !feature_text.to_lowercase().contains(&needle_low) {
+            continue;
+        }
+        let session_id = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let files: Vec<String> = meta
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let refs: Vec<Value> = meta
+            .get("refs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let layer = meta
+            .get("layer")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        hits.push(FeatureHit {
+            session_id,
+            feature: feature_text,
+            ts,
+            files,
+            refs,
+            layer,
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Most recent first when both have ts; deterministic on session_id otherwise.
+    hits.sort_by(|a, b| {
+        b.ts.as_deref()
+            .unwrap_or("")
+            .cmp(a.ts.as_deref().unwrap_or(""))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+
+    Ok(Json(ByFeatureResponse { query: q.q, hits }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
-    Router::new().route("/api/v1/sessions", get(list_sessions))
+    Router::new()
+        .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/sessions/by-file", get(sessions_by_file))
+        .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
 }

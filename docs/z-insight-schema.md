@@ -90,6 +90,7 @@ re-summarise free-form text.
 | `decision` | string | optional | When `awaiting_decision == true`, the **actual question** the user needs to answer. One sentence ideally. |
 | `blockers` | string[] | optional | Concrete blockers preventing progress. Distinct from `progress: "blocked"` (which is just a flag) — these are the actual reasons. Each blocker should be one short string. |
 | `requires_user_action` | object[] | optional | **Imperative steps the USER must do** (reload a page, click a button, run a command, confirm an outcome). Distinct from `tasks[]` which is the assistant's own work. Each entry: `{step, action, reason, urgency}` where `urgency` ∈ `"now"`/`"soon"`/`"later"`. See semantics below. |
+| `delivered_features` | object[] | optional | **Features this turn shipped**, named in the assistant's own words. Lets the substrate answer "which session added the query-overlay mode" without grepping commits or PRs. Each entry: `{feature, files?, refs?, layer?}` — see [`delivered_features[]` shape](#delivered_features-shape) below. Higher-signal than walking `tool_use` because the agent names the feature; the per-file `tool_use` index in the ingester answers "which session touched X.tsx" complementarily. |
 
 ### `requires_user_action[]` shape
 
@@ -109,6 +110,28 @@ re-summarise free-form text.
 | `now` | The user needs to do this before the next assistant turn / next interaction with this session. Inbox highlights these. |
 | `soon` | The user needs to do this before the next time they open this session. Inbox includes these. |
 | `later` | Backlog. Stored but not surfaced in the attention inbox. |
+
+### `delivered_features[]` shape
+
+```jsonc
+{
+  "feature": "query-overlay mode for /field viz",      // required: short feature name
+  "files":   ["web/src/routes/field.tsx",             // optional: which files implement it
+              "web/src/styles.css"],
+  "refs":    ["PR #39", "src/api/tools.rs:retrieve"], // optional: outside-of-files pointers
+  "layer":   "frontend"                                // optional: frontend|backend|infra|docs|tests|other
+}
+```
+
+The ingester emits one `MemoryKind::Feature` record per entry, with
+`metadata.kind == "feature"`, `metadata.files`, `metadata.refs`,
+`metadata.layer`, and `metadata.src_session` set. The feature name
+itself goes into the fragment's text so semantic retrieve hits it.
+
+**Why this isn't just a `top_jobs[]` bullet:** `top_jobs` is
+freeform "I did X" prose. `delivered_features` is structured, with
+file pointers + layer + refs, suitable for `/api/v1/sessions/by-feature?q=…`
+to answer "which session added feature X" deterministically.
 
 ## What the ingester does with this
 
