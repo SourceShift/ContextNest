@@ -88,7 +88,7 @@ reqwest = { version = "0.11", features = ["json"] }
 
 # GraphQL
 async-graphql = { version = "6.0", features = ["apollo_tracing", "apollo_persisted_queries"] }
-async-graphql-axum = "6.0"
+async-graphql-axum = "7.2"
 
 # Command line args
 clap = { version = "4.5", features = ["derive"] }
