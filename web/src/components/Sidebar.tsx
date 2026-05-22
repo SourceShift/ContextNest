@@ -1,15 +1,32 @@
 import { Link, useRouterState } from '@tanstack/react-router';
 
 import { BrandMark, Icon } from './atoms';
+import { useFeatures } from '@/hooks/useFeatures';
 import { useInbox } from '@/hooks/useInbox';
 import { useSessions } from '@/hooks/useSessions';
 import { useStats } from '@/hooks/useStats';
 
-type NavKey = 'inbox' | 'sessions' | 'search' | 'phases' | 'field' | 'tools' | 'substrate';
+type NavKey =
+  | 'inbox'
+  | 'sessions'
+  | 'search'
+  | 'phases'
+  | 'features'
+  | 'field'
+  | 'tools'
+  | 'substrate';
 
 type NavItem = {
   k: NavKey;
-  to: '/' | '/sessions' | '/search' | '/phases' | '/field' | '/tools' | '/substrate';
+  to:
+    | '/'
+    | '/sessions'
+    | '/search'
+    | '/phases'
+    | '/features'
+    | '/field'
+    | '/tools'
+    | '/substrate';
   label: string;
   icon: React.ReactNode;
   kbd: string;
@@ -23,6 +40,10 @@ export function Sidebar() {
   const inbox = useInbox();
   const sessions = useSessions();
   const stats = useStats();
+  // Features count is the 24h window — same default the /features page
+  // uses on first load, so the badge matches what the user will see
+  // when they click through.
+  const features = useFeatures({ since: '24h' });
 
   // Phases count is derived from substrate stats — every kind=goal_phase
   // fragment is a "phase" in the dashboard's vocabulary. When the stats
@@ -63,6 +84,14 @@ export function Sidebar() {
       icon: <Icon.Layers className="nav-icon" />,
       kbd: 'g p',
       count: phasesCount,
+    },
+    {
+      k: 'features',
+      to: '/features',
+      label: 'Features',
+      icon: <Icon.Check className="nav-icon" />,
+      kbd: 'g e',
+      count: features.data?.count,
     },
     {
       k: 'field',
