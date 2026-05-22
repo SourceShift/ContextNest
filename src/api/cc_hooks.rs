@@ -411,10 +411,14 @@ async fn store_task_completion(
     };
 
     let session_uuid = &payload.session_id;
+    // Canonical substrate session_id is `cc-<full-uuid>` (matches what
+    // `extractor::extract_memories` emits for the same session). Older
+    // builds truncated to the first 8 chars; WAL migration upgrades
+    // pre-existing short-form records at startup.
     let cn_sid = if session_uuid.is_empty() {
         "cc-unknown".to_string()
     } else {
-        format!("cc-{}", &session_uuid[..session_uuid.len().min(8)])
+        format!("cc-{session_uuid}")
     };
 
     let mut record = MemoryRecord::new(

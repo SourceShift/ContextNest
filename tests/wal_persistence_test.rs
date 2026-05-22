@@ -409,3 +409,110 @@ async fn retrieve_with_metadata_filter_works_on_sidecar_only_substrate() {
         assert_eq!(hit["metadata"]["kind"], "todo");
     }
 }
+
+#[tokio::test]
+async fn migration_rewrites_short_session_ids_to_full_uuid() {
+    use contextnest::services::wal::migrate_short_session_ids;
+
+    let dir = tempdir().unwrap();
+    let wal_path = dir.path().join("wal.jsonl");
+
+    // Hand-craft a WAL that mimics what an old build would have written:
+    // one short-form `cc-9b8a1f3e` record carrying the full uuid in
+    // metadata.src_session, plus one long-form record (already migrated),
+    // plus one short-form record WITHOUT src_session (should be skipped).
+    let writer = Wal::open_for_append(wal_path.clone()).unwrap();
+    let full_uuid = "9b8a1f3e-51e2-bc40-89ab-cdef01234567";
+    writer
+        .append(&WalRecord::Store {
+            fragment_id: "frag-old".into(),
+            session_id: "cc-9b8a1f3e".into(),
+            content: "old short-form record".into(),
+            importance: 0.5,
+            metadata: HashMap::from([(
+                "src_session".to_string(),
+                json!(full_uuid),
+            )]),
+        })
+        .unwrap();
+    writer
+        .append(&WalRecord::Store {
+            fragment_id: "frag-new".into(),
+            session_id: format!("cc-{full_uuid}"),
+            content: "already-canonical record".into(),
+            importance: 0.5,
+            metadata: HashMap::from([(
+                "src_session".to_string(),
+                json!(full_uuid),
+            )]),
+        })
+        .unwrap();
+    writer
+        .append(&WalRecord::Store {
+            fragment_id: "frag-orphan".into(),
+            session_id: "cc-deadbeef".into(),
+            content: "no src_session — leave alone".into(),
+            importance: 0.5,
+            metadata: HashMap::new(),
+        })
+        .unwrap();
+    drop(writer);
+
+    let records = Wal::read_records(&wal_path).unwrap();
+    assert_eq!(records.len(), 3);
+
+    let (migrated_records, report) =
+        migrate_short_session_ids(&wal_path, records).expect("migration ok");
+
+    // Migration report shape: 1 rewrite, 1 untouched orphan, 1 already-long.
+    assert_eq!(report.migrated, 1, "exactly one short-form was rewritten");
+    assert_eq!(report.skipped_no_src_session, 1, "orphan was skipped");
+
+    // In-memory records: the short-form became long-form, others
+    // unchanged.
+    let by_id: HashMap<_, _> = migrated_records
+        .iter()
+        .map(|r| match r {
+            WalRecord::Store {
+                fragment_id,
+                session_id,
+                ..
+            } => (fragment_id.clone(), session_id.clone()),
+        })
+        .collect();
+    assert_eq!(by_id["frag-old"], format!("cc-{full_uuid}"));
+    assert_eq!(by_id["frag-new"], format!("cc-{full_uuid}"));
+    assert_eq!(by_id["frag-orphan"], "cc-deadbeef");
+
+    // On-disk WAL rewritten: re-read and confirm.
+    let after = Wal::read_records(&wal_path).unwrap();
+    let after_session_ids: Vec<_> = after
+        .iter()
+        .map(|r| match r {
+            WalRecord::Store { session_id, .. } => session_id.clone(),
+        })
+        .collect();
+    assert!(after_session_ids.contains(&format!("cc-{full_uuid}")));
+    assert!(after_session_ids.contains(&"cc-deadbeef".to_string()));
+    assert!(
+        !after_session_ids.contains(&"cc-9b8a1f3e".to_string()),
+        "short-form must be gone from disk",
+    );
+
+    // .bak recovery breadcrumb exists and still has the pre-migration data.
+    let bak_path = wal_path.with_extension("bak");
+    let bak = Wal::read_records(&bak_path).unwrap();
+    let bak_session_ids: Vec<_> = bak
+        .iter()
+        .map(|r| match r {
+            WalRecord::Store { session_id, .. } => session_id.clone(),
+        })
+        .collect();
+    assert!(bak_session_ids.contains(&"cc-9b8a1f3e".to_string()));
+
+    // Re-running the migration is a no-op (idempotent).
+    let (_, second) =
+        migrate_short_session_ids(&wal_path, Wal::read_records(&wal_path).unwrap())
+            .expect("idempotent rerun");
+    assert_eq!(second.migrated, 0, "second pass must migrate nothing");
+}

@@ -161,7 +161,15 @@ function SessionsPage() {
               onClick={() => navigate({ to: '/sessions/$id', params: { id: s.id } })}
             >
               <UrgencyDot urg={urgency} />
-              <span className="sid">{s.id}</span>
+              {/* Show a visually compact head…tail of the canonical
+                  session id; the full id is in `title` and is what gets
+                  routed to on click. */}
+              <span
+                className="sid"
+                title={s.id}
+              >
+                {s.id.length > 16 ? `${s.id.slice(0, 11)}…${s.id.slice(-8)}` : s.id}
+              </span>
               <span>
                 <span className="proj mono">{proj}</span>
                 <span

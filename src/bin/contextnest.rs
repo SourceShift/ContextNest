@@ -106,7 +106,7 @@ async fn inbox(
                 if s.session_uuid.is_empty() {
                     return None;
                 }
-                let cn_id = format!("cc-{}", &s.session_uuid[..s.session_uuid.len().min(8)]);
+                let cn_id = format!("cc-{}", s.session_uuid);
                 if seen.insert(cn_id.clone()) {
                     Some(cn_id)
                 } else {
@@ -507,9 +507,7 @@ async fn ingest_claude_code(
         let mb = s.size_bytes as f64 / 1_048_576.0;
         println!(
             "  • {}  ({:.2} MB)  project: {}",
-            &s.session_uuid[..s.session_uuid.len().min(8)],
-            mb,
-            s.project_cwd
+            s.session_uuid, mb, s.project_cwd
         );
     }
     println!();
@@ -551,11 +549,7 @@ async fn process_sessions<S: Sink + ?Sized>(
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "  ✗ session {}: {}",
-                    &s.session_uuid[..s.session_uuid.len().min(8)],
-                    e
-                );
+                eprintln!("  ✗ session {}: {}", s.session_uuid, e);
                 combined.failed += 1;
             }
         }
@@ -926,6 +920,22 @@ async fn bootstrap_wal(
             records = total,
             mode = ?mode,
             "WAL replay: starting",
+        );
+    }
+
+    // One-shot migration: old WAL records carry session_id = `cc-<first-8>`,
+    // new code emits `cc-<full-uuid>`. Rewrite in-place using each
+    // record's metadata.src_session as the source of truth, then
+    // atomically replace the on-disk WAL so the next restart is a no-op.
+    // Idempotent — long-form records pass through untouched.
+    let (records, mig_report) =
+        contextnest::services::wal::migrate_short_session_ids(path, records)?;
+    if mig_report.migrated > 0 || mig_report.skipped_no_src_session > 0 {
+        tracing::info!(
+            migrated = mig_report.migrated,
+            skipped = mig_report.skipped_no_src_session,
+            wal_path = %path.display(),
+            "session_id migration: WAL rewritten to canonical cc-<full-uuid>",
         );
     }
 

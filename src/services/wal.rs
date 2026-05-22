@@ -148,6 +148,119 @@ impl Wal {
     }
 }
 
+/// Result of [`migrate_short_session_ids`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MigrationReport {
+    /// Records whose `session_id` was rewritten from the old
+    /// `cc-<first-8>` form to the canonical `cc-<full-uuid>` form.
+    pub migrated: usize,
+    /// Short-form records that lacked a `metadata.src_session` oracle
+    /// and were therefore left unchanged.
+    pub skipped_no_src_session: usize,
+}
+
+/// One-shot migration from the legacy `cc-<first-8-of-uuid>` short-form
+/// session id to the canonical `cc-<full-uuid>` long form.
+///
+/// Detection: a record is migrated iff its `session_id` is shorter than
+/// `cc-` + 36 chars AND starts with `cc-` AND carries a non-empty
+/// `metadata.src_session`. Long-form records pass through untouched;
+/// records without an `src_session` oracle (manual API stores, test
+/// fixtures) are kept as-is.
+///
+/// If any records changed, the on-disk WAL at `path` is rewritten:
+/// write `wal.new` (fsync), rename current `wal` → `wal.bak`, rename
+/// `wal.new` → `wal`. The `.bak` is left in place as a recovery
+/// breadcrumb. If `path` does not exist (cold start) the call is a
+/// no-op that returns the input records unchanged.
+///
+/// Idempotency: rerunning the function after a successful migration
+/// finds nothing to do and skips the rewrite — safe to call on every
+/// boot.
+pub fn migrate_short_session_ids(
+    path: &Path,
+    records: Vec<WalRecord>,
+) -> std::io::Result<(Vec<WalRecord>, MigrationReport)> {
+    const LONG_FORM_MIN_LEN: usize = "cc-".len() + 36;
+
+    let mut report = MigrationReport::default();
+    let mut out: Vec<WalRecord> = Vec::with_capacity(records.len());
+
+    for rec in records {
+        match rec {
+            WalRecord::Store {
+                fragment_id,
+                session_id,
+                content,
+                importance,
+                metadata,
+            } => {
+                if session_id.len() >= LONG_FORM_MIN_LEN || !session_id.starts_with("cc-") {
+                    out.push(WalRecord::Store {
+                        fragment_id,
+                        session_id,
+                        content,
+                        importance,
+                        metadata,
+                    });
+                    continue;
+                }
+                let full_uuid = metadata
+                    .get("src_session")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let new_session_id = match full_uuid {
+                    Some(uuid) if !uuid.is_empty() => {
+                        report.migrated += 1;
+                        format!("cc-{uuid}")
+                    }
+                    _ => {
+                        report.skipped_no_src_session += 1;
+                        session_id
+                    }
+                };
+                out.push(WalRecord::Store {
+                    fragment_id,
+                    session_id: new_session_id,
+                    content,
+                    importance,
+                    metadata,
+                });
+            }
+        }
+    }
+
+    if report.migrated == 0 || !path.exists() {
+        return Ok((out, report));
+    }
+
+    let new_path = path.with_extension("new");
+    let bak_path = path.with_extension("bak");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&new_path)?;
+        let mut buf = BufWriter::new(&mut f);
+        for r in &out {
+            let line = serde_json::to_string(r).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+            writeln!(buf, "{line}")?;
+        }
+        buf.flush()?;
+        drop(buf);
+        f.sync_all()?;
+    }
+    // Two-rename swap. A crash between these leaves `.bak` and `.new`
+    // for manual recovery: `mv wal.new wal` (or restore `.bak` and
+    // re-run; migration is idempotent).
+    std::fs::rename(path, &bak_path)?;
+    std::fs::rename(&new_path, path)?;
+    Ok((out, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

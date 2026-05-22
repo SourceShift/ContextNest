@@ -26,7 +26,10 @@ use tokio::time::sleep;
 
 const FIXTURE_PATH: &str = "tests/fixtures/cc_session_sample.jsonl";
 const FIXTURE_SESSION_UUID: &str = "abc12345-fixture-session";
-const FIXTURE_SUBSTRATE_SESSION: &str = "cc-abc12345";
+// Substrate now uses `cc-<full-uuid>` as the canonical session_id
+// (no first-8 truncation), so the expected value is `cc-` + the full
+// fixture UUID byte-for-byte.
+const FIXTURE_SUBSTRATE_SESSION: &str = "cc-abc12345-fixture-session";
 
 async fn make_server() -> TestServer {
     let services = ContextNestServices::new_default()
@@ -314,7 +317,8 @@ async fn subagent_stop_triggers_ingest_and_lands_fragments() {
 
     // The fixture's z-insight blocks include user_action entries.
     // Look for them under the subagent's substrate session id.
-    let sub_substrate_session = format!("cc-{}", &sub_session_uuid[..8]);
+    // Canonical session_id is `cc-<full-uuid>` — no first-8 truncation.
+    let sub_substrate_session = format!("cc-{sub_session_uuid}");
     let hits = poll_retrieve(
         &server,
         &sub_substrate_session,
