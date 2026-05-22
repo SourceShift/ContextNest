@@ -457,6 +457,16 @@ impl MemoryAttractorManager {
 
     /// Find memory attractor basins for a given memory content
 
+    /// Snapshot every basin currently in the basin manager. Forwards to
+    /// [`crate::memory::attractors::attractor_basin::AttractorBasinManager::list_snapshots`].
+    /// Used by `/api/v1/field/basins` (Phase 3 of the neural-field
+    /// epic). Returns empty when no consolidation has run yet.
+    pub async fn list_basin_snapshots(
+        &self,
+    ) -> Vec<crate::memory::attractors::attractor_basin::BasinSnapshot> {
+        self.basin_manager.list_snapshots().await
+    }
+
     pub async fn find_attractor_basins(&self, content: &[f32]) -> ContextNestResult<Vec<String>> {
         let nearest = self.basin_manager.find_nearest_basin(content).await?;
 
@@ -735,14 +745,25 @@ impl MemoryAttractorManager {
     ) -> ContextNestResult<String> {
         use crate::memory::attractors::attractor_basin::BasinType;
 
-        self.basin_manager
+        let basin_id = self
+            .basin_manager
             .create_basin(
                 fragment.content.clone(),
                 fragment.importance,
                 fragment.confidence,
                 BasinType::Secondary,
             )
-            .await
+            .await?;
+        // Record the fragment as a member of the basin it seeded.
+        // Without this the basin's `associated_fragments` stays empty
+        // forever, which breaks every read that wants to know basin
+        // membership (Phase 3 of the neural-field epic surfaces real
+        // basin mass at `/api/v1/field/basins` and saw zero everywhere
+        // before this line existed).
+        self.basin_manager
+            .add_fragment_to_basin(&basin_id, fragment.id.clone())
+            .await?;
+        Ok(basin_id)
     }
 
     async fn create_memory_connection(
