@@ -668,6 +668,16 @@ pub async fn retrieve(
     // disables); see `basin_aware_expand` for the full design.
     basin_aware_expand(&services, &mut scored, &candidate_ids, &multi_session).await;
 
+    // Phase 5 of the neural-field epic: ConnectionNetwork expansion.
+    // Pull the top hit's 1-hop learned-graph neighbors (populated by
+    // the consolidation worker's `add_node` calls, which run
+    // similarity-driven auto-connection) and surface them with
+    // similarity scaled by the edge weight. Complements Phase 4's
+    // basin expansion: basins cluster by embedding proximity, the
+    // connection network records "fragments that co-occurred" — the
+    // two signals overlap but aren't identical.
+    connection_aware_expand(&services, &mut scored, &candidate_ids, &multi_session).await;
+
     // Re-sort because expansion may have inserted higher-scoring
     // basin siblings than the post-truncate tail of the original set.
     scored.sort_by(|a, b| {
@@ -836,6 +846,111 @@ async fn basin_aware_expand(
                 content,
                 importance: 0.5,
                 similarity: boosted,
+                metadata: meta,
+                session_id: owner,
+            });
+        }
+    }
+    scored.extend(additions);
+}
+
+/// ConnectionNetwork-aware retrieval expansion — Phase 5 of the
+/// neural-field epic (`docs/roadmap/epics/neural-field-real.md`).
+///
+/// Parallel to [`basin_aware_expand`] but reads a different signal:
+/// the learned-graph 1-hop neighbors of the top hit, populated by the
+/// consolidation worker's `add_node` calls (which trigger similarity-
+/// driven auto-connection inside `ConnectionNetwork`). Where Phase 4
+/// expands by basin membership (embedding-space clustering), Phase 5
+/// expands by edge weight in the explicit graph — the two signals
+/// usually overlap but the graph captures cross-cluster bridges that
+/// basin membership alone misses.
+///
+/// Each surfaced neighbor scores at `top_sim × edge_weight × boost`.
+/// The `boost` knob is independent of Phase 4's so operators can
+/// tune the two expansion sources separately.
+///
+/// Knobs:
+/// - `CONTEXTNEST_RETRIEVE_CONNECTION_BOOST` (default 0.5) — outer
+///   multiplier. Range (0.0, 1.0]. `0.0` disables.
+/// - `CONTEXTNEST_RETRIEVE_CONNECTION_MAX_EXPANSION` (default 10) —
+///   cap on appended neighbors per query.
+/// - `CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT` (default 0.1) —
+///   floor on edge weight; weaker edges are skipped to avoid noise
+///   from auto-created low-confidence connections.
+///
+/// Same prefilter discipline as Phase 4: only ids in `candidate_ids`
+/// (active + metadata_filter-passing) are eligible.
+async fn connection_aware_expand(
+    services: &ContextNestServices,
+    scored: &mut Vec<RetrieveHit>,
+    candidate_ids: &[String],
+    multi_session: &Option<HashMap<String, String>>,
+) {
+    let boost: f32 = std::env::var("CONTEXTNEST_RETRIEVE_CONNECTION_BOOST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.5);
+    if boost <= 0.0 {
+        return;
+    }
+    let max_expansion: usize = std::env::var("CONTEXTNEST_RETRIEVE_CONNECTION_MAX_EXPANSION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(10);
+    let min_weight: f32 = std::env::var("CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.1);
+
+    let Some(top) = scored.first() else {
+        return;
+    };
+    let top_sim = top.similarity;
+    if top_sim <= 0.0 {
+        return;
+    }
+    let top_id = top.id.clone();
+
+    let neighbors = services.attractor_manager.list_neighbors(&top_id).await;
+    if neighbors.is_empty() {
+        return;
+    }
+
+    let candidate_set: HashSet<&String> = candidate_ids.iter().collect();
+    let existing: HashSet<String> = scored.iter().map(|h| h.id.clone()).collect();
+    let mut additions: Vec<RetrieveHit> = Vec::new();
+    {
+        let texts = services.fragment_texts.read().await;
+        let metadata = services.fragment_metadata.read().await;
+        for (neighbor_id, weight) in &neighbors {
+            if additions.len() >= max_expansion {
+                break;
+            }
+            if *weight < min_weight {
+                // Neighbors are sorted by weight desc, so anything
+                // below threshold means the rest is below too.
+                break;
+            }
+            if existing.contains(neighbor_id) {
+                continue;
+            }
+            if !candidate_set.contains(neighbor_id) {
+                continue;
+            }
+            let content = texts.get(neighbor_id).cloned().unwrap_or_default();
+            let meta = metadata.get(neighbor_id).cloned().unwrap_or_default();
+            let owner = multi_session
+                .as_ref()
+                .and_then(|m| m.get(neighbor_id).cloned());
+            additions.push(RetrieveHit {
+                id: neighbor_id.clone(),
+                content,
+                importance: 0.5,
+                similarity: top_sim * weight * boost,
                 metadata: meta,
                 session_id: owner,
             });

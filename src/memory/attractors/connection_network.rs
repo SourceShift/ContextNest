@@ -528,6 +528,34 @@ impl ConnectionNetwork {
         Ok(edge_id)
     }
 
+    /// 1-hop neighbors of `node_id` with their edge weights, sorted
+    /// strongest first. Used by Phase 5 of the neural-field epic
+    /// (`docs/roadmap/epics/neural-field-real.md`) to surface
+    /// learned-graph siblings of a query's top hit at retrieve time,
+    /// independent of the heavier `retrieve_memories` cache path.
+    ///
+    /// Walks the edge map (cheap O(E) scan; for the 25k-fragment
+    /// substrate that's ~10k–50k edges) and emits both directions of
+    /// any bidirectional edge so callers get a symmetric neighbor list.
+    /// Returns an empty Vec when the node has no edges yet (cold
+    /// substrate, or no peer fragments survived similarity-driven
+    /// auto-connection thresholds).
+    pub async fn neighbors_of(&self, node_id: &str) -> Vec<(String, f32)> {
+        let graph = self.graph.read().unwrap();
+        let mut out: Vec<(String, f32)> = Vec::new();
+        for edges in graph.edges.values() {
+            for edge in edges {
+                if edge.source == node_id {
+                    out.push((edge.target.clone(), edge.weight));
+                } else if edge.target == node_id && edge.bidirectional {
+                    out.push((edge.source.clone(), edge.weight));
+                }
+            }
+        }
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
     /// Retrieve memories based on query
 
     pub async fn retrieve_memories(

@@ -467,6 +467,15 @@ impl MemoryAttractorManager {
         self.basin_manager.list_snapshots().await
     }
 
+    /// Return the 1-hop neighbors of a node in the canonical
+    /// connection network, sorted by edge weight desc. Forwards to
+    /// [`crate::memory::attractors::connection_network::ConnectionNetwork::neighbors_of`].
+    /// Used by Phase 5 of the neural-field epic to expand retrieve
+    /// results with learned-graph siblings of the top hit.
+    pub async fn list_neighbors(&self, node_id: &str) -> Vec<(String, f32)> {
+        self.connection_network.neighbors_of(node_id).await
+    }
+
     pub async fn find_attractor_basins(&self, content: &[f32]) -> ContextNestResult<Vec<String>> {
         let nearest = self.basin_manager.find_nearest_basin(content).await?;
 
