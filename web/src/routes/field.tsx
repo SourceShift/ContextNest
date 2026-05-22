@@ -765,6 +765,7 @@ function FieldPage() {
         </div>
       ) : (
         <div className="field-layout">
+          <div className="field-canvas-column">
           <div className="field-canvas-wrap">
             <svg
               ref={svgRef}
@@ -1110,6 +1111,8 @@ function FieldPage() {
                   <span>90d</span>
                 </div>
               </div>
+            </div>
+
             </div>
 
             <TimelineScrubber

@@ -1546,6 +1546,13 @@ body {
     min-height: 420px;
   }
 }
+.field-canvas-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
 .field-canvas-wrap {
   background: var(--surface-0);
   border: 1px solid var(--border);
@@ -1553,6 +1560,8 @@ body {
   position: relative;
   overflow: hidden;
   min-width: 0;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .field-svg {
   display: block;
@@ -1845,17 +1854,19 @@ body {
 }
 
 .field-scrubber {
-  position: absolute;
-  left: 14px;
-  right: 14px;
-  bottom: 6px;
+  /* Sits in normal flow below the canvas inside .field-canvas-column.
+     Was previously `position: absolute` with `left/right: 14px` which,
+     in some layouts where the canvas-wrap stretched, made the
+     scrubber overlap the legend overlay (.field-overlay-bl) and the
+     age slider (.field-overlay-br). Putting it in flow gives both
+     overlays their corners back. */
   background: rgba(10, 10, 10, 0.82);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 14px 4px;
-  z-index: 4;
+  flex: 0 0 auto;
 }
 .field-scrubber .scrubber-label {
   display: flex;
