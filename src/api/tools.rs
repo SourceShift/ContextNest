@@ -658,6 +658,28 @@ pub async fn retrieve(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
+
+    // Phase 4 of the neural-field epic: basin-aware expansion. Look up
+    // the top hit's basin and surface its other members at a boosted
+    // similarity. Gives "you've worked on this topic before"
+    // expansion that pure cosine misses — past fragments that don't
+    // word-match the query but are semantically siblings of the top
+    // hit. Configurable via `CONTEXTNEST_RETRIEVE_BASIN_BOOST` (0.0
+    // disables); see `basin_aware_expand` for the full design.
+    basin_aware_expand(&services, &mut scored, &candidate_ids, &multi_session).await;
+
+    // Re-sort because expansion may have inserted higher-scoring
+    // basin siblings than the post-truncate tail of the original set.
+    scored.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.importance
+                    .partial_cmp(&a.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
     scored.truncate(req.top_k);
 
     // Phase 2 of the neural-field epic: bump `last_accessed` on every
@@ -712,6 +734,114 @@ pub async fn retrieve(
     }
 
     (StatusCode::OK, Json(RetrieveResponse { hits: scored }))
+}
+
+/// Basin-aware retrieval expansion — Phase 4 of the neural-field epic
+/// (`docs/roadmap/epics/neural-field-real.md`).
+///
+/// After the initial cosine sort, looks up the top hit's basin (from
+/// the basin manager populated by Phase 1's consolidation worker) and
+/// appends basin siblings as additional hits with their similarity
+/// scaled down by a configurable factor. The point: surface fragments
+/// that are semantically clustered with the top hit even when they
+/// don't lexically match the query.
+///
+/// Knobs (all env, all optional):
+/// - `CONTEXTNEST_RETRIEVE_BASIN_BOOST` (default 0.7) — multiplier on
+///   the top hit's similarity. Range (0.0, 1.0]. Setting to 0.0
+///   disables the expansion entirely.
+/// - `CONTEXTNEST_RETRIEVE_BASIN_MAX_EXPANSION` (default 20) — cap on
+///   how many basin siblings are appended. Bounds the worst-case
+///   cost when a single basin holds hundreds of fragments.
+///
+/// No-op cases (all return early):
+/// - boost = 0 → expansion disabled
+/// - `scored` empty → nothing to anchor on
+/// - top hit has similarity 0 (sidecar-only or no embedding) →
+///   expansion would score everything at 0, no point
+/// - top hit isn't in any basin yet (consolidation hasn't caught up) →
+///   nothing to expand from
+/// - basin has only the top hit as member → no siblings to surface
+///
+/// Restricts expansion to ids already in `candidate_ids`, i.e. the
+/// active+filter-passing set for the current query. This keeps
+/// metadata_filter semantics intact (a basin sibling tagged
+/// kind="learning" won't suddenly appear in a kind="decision" query)
+/// and preserves single-session affinity (siblings from other
+/// sessions don't leak into a single-session retrieve).
+async fn basin_aware_expand(
+    services: &ContextNestServices,
+    scored: &mut Vec<RetrieveHit>,
+    candidate_ids: &[String],
+    multi_session: &Option<HashMap<String, String>>,
+) {
+    let boost: f32 = std::env::var("CONTEXTNEST_RETRIEVE_BASIN_BOOST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.7);
+    if boost <= 0.0 {
+        return;
+    }
+    let max_expansion: usize = std::env::var("CONTEXTNEST_RETRIEVE_BASIN_MAX_EXPANSION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(20);
+
+    let Some(top) = scored.first() else {
+        return;
+    };
+    let top_sim = top.similarity;
+    if top_sim <= 0.0 {
+        return;
+    }
+    let top_id = top.id.clone();
+
+    let snapshots = services.attractor_manager.list_basin_snapshots().await;
+    let Some(basin) = snapshots
+        .into_iter()
+        .find(|s| s.fragment_ids.contains(&top_id))
+    else {
+        return;
+    };
+
+    let candidate_set: HashSet<&String> = candidate_ids.iter().collect();
+    let existing: HashSet<String> = scored.iter().map(|h| h.id.clone()).collect();
+    let boosted = top_sim * boost;
+
+    let mut additions: Vec<RetrieveHit> = Vec::new();
+    {
+        // Single lock acquisition for the whole expansion. Drops at
+        // block end so the rest of retrieve() can reacquire freely.
+        let texts = services.fragment_texts.read().await;
+        let metadata = services.fragment_metadata.read().await;
+        for sib_id in &basin.fragment_ids {
+            if additions.len() >= max_expansion {
+                break;
+            }
+            if existing.contains(sib_id) {
+                continue;
+            }
+            if !candidate_set.contains(sib_id) {
+                // Sibling from another session, soft-deleted, or
+                // doesn't match the metadata_filter — skip.
+                continue;
+            }
+            let content = texts.get(sib_id).cloned().unwrap_or_default();
+            let meta = metadata.get(sib_id).cloned().unwrap_or_default();
+            let owner = multi_session.as_ref().and_then(|m| m.get(sib_id).cloned());
+            additions.push(RetrieveHit {
+                id: sib_id.clone(),
+                content,
+                importance: 0.5,
+                similarity: boosted,
+                metadata: meta,
+                session_id: owner,
+            });
+        }
+    }
+    scored.extend(additions);
 }
 
 /// Age-based decay multiplier applied to cosine similarity at retrieve
