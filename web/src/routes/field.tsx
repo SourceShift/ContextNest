@@ -123,6 +123,20 @@ function FieldPage() {
     });
   }, [sessionsHook.data, focusedProject]);
 
+  // Query-overlay state. Declared HERE (before the debounce useEffect
+  // and the dependent hooks below) because `const` bindings are subject
+  // to TDZ — referencing `queryText` / `queryDebounced` from a hook's
+  // dep array fires synchronously during render, so the bindings must
+  // already exist by then. Moving the inputRef alongside keeps related
+  // state co-located.
+  // UX shape: the user types something (typically the prompt they're
+  // about to send to Claude Code) and /field becomes a context picker,
+  // highlighting fragments most relevant to the query and dimming the
+  // rest hard.
+  const [queryText, setQueryText] = useState('');
+  const [queryDebounced, setQueryDebounced] = useState('');
+  const queryInputRef = useRef<HTMLInputElement>(null);
+
   // Debounce the typed query so we don't fire /retrieve on every
   // keystroke. 350ms is faster than search.tsx's 250ms because the
   // user typically pastes here rather than types — but a bit longer
@@ -202,13 +216,9 @@ function FieldPage() {
     null,
   );
   const [disabledKinds, setDisabledKinds] = useState<Set<string>>(new Set());
-  // Query-overlay mode (Phase 4 → field UX). The user types something
-  // — typically the prompt they're about to send to Claude Code — and
-  // /field becomes a context picker, highlighting fragments most
-  // relevant to the query and dimming the rest hard.
-  const [queryText, setQueryText] = useState('');
-  const [queryDebounced, setQueryDebounced] = useState('');
-  const queryInputRef = useRef<HTMLInputElement>(null);
+  // `queryText` / `queryDebounced` / `queryInputRef` are declared near
+  // the top of the component (before the debounce useEffect) — see
+  // the TDZ note there.
   const [view, setView] = useState<ViewState>(IDENTITY_VIEW);
   const dragRef = useRef<{
     startView: ViewState;
