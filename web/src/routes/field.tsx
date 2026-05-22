@@ -1051,39 +1051,39 @@ function FieldPage() {
                   {Math.round(view.scale * 100)}%
                 </div>
               </div>
-            </div>
 
-            <div className="field-overlay-bl">
-              <div className="legend">
-                <div className="legend-row">
-                  <span className="legend-label">filter by kind</span>
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                    {field.data.kinds.map((k) => (
-                      <button
-                        key={k}
-                        className="kind-swatch"
-                        onClick={() =>
-                          setDisabledKinds((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(k)) next.delete(k);
-                            else next.add(k);
-                            return next;
-                          })
-                        }
-                        title={`${k}${disabledKinds.has(k) ? ' (hidden)' : ''}`}
-                        style={{
-                          background: KIND_COLOR[k] ?? KIND_COLOR.unknown,
-                          opacity: disabledKinds.has(k) ? 0.2 : 1,
-                        }}
-                      />
-                    ))}
+              <div className="field-legend-panel">
+                <div className="legend">
+                  <div className="legend-row">
+                    <span className="legend-label">filter by kind</span>
+                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      {field.data.kinds.map((k) => (
+                        <button
+                          key={k}
+                          className="kind-swatch"
+                          onClick={() =>
+                            setDisabledKinds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(k)) next.delete(k);
+                              else next.add(k);
+                              return next;
+                            })
+                          }
+                          title={`${k}${disabledKinds.has(k) ? ' (hidden)' : ''}`}
+                          style={{
+                            background: KIND_COLOR[k] ?? KIND_COLOR.unknown,
+                            opacity: disabledKinds.has(k) ? 0.2 : 1,
+                          }}
+                        />
+                      ))}
+                    </div>
                   </div>
-                </div>
-                <div className="legend-row">
-                  <span className="legend-label">axes</span>
-                  <span className="legend-decay">
-                    semantic similarity (PC1 ↔, PC2 ↕)
-                  </span>
+                  <div className="legend-row">
+                    <span className="legend-label">axes</span>
+                    <span className="legend-decay">
+                      semantic similarity (PC1 ↔, PC2 ↕)
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
