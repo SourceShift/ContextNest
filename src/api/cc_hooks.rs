@@ -571,13 +571,8 @@ mod tests {
         // `record`. If a later `set` (e.g. truncation reset) wiped the
         // path, the sweeper would lose the session.
         let t = SessionTracker::new();
-        t.record(
-            "sid-a",
-            100,
-            Some(PathBuf::from("/tmp/sid-a.jsonl")),
-            None,
-        )
-        .await;
+        t.record("sid-a", 100, Some(PathBuf::from("/tmp/sid-a.jsonl")), None)
+            .await;
         t.set("sid-a", 0).await; // simulate truncation reset
         let sweepable = t.sweepable().await;
         assert_eq!(sweepable.len(), 1, "path must survive a bare set()");
@@ -593,13 +588,8 @@ mod tests {
         // `sweepable` rather than crash a sweep tick.
         let t = SessionTracker::new();
         t.set("session-start-only", 0).await;
-        t.record(
-            "fully-known",
-            10,
-            Some(PathBuf::from("/tmp/x.jsonl")),
-            None,
-        )
-        .await;
+        t.record("fully-known", 10, Some(PathBuf::from("/tmp/x.jsonl")), None)
+            .await;
         let sweepable = t.sweepable().await;
         assert_eq!(sweepable.len(), 1);
         assert_eq!(sweepable[0].0, "fully-known");
