@@ -137,6 +137,14 @@ pub struct RetrieveHit {
 #[derive(Debug, Serialize)]
 pub struct RetrieveResponse {
     pub hits: Vec<RetrieveHit>,
+    /// Phase 6 of the neural-field epic. Populated only when the
+    /// query looks like a chain question ("context of X", "history
+    /// of X", "what led to X", etc.) AND
+    /// `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT` is not disabled. Omitted
+    /// from the wire when absent so legacy clients see exactly the
+    /// `hits` array they always have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction: Option<ReconstructResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,7 +517,10 @@ pub async fn retrieve(
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(RetrieveResponse { hits: Vec::new() }),
+                Json(RetrieveResponse {
+                    hits: Vec::new(),
+                    reconstruction: None,
+                }),
             );
         }
     };
@@ -524,7 +535,13 @@ pub async fn retrieve(
         services.session_index.list_active(&session_id).await
     };
     if active_ids.is_empty() {
-        return (StatusCode::OK, Json(RetrieveResponse { hits: Vec::new() }));
+        return (
+            StatusCode::OK,
+            Json(RetrieveResponse {
+                hits: Vec::new(),
+                reconstruction: None,
+            }),
+        );
     }
 
     // Prefilter: if the caller passed a `metadata_filter`, narrow the candidate
@@ -551,7 +568,13 @@ pub async fn retrieve(
     };
 
     if candidate_ids.is_empty() {
-        return (StatusCode::OK, Json(RetrieveResponse { hits: Vec::new() }));
+        return (
+            StatusCode::OK,
+            Json(RetrieveResponse {
+                hits: Vec::new(),
+                reconstruction: None,
+            }),
+        );
     }
 
     // Phase 1: hydrate canonical fragments + score. Hold *no* `fragment_texts`
@@ -743,7 +766,37 @@ pub async fn retrieve(
         }
     }
 
-    (StatusCode::OK, Json(RetrieveResponse { hits: scored }))
+    // Phase 6 of the neural-field epic: auto-reconstruction. When the
+    // query looks like a chain question ("context of X", "history of
+    // X", etc.) ALSO compute a reconstruction over the same session
+    // and embed the result alongside the hits. Single-session only —
+    // multi-session reconstruction would need different semantics
+    // (cross-session chains aren't well-defined for the current
+    // ReconstructionProtocol).
+    let reconstruction =
+        if multi_session.is_none() && auto_reconstruct_enabled() && is_chain_query(&req.query) {
+            let session_for_reconstruct = req
+                .session_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+            compute_reconstruction(
+                &services,
+                &query_embedding,
+                &session_for_reconstruct,
+                auto_reconstruct_depth(),
+            )
+            .await
+        } else {
+            None
+        };
+
+    (
+        StatusCode::OK,
+        Json(RetrieveResponse {
+            hits: scored,
+            reconstruction,
+        }),
+    )
 }
 
 /// Basin-aware retrieval expansion — Phase 4 of the neural-field epic
@@ -957,6 +1010,141 @@ async fn connection_aware_expand(
         }
     }
     scored.extend(additions);
+}
+
+/// True when the user's query reads like a "give me the chain that
+/// led to X" question rather than a flat lookup. Phase 6 of the
+/// neural-field epic uses this to decide whether to attach a
+/// reconstruction to the retrieve response. Case-insensitive,
+/// matches a fixed phrase set chosen for low false-positive rate.
+fn is_chain_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "context of",
+        "context around",
+        "context for",
+        "what led to",
+        "how did i get to",
+        "how did we get to",
+        "history of",
+        "what happened around",
+        "chain of",
+        "trail of",
+        "trace of",
+        "story of",
+        "timeline of",
+        "how did i arrive at",
+        "how did we arrive at",
+    ];
+    PATTERNS.iter().any(|p| q.contains(p))
+}
+
+/// Whether the auto-reconstruction path runs at all. Default true;
+/// set `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT=false` (or `0`) to
+/// disable. Useful when the reconstruction proxy is producing noisy
+/// chains and ops want to pause it without redeploying.
+fn auto_reconstruct_enabled() -> bool {
+    std::env::var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT")
+        .ok()
+        .map(|s| s != "false" && s != "0")
+        .unwrap_or(true)
+}
+
+/// Depth (top-N most-similar fragments) used by the auto path.
+/// `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH`, default 5 —
+/// matches the manual `/api/v1/tools/reconstruct` default.
+fn auto_reconstruct_depth() -> usize {
+    std::env::var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(5)
+}
+
+/// Shared canonical-chain reconstruction body used by both the manual
+/// `/api/v1/tools/reconstruct` handler and the Phase 6 auto-invocation
+/// inside `/api/v1/tools/retrieve`. Returns `None` when the session
+/// has no active fragments (so the auto-path doesn't emit an empty
+/// reconstruction object alongside genuine hits).
+///
+/// The canonical chain proxy (full chain in
+/// `00_COURSE/05_memory_systems/04_reconstructive_memory.md`):
+/// ResonanceActivator → SemanticContinuityRestoration → coherence
+/// computation. Gap-filling is deferred until the 5 reconstruction
+/// modules unify their Fragment types.
+async fn compute_reconstruction(
+    services: &ContextNestServices,
+    query_embedding: &[f32],
+    session_id: &str,
+    depth: usize,
+) -> Option<ReconstructResponse> {
+    let active_ids = services.session_index.list_active(session_id).await;
+    if active_ids.is_empty() {
+        return None;
+    }
+
+    let mut hydrated: Vec<(f32, MemoryFragment)> = Vec::with_capacity(active_ids.len());
+    for id in active_ids {
+        let Ok(Some(fragment)) = services.attractor_manager.get_fragment(&id).await else {
+            continue;
+        };
+        let similarity = services
+            .embedding
+            .calculate_similarity(query_embedding, &fragment.content);
+        hydrated.push((similarity, fragment));
+    }
+    if hydrated.is_empty() {
+        return None;
+    }
+
+    // ResonanceActivator equivalent: rank by similarity, keep top-depth.
+    hydrated.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hydrated.truncate(depth);
+
+    // SemanticContinuityRestoration proxy: re-order picked fragments
+    // by importance descending so the stitch reads "biggest signal
+    // first."
+    hydrated.sort_by(|a, b| {
+        b.1.importance
+            .partial_cmp(&a.1.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let texts = services.fragment_texts.read().await;
+    let source_fragment_ids: Vec<String> = hydrated.iter().map(|(_, f)| f.id.clone()).collect();
+    let reconstructed_content = source_fragment_ids
+        .iter()
+        .filter_map(|id| texts.get(id).cloned())
+        .collect::<Vec<String>>()
+        .join("\n\n");
+    drop(texts);
+
+    let mut pair_count = 0usize;
+    let mut pair_sum = 0.0f32;
+    for i in 0..hydrated.len() {
+        for j in (i + 1)..hydrated.len() {
+            pair_sum += services
+                .embedding
+                .calculate_similarity(&hydrated[i].1.content, &hydrated[j].1.content);
+            pair_count += 1;
+        }
+    }
+    let coherence = if pair_count == 0 {
+        if hydrated.is_empty() {
+            0.0
+        } else {
+            1.0
+        }
+    } else {
+        pair_sum / pair_count as f32
+    };
+
+    Some(ReconstructResponse {
+        reconstructed_content,
+        source_fragment_ids,
+        coherence,
+        gaps_filled: 0,
+    })
 }
 
 /// Age-based decay multiplier applied to cosine similarity at retrieve
@@ -1413,90 +1601,19 @@ pub async fn reconstruct(
         }
     };
 
-    // Pull session-affine fragment IDs and hydrate their canonical forms.
-    // Materialize as (similarity, fragment) pairs so we can do the canonical
-    // chain steps in-process: ResonanceActivator (similarity scoring) →
-    // SemanticContinuityRestoration (importance-ordered stitch) → coherence.
-    let active_ids = services.session_index.list_active(&session_id).await;
-    if active_ids.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(ReconstructResponse {
-                reconstructed_content: String::new(),
-                source_fragment_ids: Vec::new(),
-                coherence: 0.0,
-                gaps_filled: 0,
-            }),
-        );
-    }
-
-    let mut hydrated: Vec<(f32, MemoryFragment)> = Vec::with_capacity(active_ids.len());
-    for id in active_ids {
-        let Ok(Some(fragment)) = services.attractor_manager.get_fragment(&id).await else {
-            continue;
-        };
-        let similarity = services
-            .embedding
-            .calculate_similarity(&query_embedding, &fragment.content);
-        hydrated.push((similarity, fragment));
-    }
-
-    // Step 1 — ResonanceActivator equivalent: rank by similarity, keep top-depth.
-    hydrated.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    hydrated.truncate(depth);
-
-    // Step 2 — SemanticContinuityRestoration proxy: re-order picked
-    // fragments by importance descending so the stitch reads "biggest
-    // signal first". A full canonical chain would also re-cluster via
-    // basin proximity here; deferred until Phase H+1.
-    hydrated.sort_by(|a, b| {
-        b.1.importance
-            .partial_cmp(&a.1.importance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let texts = services.fragment_texts.read().await;
-    let source_fragment_ids: Vec<String> = hydrated.iter().map(|(_, f)| f.id.clone()).collect();
-    let reconstructed_content = source_fragment_ids
-        .iter()
-        .filter_map(|id| texts.get(id).cloned())
-        .collect::<Vec<String>>()
-        .join("\n\n");
-    drop(texts);
-
-    // Step 3 — Coherence: mean pairwise cosine similarity of the picked set's
-    // embeddings. A tight set (high coherence) means the reconstruction
-    // holds together; a loose set means the gap-filling stage (deferred
-    // to Phase J / LLM integration) would have more to do.
-    let mut pair_count = 0usize;
-    let mut pair_sum = 0.0f32;
-    for i in 0..hydrated.len() {
-        for j in (i + 1)..hydrated.len() {
-            pair_sum += services
-                .embedding
-                .calculate_similarity(&hydrated[i].1.content, &hydrated[j].1.content);
-            pair_count += 1;
-        }
-    }
-    let coherence = if pair_count == 0 {
-        if hydrated.is_empty() {
-            0.0
-        } else {
-            1.0
-        }
-    } else {
-        pair_sum / pair_count as f32
-    };
-
-    (
-        StatusCode::OK,
-        Json(ReconstructResponse {
-            reconstructed_content,
-            source_fragment_ids,
-            coherence,
+    // Shared body — same canonical-chain proxy the Phase 6 auto path
+    // invokes from retrieve(). Returns None when the session is
+    // empty; we render that as an all-zero response for wire-compat
+    // with existing /api/v1/tools/reconstruct clients.
+    let resp = compute_reconstruction(&services, &query_embedding, &session_id, depth)
+        .await
+        .unwrap_or(ReconstructResponse {
+            reconstructed_content: String::new(),
+            source_fragment_ids: Vec::new(),
+            coherence: 0.0,
             gaps_filled: 0,
-        }),
-    )
+        });
+    (StatusCode::OK, Json(resp))
 }
 
 /// POST /api/v1/tools/resonate — emergent activation patterns in the field.
@@ -1594,4 +1711,79 @@ pub fn create_tools_router() -> Router<ContextNestServices> {
         .route("/api/v1/tools/discard", post(discard))
         .route("/api/v1/tools/reconstruct", post(reconstruct))
         .route("/api/v1/tools/resonate", post(resonate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_phrases_trigger_is_chain_query() {
+        for phrase in [
+            "context of the auth migration",
+            "Context Of The Auth Migration", // case-insensitive
+            "what led to switching languages",
+            "history of decisions",
+            "trail of evidence in this PR",
+            "how did I get to this design",
+            "how did we arrive at this conclusion",
+            "story of the release",
+            "timeline of incidents",
+        ] {
+            assert!(is_chain_query(phrase), "should match: {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn non_chain_phrases_do_not_match() {
+        for phrase in [
+            "fix the bug",
+            "implement login",
+            "what kind of fragment",
+            "show me decisions",
+            "any context", // "context" alone, not "context of"
+        ] {
+            assert!(!is_chain_query(phrase), "should NOT match: {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn auto_reconstruct_env_false_disables_path() {
+        // Serial within the same #[test] — set, check, restore.
+        // Concurrent test threads cannot enter this function because
+        // each #[test] runs to completion before another #[test]
+        // can mutate the same global. The integration tests in
+        // tests/retrieve_auto_reconstruct_test.rs avoid this env var
+        // entirely to keep their assertions deterministic.
+        let prev = std::env::var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT").ok();
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT", "false");
+        assert!(!auto_reconstruct_enabled());
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT", "0");
+        assert!(!auto_reconstruct_enabled());
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT", "true");
+        assert!(auto_reconstruct_enabled());
+        std::env::remove_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT");
+        assert!(auto_reconstruct_enabled(), "default should be enabled");
+        if let Some(v) = prev {
+            std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT", v);
+        }
+    }
+
+    #[test]
+    fn auto_reconstruct_depth_default_and_override() {
+        let prev = std::env::var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH").ok();
+        std::env::remove_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH");
+        assert_eq!(auto_reconstruct_depth(), 5);
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH", "12");
+        assert_eq!(auto_reconstruct_depth(), 12);
+        // Bad values fall back to default.
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH", "0");
+        assert_eq!(auto_reconstruct_depth(), 5);
+        std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH", "garbage");
+        assert_eq!(auto_reconstruct_depth(), 5);
+        std::env::remove_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH");
+        if let Some(v) = prev {
+            std::env::set_var("CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH", v);
+        }
+    }
 }
