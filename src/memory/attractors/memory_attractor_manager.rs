@@ -476,6 +476,16 @@ impl MemoryAttractorManager {
         self.connection_network.neighbors_of(node_id).await
     }
 
+    /// Snapshot of the connection network's graph metrics
+    /// (node count, edge count, average degree). Used by Phase 7's
+    /// substrate health endpoint to surface dormant-vs-active
+    /// connection-formation in a single read.
+    pub async fn connection_network_graph_metrics(
+        &self,
+    ) -> crate::memory::attractors::connection_network::GraphMetrics {
+        self.connection_network.get_graph_metrics()
+    }
+
     pub async fn find_attractor_basins(&self, content: &[f32]) -> ContextNestResult<Vec<String>> {
         let nearest = self.basin_manager.find_nearest_basin(content).await?;
 
