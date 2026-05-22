@@ -60,6 +60,22 @@ use crate::ingest::claude_code::{
 };
 use crate::services::ContextNestServices;
 
+/// What we remember about a session between hook fires: the byte offset
+/// we've already ingested up to, plus the last-known transcript path
+/// and project cwd.
+///
+/// Storing the path lets the [`spawn_sweeper`] background task re-tail
+/// a session even when no hook fires — defence in depth against
+/// dropped/lost hook calls (e.g. Claude killed mid-`curl`, substrate
+/// restarting through the curl-retry window, sessions abandoned after
+/// the last successful `tail_and_ingest`).
+#[derive(Clone, Debug, Default)]
+struct TrackedSession {
+    offset: u64,
+    transcript_path: Option<PathBuf>,
+    cwd: Option<String>,
+}
+
 /// Per-session byte offset tracker for incremental `.jsonl` tailing.
 ///
 /// Wrap with `Arc` and install via `.layer(Extension(Arc::new(...)))`.
@@ -67,7 +83,7 @@ use crate::services::ContextNestServices;
 /// microseconds only, never across a `.jsonl` read.
 #[derive(Default)]
 pub struct SessionTracker {
-    offsets: tokio::sync::RwLock<HashMap<String, u64>>,
+    inner: tokio::sync::RwLock<HashMap<String, TrackedSession>>,
 }
 
 impl SessionTracker {
@@ -76,28 +92,68 @@ impl SessionTracker {
     }
 
     pub async fn get(&self, session_id: &str) -> u64 {
-        self.offsets
+        self.inner
             .read()
             .await
             .get(session_id)
-            .copied()
+            .map(|t| t.offset)
             .unwrap_or(0)
     }
 
+    /// Set the byte offset for a session without touching the cached
+    /// transcript_path / cwd. Used by `session_start` (which doesn't
+    /// carry a transcript path) and by the truncation-recovery path.
     pub async fn set(&self, session_id: &str, offset: u64) {
-        self.offsets
-            .write()
+        let mut guard = self.inner.write().await;
+        let entry = guard.entry(session_id.to_string()).or_default();
+        entry.offset = offset;
+    }
+
+    /// Record offset + transcript path + cwd in one write. Called by
+    /// `tail_and_ingest` on every successful run so the sweeper has
+    /// everything it needs to re-tail without a hook.
+    pub async fn record(
+        &self,
+        session_id: &str,
+        offset: u64,
+        transcript_path: Option<PathBuf>,
+        cwd: Option<String>,
+    ) {
+        let mut guard = self.inner.write().await;
+        let entry = guard.entry(session_id.to_string()).or_default();
+        entry.offset = offset;
+        if transcript_path.is_some() {
+            entry.transcript_path = transcript_path;
+        }
+        if cwd.is_some() {
+            entry.cwd = cwd;
+        }
+    }
+
+    /// Snapshot every session that has a known transcript path.
+    /// Returned as `(session_id, transcript_path, cwd)` tuples so the
+    /// sweeper can drive `tail_and_ingest` over an unchanging copy and
+    /// release the lock immediately.
+    pub async fn sweepable(&self) -> Vec<(String, PathBuf, Option<String>)> {
+        self.inner
+            .read()
             .await
-            .insert(session_id.to_string(), offset);
+            .iter()
+            .filter_map(|(sid, t)| {
+                t.transcript_path
+                    .as_ref()
+                    .map(|p| (sid.clone(), p.clone(), t.cwd.clone()))
+            })
+            .collect()
     }
 
     /// Best-effort introspection for tests / debug.
     pub async fn len(&self) -> usize {
-        self.offsets.read().await.len()
+        self.inner.read().await.len()
     }
 
     pub async fn is_empty(&self) -> bool {
-        self.offsets.read().await.is_empty()
+        self.inner.read().await.is_empty()
     }
 }
 
@@ -302,7 +358,27 @@ async fn tail_and_ingest(
             .map_err(|e| format!("ServicesSink::store_batch: {e}"))?;
     }
 
-    tracker.set(&payload.session_id, total_len).await;
+    // Stash the transcript path + cwd alongside the new offset so the
+    // sweeper can re-tail this session even if the next hook never fires
+    // (Claude killed mid-curl, session abandoned, server restart, etc).
+    tracker
+        .record(
+            &payload.session_id,
+            total_len,
+            Some(transcript_path.clone()),
+            payload
+                .cwd
+                .clone()
+                .or_else(|| metadata.cwd.clone())
+                .or_else(|| {
+                    if project_cwd.is_empty() {
+                        None
+                    } else {
+                        Some(project_cwd.to_string())
+                    }
+                }),
+        )
+        .await;
     Ok(())
 }
 
@@ -348,7 +424,16 @@ async fn store_task_completion(
     )
     .with_meta("kind", json!("accomplishment"))
     .with_meta("source", json!("TaskCompleted"))
-    .with_meta("src_session", json!(session_uuid));
+    .with_meta("src_session", json!(session_uuid))
+    // Stamp a timestamp so this accomplishment sorts alongside z-insight
+    // accomplishments instead of falling to the bottom of any ts-ordered
+    // view. The hook payload doesn't carry an event time, so the
+    // server's clock is the best we have — accuracy is bounded by hook
+    // delivery latency, which is sub-second in practice.
+    .with_meta(
+        "ts",
+        json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+    );
     if let Some(cwd) = payload.cwd.as_deref() {
         record = record.with_meta("project_cwd", json!(cwd));
     }
@@ -360,6 +445,76 @@ async fn store_task_completion(
     sink.store(&record)
         .await
         .map_err(|e| format!("ServicesSink::store: {e}"))
+}
+
+/// Periodic background sweep: re-tail every tracked session's transcript.
+///
+/// This is the "pull" half of a deliberate push+pull delivery design.
+/// The hook protocol ([`dispatch`]) is the push path — fast, real-time,
+/// usually reliable. But it can drop a payload (Claude killed mid-curl
+/// before the retries complete, substrate down for longer than the curl
+/// retry window, session abandoned before a Stop fires). The sweeper
+/// recovers from any such drop on the next tick.
+///
+/// Cost is bounded by [`tail_and_ingest`]'s own short-circuit at
+/// `total_len == last_offset` — a session with no new transcript bytes
+/// since the last successful run pays one stat + one read of the file
+/// header and nothing else.
+///
+/// Spawn via [`spawn_sweeper`] at server bootstrap. Lives for the
+/// lifetime of the runtime.
+pub async fn sweep_once(services: &ContextNestServices, tracker: &SessionTracker) {
+    let snapshot = tracker.sweepable().await;
+    if snapshot.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        sessions = snapshot.len(),
+        "cc_hooks: sweeper running tail-and-ingest"
+    );
+    for (session_id, transcript_path, cwd) in snapshot {
+        let payload = HookPayload {
+            session_id,
+            cwd,
+            transcript_path: Some(transcript_path),
+            hook_event_name: Some("Sweep".to_string()),
+            extra: HashMap::new(),
+        };
+        if let Err(e) = tail_and_ingest(services, tracker, &payload).await {
+            // Sweeper errors are debug-level: they're already covered
+            // by the regular hook path; a transient sweep failure just
+            // means the next tick (or next real hook) will pick up.
+            tracing::debug!(
+                session_id = %payload.session_id,
+                error = %e,
+                "cc_hooks: sweeper tail_and_ingest skipped",
+            );
+        }
+    }
+}
+
+/// Spawn the periodic sweeper. Idempotent only in the sense that calling
+/// twice doubles the work — bootstrap should call this once.
+pub fn spawn_sweeper(
+    services: ContextNestServices,
+    tracker: Arc<SessionTracker>,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Skip missed ticks (don't burst-catch-up). The sweep is
+        // already a cheap no-op when nothing changed, but bursting
+        // after a long pause adds no value over the next normal tick.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick fires immediately; consume it so the first sweep
+        // happens `interval` after spawn, giving normal hook traffic
+        // a chance to be the source of truth on warm startups.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            sweep_once(&services, &tracker).await;
+        }
+    });
 }
 
 /// First string-valued entry from `extras` matching any of `keys`.
@@ -388,6 +543,66 @@ mod tests {
         assert_eq!(t.get("sid-a").await, 12345);
         assert_eq!(t.get("sid-b").await, 0);
         assert_eq!(t.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn tracker_record_keeps_path_and_cwd_for_sweeper() {
+        let t = SessionTracker::new();
+        t.record(
+            "sid-a",
+            42,
+            Some(PathBuf::from("/tmp/sid-a.jsonl")),
+            Some("/work/repo".to_string()),
+        )
+        .await;
+        assert_eq!(t.get("sid-a").await, 42);
+        let sweepable = t.sweepable().await;
+        assert_eq!(sweepable.len(), 1);
+        assert_eq!(sweepable[0].0, "sid-a");
+        assert_eq!(sweepable[0].1, PathBuf::from("/tmp/sid-a.jsonl"));
+        assert_eq!(sweepable[0].2.as_deref(), Some("/work/repo"));
+    }
+
+    #[tokio::test]
+    async fn tracker_set_does_not_clobber_path() {
+        // Regression guard: `session_start` uses `set` to register a
+        // session at offset 0 before any transcript path is known.
+        // A subsequent `tail_and_ingest` call records the path via
+        // `record`. If a later `set` (e.g. truncation reset) wiped the
+        // path, the sweeper would lose the session.
+        let t = SessionTracker::new();
+        t.record(
+            "sid-a",
+            100,
+            Some(PathBuf::from("/tmp/sid-a.jsonl")),
+            None,
+        )
+        .await;
+        t.set("sid-a", 0).await; // simulate truncation reset
+        let sweepable = t.sweepable().await;
+        assert_eq!(sweepable.len(), 1, "path must survive a bare set()");
+        assert_eq!(sweepable[0].1, PathBuf::from("/tmp/sid-a.jsonl"));
+        assert_eq!(t.get("sid-a").await, 0);
+    }
+
+    #[tokio::test]
+    async fn tracker_sweepable_skips_sessions_with_no_path() {
+        // session_start fires before any tail_and_ingest; that session
+        // is in the tracker but has no transcript path yet, so the
+        // sweeper cannot act on it. It MUST be excluded from
+        // `sweepable` rather than crash a sweep tick.
+        let t = SessionTracker::new();
+        t.set("session-start-only", 0).await;
+        t.record(
+            "fully-known",
+            10,
+            Some(PathBuf::from("/tmp/x.jsonl")),
+            None,
+        )
+        .await;
+        let sweepable = t.sweepable().await;
+        assert_eq!(sweepable.len(), 1);
+        assert_eq!(sweepable[0].0, "fully-known");
     }
 
     #[tokio::test]

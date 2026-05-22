@@ -180,7 +180,13 @@ pub async fn list_inbox(
 ///   session. Always inbox-worthy.
 /// - **`todo`** — extracted task / open item. Empirically these read as
 ///   "the user needs to do X" even without a tag (e.g. researcher
-///   autopilot emits "User picks: ship / iterate / suspend").
+///   autopilot emits "User picks: ship / iterate / suspend"). A `todo`
+///   carrying `task_status == "completed"` is dropped: the work is
+///   already done, so it has no place in an attention queue. (The
+///   ingest pipeline re-emits the same `(session_id, kind, content)`
+///   triple with the new `task_status`, and the view-layer dedupe at
+///   the bottom of `list_inbox` keeps the freshest copy — so once a
+///   task flips to completed, this filter retires its inbox row.)
 /// - **`decision`** — only when `awaiting_decision: true`, since
 ///   already-resolved decisions are historical, not actionable.
 ///
@@ -188,7 +194,17 @@ pub async fn list_inbox(
 /// historical / contextual and excluded.
 fn is_inbox_eligible(meta: &HashMap<String, serde_json::Value>) -> bool {
     match meta.get("kind").and_then(|v| v.as_str()) {
-        Some("user_action") | Some("todo") => true,
+        Some("user_action") => true,
+        Some("todo") => {
+            // Drop completed todos; everything else (pending,
+            // in_progress, failed, or missing task_status entirely)
+            // stays inbox-eligible. `failed` is deliberately kept —
+            // regressions are valuable attention signal.
+            !matches!(
+                meta.get("task_status").and_then(|v| v.as_str()),
+                Some("completed")
+            )
+        }
         Some("decision") => meta
             .get("awaiting_decision")
             .and_then(|v| v.as_bool())
@@ -222,6 +238,43 @@ mod tests {
         // researcher-style ingest emits `todo` for "user needs to do X"
         // records that would otherwise be tagged `user_action` explicitly.
         assert!(is_inbox_eligible(&meta(&[("kind", json!("todo"))])));
+    }
+
+    #[test]
+    fn todo_pending_is_eligible() {
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("todo")),
+            ("task_status", json!("pending")),
+        ])));
+    }
+
+    #[test]
+    fn todo_in_progress_is_eligible() {
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("todo")),
+            ("task_status", json!("in_progress")),
+        ])));
+    }
+
+    #[test]
+    fn todo_failed_is_eligible() {
+        // Regressions are useful attention signal — keep them visible.
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("todo")),
+            ("task_status", json!("failed")),
+        ])));
+    }
+
+    #[test]
+    fn todo_completed_is_ineligible() {
+        // Regression: a completed task should not occupy an inbox slot.
+        // This is the bug that caused "Add BE route POST
+        // /api/publisher-style-synthesis/:jobId" to keep showing 14
+        // minutes after the assistant marked task #22 done.
+        assert!(!is_inbox_eligible(&meta(&[
+            ("kind", json!("todo")),
+            ("task_status", json!("completed")),
+        ])));
     }
 
     #[test]
