@@ -87,7 +87,7 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json"] }
 
 # GraphQL
-async-graphql = { version = "6.0", features = ["apollo_tracing", "apollo_persisted_queries"] }
+async-graphql = { version = "7.2", features = ["apollo_tracing", "apollo_persisted_queries"] }
 async-graphql-axum = "6.0"
 
 # Command line args
