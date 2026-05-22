@@ -429,10 +429,7 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
             session_id: "cc-9b8a1f3e".into(),
             content: "old short-form record".into(),
             importance: 0.5,
-            metadata: HashMap::from([(
-                "src_session".to_string(),
-                json!(full_uuid),
-            )]),
+            metadata: HashMap::from([("src_session".to_string(), json!(full_uuid))]),
         })
         .unwrap();
     writer
@@ -441,10 +438,7 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
             session_id: format!("cc-{full_uuid}"),
             content: "already-canonical record".into(),
             importance: 0.5,
-            metadata: HashMap::from([(
-                "src_session".to_string(),
-                json!(full_uuid),
-            )]),
+            metadata: HashMap::from([("src_session".to_string(), json!(full_uuid))]),
         })
         .unwrap();
     writer
@@ -511,8 +505,7 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
     assert!(bak_session_ids.contains(&"cc-9b8a1f3e".to_string()));
 
     // Re-running the migration is a no-op (idempotent).
-    let (_, second) =
-        migrate_short_session_ids(&wal_path, Wal::read_records(&wal_path).unwrap())
-            .expect("idempotent rerun");
+    let (_, second) = migrate_short_session_ids(&wal_path, Wal::read_records(&wal_path).unwrap())
+        .expect("idempotent rerun");
     assert_eq!(second.migrated, 0, "second pass must migrate nothing");
 }

@@ -244,9 +244,8 @@ pub fn migrate_short_session_ids(
             .open(&new_path)?;
         let mut buf = BufWriter::new(&mut f);
         for r in &out {
-            let line = serde_json::to_string(r).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
+            let line = serde_json::to_string(r)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             writeln!(buf, "{line}")?;
         }
         buf.flush()?;
