@@ -115,23 +115,49 @@ re-summarise free-form text.
 
 ```jsonc
 {
-  "feature": "query-overlay mode for /field viz",      // required: short feature name
-  "files":   ["web/src/routes/field.tsx",             // optional: which files implement it
-              "web/src/styles.css"],
-  "refs":    ["PR #39", "src/api/tools.rs:retrieve"], // optional: outside-of-files pointers
-  "layer":   "frontend"                                // optional: frontend|backend|infra|docs|tests|other
+  "feature":     "query-overlay mode for /field viz",   // required: short feature name
+  "files":       ["web/src/routes/field.tsx",          // optional: which files implement it
+                  "web/src/styles.css"],
+  "refs":        ["PR #39", "src/api/tools.rs:retrieve"], // optional: outside-of-files pointers
+  "layer":       "frontend",                            // optional: frontend|backend|infra|docs|tests|other
+  "how_to_test": "open /field, paste 'auth bcrypt' into the query bar, verify dimming",  // optional: replayable recipe
+  "defs":        ["fn basin_aware_expand", "fn fragmentRadius"]                          // optional: symbol names
 }
 ```
 
 The ingester emits one `MemoryKind::Feature` record per entry, with
 `metadata.kind == "feature"`, `metadata.files`, `metadata.refs`,
-`metadata.layer`, and `metadata.src_session` set. The feature name
-itself goes into the fragment's text so semantic retrieve hits it.
+`metadata.layer`, `metadata.how_to_test`, `metadata.defs`, and
+`metadata.src_session` set. The feature name itself goes into the
+fragment's text so semantic retrieve hits it.
 
 **Why this isn't just a `top_jobs[]` bullet:** `top_jobs` is
 freeform "I did X" prose. `delivered_features` is structured, with
-file pointers + layer + refs, suitable for `/api/v1/sessions/by-feature?q=…`
-to answer "which session added feature X" deterministically.
+file pointers + layer + refs + test recipe + symbol defs, suitable for
+`/api/v1/sessions/by-feature?q=…` to answer "which session added
+feature X" deterministically AND
+`/api/v1/features?since=24h&layer=backend` to answer "what shipped
+today, and how do I test it?" without grepping commits.
+
+### `how_to_test` conventions
+
+Free-form. The agent picks the shape that fits the feature:
+- Shell command: `cargo test --test foo`
+- Curl one-liner: `curl http://localhost:28080/api/v1/features?since=24h | jq`
+- Manual recipe: `Open /field, paste 'auth' into query bar, verify dimming`
+
+A future migration may tag the field with a kind (`"shell"`,
+`"curl"`, `"manual"`); free-form is the simplest thing that lets
+the daily-test loop work today.
+
+### `defs[]` conventions
+
+Symbol names the agent says implement the feature. Pick the shortest
+unambiguous form:
+- Rust: `fn retrieve`, `struct BasinSnapshot`, `impl MemoryAttractorManager`
+- TypeScript: `function QueryResultsPanel`, `type RetrieveHit`
+- Used by future "what code defines feature X" queries; not yet
+  consumed by an endpoint but stored so it's there when needed.
 
 ## What the ingester does with this
 

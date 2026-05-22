@@ -426,6 +426,177 @@ pub async fn sessions_by_feature(
     Ok(Json(ByFeatureResponse { query: q.q, hits }))
 }
 
+// =============================================================================
+// `GET /api/v1/features?since=<duration>&layer=<layer>`
+//
+// Time-windowed catalogue of every Feature record (one per
+// `z-insight.delivered_features[]` entry) the substrate has seen.
+// The daily-driver query: "what shipped today, and how do I test it?"
+// =============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FeaturesQuery {
+    /// Duration suffix: `5m`, `2h`, `24h`, `7d`, `30d`. When omitted,
+    /// defaults to `24h` — the "what shipped today" answer most callers
+    /// want without parameters. Unparseable values fall through to the
+    /// default so a typo doesn't break a dashboard widget.
+    pub since: Option<String>,
+    /// Optional `layer` filter (`frontend`/`backend`/`infra`/`docs`/
+    /// `tests`/`other`). Matches the `layer` field the agent supplied
+    /// on `delivered_features[]`. Case-insensitive.
+    pub layer: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FeatureEntry {
+    pub session_id: String,
+    pub feature: String,
+    pub ts: Option<String>,
+    pub files: Vec<String>,
+    pub refs: Vec<Value>,
+    pub layer: Option<String>,
+    /// Free-form recipe the agent supplied — shell command, curl
+    /// snippet, "click X then look for Y", etc. Omitted when the
+    /// agent didn't include a `how_to_test` for this feature.
+    pub how_to_test: Option<String>,
+    /// Symbol names (e.g. `fn retrieve()`, `struct BasinSnapshot`).
+    /// Empty array when the agent didn't enumerate them.
+    pub defs: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FeaturesResponse {
+    pub since: String,
+    pub layer: Option<String>,
+    pub count: usize,
+    pub features: Vec<FeatureEntry>,
+}
+
+/// Parse a duration suffix (`5m`, `2h`, `24h`, `7d`, `30d`) into a
+/// chrono::Duration. Returns `None` on parse failure so the caller
+/// falls back to its default.
+fn parse_since(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: i64 = num.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    match unit {
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
+}
+
+pub async fn list_features(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<FeaturesQuery>,
+) -> Result<Json<FeaturesResponse>, StatusCode> {
+    let since_raw = q.since.as_deref().unwrap_or("24h");
+    let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::hours(24));
+    let cutoff = chrono::Utc::now() - dur;
+    let layer_low = q.layer.as_deref().map(str::to_lowercase);
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+    let mut entries: Vec<FeatureEntry> = Vec::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        if meta.get("kind").and_then(|v| v.as_str()) != Some("feature") {
+            continue;
+        }
+        let ts_str = meta.get("ts").and_then(|v| v.as_str());
+        if let Some(ts) = ts_str {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if parsed.with_timezone(&chrono::Utc) < cutoff {
+                    continue;
+                }
+            }
+            // Unparseable ts → don't exclude; better to over-report
+            // than silently drop something the dashboard expected.
+        }
+        let layer = meta
+            .get("layer")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(want) = &layer_low {
+            let got = layer.as_deref().unwrap_or("").to_lowercase();
+            if got != *want {
+                continue;
+            }
+        }
+        let session_id = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if session_id.is_empty() {
+            continue;
+        }
+        let files: Vec<String> = meta
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let refs: Vec<Value> = meta
+            .get("refs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let how_to_test = meta
+            .get("how_to_test")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let defs: Vec<String> = meta
+            .get("defs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let feature_text = texts.get(frag_id).cloned().unwrap_or_default();
+        entries.push(FeatureEntry {
+            session_id,
+            feature: feature_text,
+            ts: ts_str.map(|s| s.to_string()),
+            files,
+            refs,
+            layer,
+            how_to_test,
+            defs,
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Newest first; deterministic tiebreak on session_id then feature.
+    entries.sort_by(|a, b| {
+        b.ts.as_deref()
+            .unwrap_or("")
+            .cmp(a.ts.as_deref().unwrap_or(""))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.feature.cmp(&b.feature))
+    });
+
+    Ok(Json(FeaturesResponse {
+        since: since_raw.to_string(),
+        layer: q.layer,
+        count: entries.len(),
+        features: entries,
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
@@ -433,4 +604,5 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/by-file", get(sessions_by_file))
         .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
+        .route("/api/v1/features", get(list_features))
 }
