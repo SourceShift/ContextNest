@@ -50,7 +50,7 @@ async-recursion = "1.0"
 
 # Web framework
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "auth", "compression-br", "request-id"] }
 hyper = { version = "1.0", features = ["full"] }
 http = "1.0"
