@@ -311,9 +311,74 @@ pub struct BasinsResponse {
 pub async fn list_basins(
     State(services): State<ContextNestServices>,
 ) -> Result<Json<BasinsResponse>, StatusCode> {
-    // Always emit project-derived basins for now. When the
-    // MemoryAttractorManager exposes basin centroids via a public list
-    // accessor, this is the call site that would prefer them.
+    // Phase 3 of the neural-field epic
+    // (docs/roadmap/epics/neural-field-real.md): prefer real basins
+    // formed by the consolidation worker (Phase 1) over the
+    // project-derived fallback. When the worker has caught up the
+    // response is genuinely attractor-shaped; before it catches up the
+    // project basins keep the frontend usable instead of going blank.
+    let snapshots = services.attractor_manager.list_basin_snapshots().await;
+    if !snapshots.is_empty() {
+        let active = services.session_index.active_fragments_session_map().await;
+        let metadata = services.fragment_metadata.read().await;
+
+        let mut basins: Vec<BasinSummary> = Vec::with_capacity(snapshots.len());
+        for snap in snapshots {
+            let mut by_kind: HashMap<String, usize> = HashMap::new();
+            let mut sessions: Vec<String> = Vec::new();
+            // Only count fragments that are still active in some
+            // session — discarded ones shouldn't inflate basin mass.
+            let mut active_mass = 0usize;
+            for fid in &snap.fragment_ids {
+                if let Some(session_id) = active.get(fid) {
+                    active_mass += 1;
+                    if !sessions.contains(session_id) {
+                        sessions.push(session_id.clone());
+                    }
+                    if let Some(meta) = metadata.get(fid) {
+                        if let Some(kind) = meta.get("kind").and_then(|v| v.as_str()) {
+                            *by_kind.entry(kind.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            // Label = the dominant kind, falling back to a short basin
+            // id slug. Frontends already render the label on the basin
+            // disc, so "decision" / "learning" reads better than a uuid.
+            let dominant_kind = by_kind
+                .iter()
+                .max_by_key(|(_, n)| *n)
+                .map(|(k, _)| k.clone());
+            let short = snap.id.split('-').next().unwrap_or("basin");
+            let label = dominant_kind.unwrap_or_else(|| format!("basin-{short}"));
+
+            basins.push(BasinSummary {
+                id: format!("basin-{}", snap.id),
+                label,
+                source: BasinSource::Attractor,
+                mass: active_mass,
+                centroid: snap.center,
+                by_kind,
+                sessions,
+            });
+        }
+        drop(metadata);
+        // Empty basins (every member fragment got discarded) shouldn't
+        // be returned — they confuse the viz with phantom centroids.
+        basins.retain(|b| b.mass > 0);
+        // Sort by mass desc — heavy basins first, label as tiebreaker.
+        basins.sort_by(|a, b| b.mass.cmp(&a.mass).then_with(|| a.label.cmp(&b.label)));
+        if !basins.is_empty() {
+            return Ok(Json(BasinsResponse { basins }));
+        }
+        // If every real basin filtered out (all members discarded), drop
+        // through to the project fallback rather than returning an empty
+        // list — keeps the viz useful while the worker re-balances.
+    }
+
+    // Fallback: project-derived basins. Used when (a) consolidation
+    // hasn't caught up so `list_basin_snapshots` is empty, or (b)
+    // every real basin's members got soft-deleted.
     let active = services.session_index.active_fragments_session_map().await;
     let metadata = services.fragment_metadata.read().await;
 

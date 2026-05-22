@@ -13,6 +13,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock as AsyncRwLock;
 use uuid::Uuid;
 
+/// Thin projection of an [`AttractorBasin`] for callers that only need
+/// the read-side essentials (id, centroid, fragment membership). Used
+/// by `/api/v1/field/basins` (Phase 3 of the neural-field epic) to
+/// surface real basins without dragging the full basin struct into
+/// the API layer.
+#[derive(Debug, Clone)]
+pub struct BasinSnapshot {
+    pub id: String,
+    pub center: Vec<f32>,
+    pub fragment_ids: Vec<String>,
+}
+
 /// Advanced attractor basin with memory pattern stability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttractorBasin {
@@ -588,6 +600,56 @@ impl AttractorBasinManager {
         });
 
         Ok(basin_id)
+    }
+
+    /// Add a fragment id to an existing basin's `associated_fragments`
+    /// set. Idempotent — repeated calls are no-ops because the
+    /// underlying `HashSet` collapses duplicates. Returns
+    /// `ContextNestError::NotFound` if the basin id is unknown.
+    ///
+    /// Why this exists separately from [`Self::create_basin`]: the
+    /// canonical pipeline historically created basins from a
+    /// fragment's centroid without recording the fragment as a
+    /// member, so `associated_fragments` stayed empty across the
+    /// entire substrate. That broke any caller that wanted to
+    /// enumerate basin membership (Phase 3 of the neural-field epic
+    /// surfaces basins to the frontend; it needs real masses, not
+    /// zeros). The fix is to call this method after `create_basin` —
+    /// see `MemoryAttractorManager::create_attractor_basin_from_fragment`.
+    pub async fn add_fragment_to_basin(
+        &self,
+        basin_id: &str,
+        fragment_id: String,
+    ) -> ContextNestResult<()> {
+        use crate::error::ContextNestError;
+        let mut basins = self.basins.write().await;
+        let basin = basins
+            .get_mut(basin_id)
+            .ok_or_else(|| ContextNestError::NotFound(format!("basin {basin_id} not found")))?;
+        basin.add_fragment(fragment_id);
+        basin.update_health();
+        basin.last_modified = Utc::now();
+        Ok(())
+    }
+
+    /// Snapshot every basin as a thin tuple of (id, centroid, fragment ids).
+    /// Lightweight projection — callers in the API layer don't need
+    /// dynamics / health / shape; exposing the full [`AttractorBasin`]
+    /// would force every dependent crate to depend on those types.
+    ///
+    /// Returns an empty Vec when no basins have formed yet (e.g.
+    /// post-sidecar-replay before the consolidation worker catches up
+    /// — see `docs/roadmap/epics/neural-field-real.md` Phase 1).
+    pub async fn list_snapshots(&self) -> Vec<BasinSnapshot> {
+        let basins = self.basins.read().await;
+        basins
+            .values()
+            .map(|b| BasinSnapshot {
+                id: b.id.clone(),
+                center: b.center.clone(),
+                fragment_ids: b.associated_fragments.iter().cloned().collect(),
+            })
+            .collect()
     }
 
     /// Find nearest basin to a position
