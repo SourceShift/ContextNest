@@ -382,6 +382,14 @@ pub async fn restore_sidecars_bulk(
     // (active/deleted/reverse) per call. Could be made bulk too if it
     // becomes the bottleneck — for 12k records it's not.
     for (frag_id, session_id, _, _) in records {
+        // Enqueue every restored fragment for background consolidation
+        // (Phase 1 of the neural-field epic). This is what turns a WAL
+        // replay from "sidecars only" into eventually-full attractor
+        // state. The worker's startup scan would catch these anyway,
+        // but enqueueing inline saves the scan a pass over already-
+        // known ids and means consolidation starts the moment replay
+        // finishes rather than waiting for the worker's first tick.
+        services.consolidation_queue.enqueue(frag_id.clone());
         services.session_index.add(&session_id, &frag_id).await;
     }
 }
@@ -587,19 +595,26 @@ pub async fn retrieve(
     // each read lock exactly once.
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
+    // Phase 2 of the neural-field epic: apply age-based decay to cosine
+    // similarity. Fragments that haven't been read in a long time score
+    // lower than recent ones with identical content, mirroring the
+    // "forgetting curve" that makes a memory substrate feel alive.
+    // Sidecar-only hits keep their similarity at 0 (no embedding to
+    // decay) and never reach this branch.
     let mut scored: Vec<RetrieveHit> = hydrated
         .into_iter()
-        .map(|(fragment, similarity)| {
+        .map(|(fragment, base_similarity)| {
             let fragment_meta = metadata.get(&fragment.id);
             let content = texts.get(&fragment.id).cloned().unwrap_or_default();
             let owner = multi_session
                 .as_ref()
                 .and_then(|m| m.get(&fragment.id).cloned());
+            let decay = fragment_meta.map(decay_multiplier).unwrap_or(1.0);
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
-                similarity,
+                similarity: base_similarity * decay,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
             }
@@ -645,6 +660,22 @@ pub async fn retrieve(
     });
     scored.truncate(req.top_k);
 
+    // Phase 2 of the neural-field epic: bump `last_accessed` on every
+    // returned hit so future retrieves apply the recency bonus via
+    // `decay_multiplier` (which prefers last_accessed over ts when
+    // present). One write-lock, all hits in a single batch.
+    if !scored.is_empty() {
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let mut meta_w = services.fragment_metadata.write().await;
+        for hit in &scored {
+            let entry = meta_w.entry(hit.id.clone()).or_default();
+            entry.insert(
+                "last_accessed".to_string(),
+                serde_json::Value::String(now_iso.clone()),
+            );
+        }
+    }
+
     // Update the retrieve co-occurrence log: every unordered pair of
     // returned hits gains +1 in the shared connection map. This is the
     // substrate's only signal for "fragments that show up together" —
@@ -681,6 +712,42 @@ pub async fn retrieve(
     }
 
     (StatusCode::OK, Json(RetrieveResponse { hits: scored }))
+}
+
+/// Age-based decay multiplier applied to cosine similarity at retrieve
+/// time. See `docs/roadmap/epics/neural-field-real.md` Phase 2.
+///
+/// The half-life is read from `CONTEXTNEST_DECAY_HALF_LIFE_DAYS` (default
+/// 60 days). A 1-day-old fragment scores ~99% of its base similarity; a
+/// 60-day-old one scores ~50%; a 180-day-old one ~12%.
+///
+/// Recency boost: `last_accessed` (bumped on every retrieve hit) takes
+/// precedence over `ts` so frequently-referenced fragments stay fresh.
+/// Returns 1.0 (no decay) when no usable timestamp is present.
+fn decay_multiplier(metadata: &HashMap<String, serde_json::Value>) -> f32 {
+    let half_life_days: f64 = std::env::var("CONTEXTNEST_DECAY_HALF_LIFE_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+        .unwrap_or(60.0);
+
+    let ref_ts = metadata
+        .get("last_accessed")
+        .or_else(|| metadata.get("ts"))
+        .and_then(|v| v.as_str());
+
+    let when = match ref_ts.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(t) => t.with_timezone(&chrono::Utc),
+        None => return 1.0,
+    };
+
+    let age_secs = (Utc::now() - when).num_seconds() as f64;
+    if age_secs <= 0.0 {
+        return 1.0;
+    }
+    let age_days = age_secs / 86_400.0;
+    let lambda = std::f64::consts::LN_2 / half_life_days;
+    (-lambda * age_days).exp() as f32
 }
 
 /// True iff every `(key, value)` pair in `filter` is present in

@@ -11,6 +11,7 @@ use crate::api::inbox;
 use crate::api::services::ServiceContainer;
 use crate::api::sessions;
 use crate::api::stats;
+use crate::api::substrate;
 use crate::api::tools;
 use crate::services::ContextNestServices;
 
@@ -33,6 +34,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     let sessions_router = sessions::create_sessions_router();
     let inbox_router = inbox::create_inbox_router();
     let stats_router = stats::create_stats_router();
+    let substrate_router = substrate::create_substrate_router();
     let field_router = field::create_field_router();
     let session_tracker = Arc::new(SessionTracker::new());
 
@@ -44,6 +46,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .merge(sessions_router)
         .merge(inbox_router)
         .merge(stats_router)
+        .merge(substrate_router)
         .merge(field_router)
         .layer(Extension(session_tracker))
         .with_state(services);

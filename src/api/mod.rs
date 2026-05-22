@@ -18,6 +18,7 @@ pub mod services;
 pub mod sessions;
 pub mod simple;
 pub mod stats;
+pub mod substrate;
 pub mod tools;
 
 #[cfg(test)]
@@ -31,6 +32,7 @@ pub use server::{ApiRequest, ApiResponse, ContextNestApiServer, ProcessedApiRequ
 pub use sessions::create_sessions_router;
 pub use simple::create_simple_app;
 pub use stats::create_stats_router;
+pub use substrate::create_substrate_router;
 pub use tools::create_tools_router;
 
 /// Create the main application router with comprehensive middleware
