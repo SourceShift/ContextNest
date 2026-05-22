@@ -38,6 +38,18 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     let field_router = field::create_field_router();
     let session_tracker = Arc::new(SessionTracker::new());
 
+    // Defence-in-depth sweeper: re-tail every tracked session's
+    // transcript on a 30s cadence so a dropped hook (Claude killed
+    // mid-curl, substrate restart longer than the curl retry window,
+    // session abandoned before Stop fires) cannot strand a session's
+    // recent z-insight blocks out of the inbox. The hook path remains
+    // the primary delivery channel; this is the "pull" backstop.
+    cc_hooks::spawn_sweeper(
+        services.clone(),
+        session_tracker.clone(),
+        std::time::Duration::from_secs(30),
+    );
+
     let base_router = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/status", get(status_check))

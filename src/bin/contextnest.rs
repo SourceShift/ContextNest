@@ -726,15 +726,21 @@ async fn load_configuration() -> Result<Config, Box<dyn std::error::Error>> {
 ///    sees an empty POST and returns 400. The tempfile dance
 ///    guarantees the body is fully captured before the parent shell
 ///    returns control to Claude.
-/// 3. Curl is `-s -m 1` + redirected to `/dev/null 2>&1` so a server
-///    outage never blocks Claude Code's main loop. We accept that this
-///    is "silent" — operators detect outages via `~/.contextnest/
-///    wal.jsonl` growth, not via hook stderr.
+/// 3. Curl is `-s -m 10 --retry 3 --retry-connrefused --retry-delay 1` +
+///    redirected to `/dev/null 2>&1`. The previous `-m 1` (1-second
+///    total budget, no retry) silently dropped payloads on the smallest
+///    bit of contention or during a substrate restart, leaving the
+///    in-memory `SessionTracker` offset frozen and an active session's
+///    inbox stuck. With 10s + 3 retries on connection refused, the
+///    delivery is reliable enough that the server-side sweeper (see
+///    [`crate::api::cc_hooks::spawn_sweeper`]) is purely defence in
+///    depth, not the load-bearing path.
 /// 4. Trailing `&` detaches the curl from the hook's foreground call so
-///    Claude Code's hook protocol gets its instant ack.
+///    Claude Code's hook protocol gets its instant ack — Claude never
+///    waits for the network, regardless of how long the retries take.
 fn render_hook_command(url: &str) -> String {
     format!(
-        r#"F=$(mktemp /tmp/cnhk-XXXXXX); cat > "$F"; (curl -s -m 1 -X POST {url} -H "content-type: application/json" --data-binary @"$F" >/dev/null 2>&1; rm -f "$F") &"#,
+        r#"F=$(mktemp /tmp/cnhk-XXXXXX); cat > "$F"; (curl -s -m 10 --retry 3 --retry-connrefused --retry-delay 1 -X POST {url} -H "content-type: application/json" --data-binary @"$F" >/dev/null 2>&1; rm -f "$F") &"#,
     )
 }
 
@@ -791,6 +797,36 @@ mod render_hook_command_tests {
         assert!(
             cmd.trim_end().ends_with('&'),
             "trailing & required so Claude's hook protocol gets an instant ack",
+        );
+    }
+
+    #[test]
+    fn curl_has_realistic_timeout_and_connect_retry() {
+        // Regression: `-m 1` (1-second total budget) silently dropped
+        // payloads under any contention. The combo below survives
+        // brief substrate restarts and OS-scheduling jitter without
+        // ever blocking Claude (the call is backgrounded; see
+        // `hook_subshell_is_backgrounded`).
+        let cmd = render_hook_command("http://x.test/y");
+        assert!(
+            cmd.contains("-m 10"),
+            "curl --max-time must be ≥10s; -m 1 was the cause of the inbox staleness bug. cmd: {cmd}",
+        );
+        assert!(
+            cmd.contains("--retry 3"),
+            "curl must retry on transient failure; cmd: {cmd}",
+        );
+        assert!(
+            cmd.contains("--retry-connrefused"),
+            "curl must retry across substrate-restart windows; cmd: {cmd}",
+        );
+        assert!(
+            cmd.contains("--retry-delay 1"),
+            "curl must pause between retries to give the substrate time to come up; cmd: {cmd}",
+        );
+        assert!(
+            !cmd.contains("-m 1 "),
+            "regression: -m 1 reintroduced — payloads will drop under any contention. cmd: {cmd}",
         );
     }
 }
