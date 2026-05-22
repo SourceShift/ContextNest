@@ -44,6 +44,38 @@ where:
    reconciles that update with the doc-derived view, surfacing any
    conflict.
 
+## Related work — what the literature already settled
+
+The general shape of this epic — *turn semi-structured project
+artefacts into a queryable, status-aware knowledge graph that an
+LLM agent can read and update* — is now a researched problem
+space. The 2025–early-2026 literature lets us reuse known
+techniques instead of re-discovering them.
+
+| Paper | What it gives us | How we use it |
+|---|---|---|
+| **Liu et al., *LLM-empowered Knowledge Graph Construction: A Survey*** (arXiv:2510.20345, Oct 2025) | The canonical three-layered pipeline: ontology engineering → knowledge extraction → knowledge fusion. Explicitly identifies *"dynamic knowledge memory for agentic systems"* as a key trend. | Our Phases A→C map onto this pipeline; we don't re-invent the framing. |
+| **Edge et al., *Towards Practical GraphRAG*** (arXiv:2507.03226, Aug 2025) | Dependency-based construction reaches **94% of LLM-generated KG quality at a fraction of the cost**. | Validates our heuristic-first + LLM-fallback classifier in Phase B — we shouldn't burn LLM tokens on sections that regex can class confidently. |
+| **Toroghi et al., *Ontology-grounded KGC under Wikidata schema*** (arXiv:2412.20942, Dec 2024) | LLM-generated KGs systematically misalign with established ontologies — incompleteness + alignment are the hardest parts. | Surfaces a *new open question* about whether users should be able to supply a controlled vocabulary; see "Open question 4" below. |
+| **Chhikara et al., *Mem0: Production-Ready Long-Term Memory*** (arXiv:2504.19413, Apr 2025) | Memory as a *managed lifecycle* — explicit extraction, consolidation, forgetting. Outperforms prior systems across single-hop, temporal, multi-hop, and open-domain queries. | ContextNest's consolidation worker + decay system *already implement* this lifecycle — we're applying a researched pattern, not improvising. |
+| **Anonymous, *Hindsight is 20/20: Build Agent Memory that Retains, Recalls, and Reflects*** (arXiv:2512.12818, Dec 2025) | Reflection-driven memory revision; agents update their own memory after observing outcomes. | Underwrites our Pattern 4 (drift detection) — agents revert `shipped` → `building` on test failure. |
+| **Soliman et al., *Evaluating LLMs for Documentation-to-Code Traceability*** (arXiv:2506.16440, Jun 2025) | Evaluation methodology + benchmark for the very thing this epic enables (doc ↔ code links). Notes 128k–2M context windows shift the trade-off. | Adopt their accuracy metrics for our acceptance tests in Phase E. |
+| **Anonymous, *ArTEMiS: Architecture Entity Recognition for Software Traceability*** (arXiv:2511.02434, Nov 2025) | Specific NER technique for architectural entities in design docs + code. | Optional Phase B+ enhancement for the `depends_on` / `supersedes` / `conflicts_with` graph edges — see "Phase B optional follow-up" below. |
+| **Wu et al., *StateFlow: LLM Task-Solving through State-Driven Workflows*** (arXiv:2403.11322, 2024) | Models LLM agent workflows as explicit state machines. | Validates our status state machine framing in Phase C. |
+| **Yu et al., *Evaluation-Driven Development of LLM Agents*** (arXiv:2411.13768, Nov 2024) | Combines online runtime evaluation with offline development evaluation. | Maps onto Phase D's doc-watcher reconciliation loop — the doc-edit event is the "online evaluation" that flips status. |
+| **Nipane et al., *SpecMap: Hierarchical LLM Agent for Datasheet-to-Code Traceability Link Recovery*** (arXiv:2601.11688, Jan 2026) | Four-step decomposition (folder → file → symbol → validation+gap) outperforms flat retrieval by ~73 pp on file-mapping accuracy. Introduces a quantitative **drift score** metric. | We adopt their fourth step as a first-class Phase B outcome — "implementation gap analysis" surfaces what the docs claim should exist vs what the substrate sees, not just what does exist. We also borrow the drift / confidence score per record. |
+| **Chakraborty & Guha, *Knowledge Graph RAG: Agentic Crawling in Enterprise Documents*** (arXiv:2604.14220, Apr 2026) | Defines **`SUPERSEDES`** and **`REFERS_TO`** as first-class typed edges. Their `get_valid_clause` algorithm walks SUPERSEDES edges to resolve the temporally-current version. **70% accuracy improvement** over flat vector RAG on regulatory queries by encoding "time as node property, validity as edge property". | The SUPERSEDES pattern is directly applicable to our status-conflict resolution. We adopt these edge type names verbatim in the metadata schema — there's no value in inventing parallel terminology when a working pattern with a name already exists in the literature. |
+| **Du et al., *Rethinking Memory in LLM-based Agents: Representations, Operations, Emerging Topics*** (arXiv:2505.00675, May 2025) | Defines **six atomic operations** on contextual memory (extraction, consolidation, retrieval, etc.) — the canonical operation set our consolidation worker already implements. Categorizes memory as parametric vs contextual; ContextNest substrate is contextual. | We use their vocabulary in implementation docs going forward so the architecture is legible to reviewers from outside ContextNest. |
+| **Kerestecioglu et al., *Human-Inspired Memory Architecture for LLM Agents*** (arXiv:2605.08538, May 2026) | Lists six biologically-grounded mechanisms: sleep-phase consolidation, interference-based forgetting, engram maturation, reconsolidation upon retrieval, entity knowledge graphs, hybrid multi-cue retrieval. **This is functionally a description of ContextNest's existing architecture.** | We are not first; the substrate primitives we're integrating are independently validated. Worth citing in the architecture-honest doc. |
+| **Badrinarayan & Parthasarathy, *DocSync: Agentic Documentation Maintenance via Critic-Guided Reflexion*** (arXiv:2605.02163, May 2026) | "Software documentation frequently drifts from executable logic as codebases evolve." Their critic-guided reflexion pattern detects + repairs drift. | Maps directly onto our Phase D doc-watcher. We adopt the **critic-guided** framing: a separate agent verifies status transitions before applying them, instead of unilateral edits flipping the substrate. |
+| **Park et al., *Ontology-Based Knowledge Graph Framework for Industrial Standard Documents via Hierarchical and Propositional Structuring*** (arXiv:2512.08398, Dec 2025) | Hierarchical + propositional structuring approach for KG construction from technical docs. Validates the heading-tree-as-structure choice. | Validates Phase A's section-split-by-heading strategy. |
+
+**Net takeaway:** every architectural choice in this epic has a
+2024–2026 paper supporting it. The work below isn't speculative;
+it's an integration project that wires ContextNest's existing
+substrate primitives into the shape the literature already
+identified.
+
 ## Why ContextNest is the right core
 
 A naïve "embed every paragraph in a vector store" approach
@@ -148,10 +180,26 @@ pub enum MemoryKind {
   "status_source": "doc" | "agent" | "inferred",
   "status_ts": "2026-05-22T11:00:00Z",
 
-  // ===== graph =====
-  "depends_on": ["consolidation worker", "real basins surface"],   // outgoing edges
-  "supersedes": ["old field viz design"],
-  "conflicts_with": [],
+  // ===== graph (typed edges) =====
+  // We adopt the edge vocabulary from Chakraborty & Guha 2026
+  // (arXiv:2604.14220) verbatim — `SUPERSEDES` and `REFERS_TO` are
+  // first-class types, with `SUPERSEDES` being directional from
+  // newer → older. The substrate's existing ConnectionNetwork stores
+  // these as edges; the agent-facing API returns them as arrays here
+  // for ergonomic JSON.
+  "supersedes":        ["older-feature-name", "deprecated-design-x"],   // newer → older
+  "superseded_by":     null,                                            // reverse direction; populated on read
+  "refers_to":         ["consolidation worker", "real basins surface"], // depends-on / cites
+  "conflicts_with":    [],                                              // mutual exclusion
+
+  // ===== quality signals =====
+  // Borrowed from Nipane et al. 2026 (arXiv:2601.11688). Confidence
+  // is the LLM-assigned 0–1 score from the classifier; drift_score is
+  // the divergence between this fragment's classification and prior
+  // fragments for the same canonical_name (low = consistent, high =
+  // conflict surfaces).
+  "confidence":  0.91,
+  "drift_score": 0.12,
 
   // ===== freshness / decay =====
   "ts": "2026-05-22T11:00:00Z"
@@ -293,6 +341,38 @@ the basin wins).
 - Status heuristics produce expected enum values for 8 representative
   fixtures
 
+**Optional Phase B+ enhancement — entity recognition for typed edges**
+
+`SUPERSEDES`, `REFERS_TO`, and `CONFLICTS_WITH` edges between
+features are mined from prose like "this replaces the old design"
+or "depends on the consolidation worker". V1 uses regex over the
+canonical-name vocabulary. A V1.5 enhancement would adopt
+ArTEMiS-style architecture entity recognition (arXiv:2511.02434)
+for higher recall on edges expressed indirectly ("X uses Y's
+basins", "Y is the foundation for X"). Defer until V1 telemetry
+shows recall is the limiter.
+
+### Gap Analysis (added per SpecMap, arXiv:2601.11688)
+
+After Phase B's classification + canonicalization completes, the
+substrate has enough information to answer a question the original
+draft of this epic missed: *what does the spec say should exist
+that the substrate has no implementation evidence for?*
+
+We cross-reference `MemoryKind::FeatureSpec` records against
+`MemoryKind::Feature` records (the runtime-shipped index from the
+`delivered_features` extractor) and `MemoryKind::FilesTouched`
+records (the `tool_use`-derived index). A spec record with no
+matching shipped/touched evidence is an **implementation gap**.
+
+Surface via:
+```
+GET /api/v1/feature-specs?has_implementation=false
+```
+
+This is the "honest backlog" view — what the docs promised that
+nobody actually built.
+
 ### Phase C — Status state machine + update endpoint
 
 **Goal:** Let agents (and the daemon) transition feature status
@@ -324,13 +404,52 @@ Content-Type: application/json
 `metadata.actor`, `metadata.evidence`. Audit records have very high
 importance + no decay (they're history, not signal).
 
-**State store:** The "current status" of a feature is computed by:
+**State store — `get_valid_status` algorithm:** Adapted from
+Chakraborty & Guha 2026's `get_valid_clause` (arXiv:2604.14220),
+which solves the identical "which version is authoritative" problem
+for legal/regulatory text:
+
+```python
+def get_valid_status(canonical_name: str) -> Status:
+    records = pull_all_feature_spec_records(canonical_name)
+
+    # Walk SUPERSEDES edges first — if any record claims to
+    # supersede another, the superseder wins. This handles the
+    # "temporal hallucination" failure mode: an old doc says
+    # `shipped` and a newer epic supersedes it with `building`.
+    current = records[0]   # newest by status_ts as fallback
+    while True:
+        superseders = [r for r in records if current.id in r.supersedes]
+        if not superseders:
+            break
+        # If multiple superseders exist, pick the most recent.
+        current = max(superseders, key=lambda r: r.status_ts)
+
+    # Then apply the agent-trumps-doc rule. If an agent update
+    # came within 5 minutes of the surviving doc record, agent wins
+    # (it knows more than the doc — it ran the test).
+    agent_records = [r for r in records
+                     if r.status_source == "agent"
+                     and abs((r.status_ts - current.status_ts).seconds) < 300]
+    if agent_records:
+        current = max(agent_records, key=lambda r: r.status_ts)
+
+    return current.status
+```
+
+Old approach (simple "freshest wins"):
 1. Pull all FeatureSpec records for the canonical name.
 2. Sort by `status_ts` desc.
 3. Take the freshest record's `status` value.
 4. Cross-check against `status_change` audit records — they
    override doc-derived values if newer (agent updates trump doc
    inference).
+
+The graph-walk version is correct in cases the simple version isn't
+— specifically when an old doc was *edited* to flip status (which
+backdates the conflict in `status_ts`) but a newer epic explicitly
+supersedes it. Cost: O(N) per query in the typical case; cached
+per canonical name with invalidation on new ingest.
 
 **Conflict surface:** When a doc says `building` and a recent agent
 update says `shipped`, the GET endpoint returns:
@@ -559,6 +678,9 @@ honest about what's actually working.
 | Cluster threshold too loose → distinct features collapse into one | Med | `Feature:` front matter overrides clustering; explicit `aliases:` field lets authors lock the grouping |
 | `cn_feature_spec_update` race when two agents update simultaneously | Low | Endpoint takes a `expected_current_status` field; mismatched → 409 with the actual current value |
 | Watcher misses changes on network filesystems | Low | Fallback to periodic full scan every 1 hour (configurable) |
+| **Temporal hallucination** — old doc says `shipped`, newer epic says `building`, simple "freshest wins" returns the wrong answer because the old doc was edited recently. (Documented as the central RAG failure mode by arXiv:2604.14220.) | **High** without mitigation | `get_valid_status` walks `SUPERSEDES` edges *before* the freshness fallback. Edges are first-class — never inferred from `status_ts` alone. |
+| Classifier over-confident → silent mis-classifications (SpecMap 2026 reports 90.4% pre-validation confidence vs ~73% true accuracy) | Med | Adopt SpecMap's separate validation step. `confidence` field gets calibrated against `drift_score` over a 14-day window; the agent surface flags features whose calibration is off. |
+| Critic-guided reflexion (DocSync pattern) adds latency to every doc-watcher tick | Low | Critic only runs for transitions that *advance* status (`building → testing`, `testing → shipped`). Backward / lateral moves apply without critic. |
 
 **Open questions to resolve before Phase A:**
 
@@ -581,6 +703,19 @@ honest about what's actually working.
    and `metadata.code_block=true`. Excluded from semantic search
    results by default but included when a query asks for "API
    shape of X".
+
+4. **Ontology grounding — controlled vocabulary support?** Per
+   Toroghi et al. 2024 (arXiv:2412.20942) and Park et al. 2025
+   (arXiv:2512.08398), LLM-generated KGs systematically misalign
+   with established vocabularies. Should the ingester accept an
+   optional `ontology.yml` at the corpus root mapping
+   canonical feature names to user-defined IDs / aliases /
+   `is_a` relationships? **Proposed:** yes, but as opt-in V1.5
+   feature. V1 ships with the basin-derived canonical names only;
+   teams that need lock-step alignment with an external taxonomy
+   (Jira epic IDs, ADR numbers, ISO standard sections) can supply
+   the ontology file at any time and the ingester will re-canonicalize
+   on next pass.
 
 ## Acceptance — what success looks like
 
