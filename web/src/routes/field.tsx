@@ -1723,9 +1723,12 @@ function FragmentDetail({
                   </span>
                   <span
                     className="mono dim"
+                    title={n.session_id}
                     style={{ fontSize: 10, marginLeft: 'auto' }}
                   >
-                    {n.session_id.slice(0, 11)}
+                    {n.session_id.length > 16
+                      ? `${n.session_id.slice(0, 11)}…${n.session_id.slice(-6)}`
+                      : n.session_id}
                   </span>
                 </div>
                 <div

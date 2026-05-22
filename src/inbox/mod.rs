@@ -104,12 +104,13 @@ impl InboxItem {
                 .map(String::from)
                 .or_else(|| {
                     // Fallback — when the response shape doesn't carry
-                    // session_id at the top, derive from the src_session
-                    // uuid prefix.
+                    // session_id at the top, derive it from the
+                    // src_session uuid. Substrate canonical form is
+                    // `cc-<full-uuid>` (no truncation).
                     metadata
                         .get("src_session")
                         .and_then(|v| v.as_str())
-                        .map(|uuid| format!("cc-{}", &uuid[..uuid.len().min(8)]))
+                        .map(|uuid| format!("cc-{uuid}"))
                 })
                 .unwrap_or_else(|| "unknown".to_string()),
             project_cwd: metadata

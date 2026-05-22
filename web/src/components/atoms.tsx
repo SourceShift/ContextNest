@@ -202,11 +202,51 @@ export function KindBadge({ kind }: { kind: string }) {
   return <span className={`kind-badge ${kind}`}>{kind.replace('_', ' ')}</span>;
 }
 
-export function SessionPill({ id, onClick }: { id: string; onClick?: () => void }) {
+/** Visually compact `cc-1234abcd…01234567` form for a 39-char canonical
+ *  session id. Long-form ids are abbreviated with a horizontal ellipsis;
+ *  short / unknown ids pass through untouched. Pure presentation — the
+ *  underlying `id` stays the canonical full UUID. */
+function shortenSessionId(id: string): string {
+  if (id.length <= 16) return id;
+  const head = id.slice(0, 11);
+  const tail = id.slice(-8);
+  return `${head}…${tail}`;
+}
+
+export function SessionPill({
+  id,
+  onClick,
+  showFull = false,
+}: {
+  /** The canonical full session id, e.g. `cc-9b8a1f3e-51e2-bc40-89ab-cdef01234567`. */
+  id: string;
+  /** Override the default copy-to-clipboard behaviour. Receives no args
+   *  — the parent is expected to know `id` already. When set, the
+   *  caller takes ownership of the click handler entirely. */
+  onClick?: () => void;
+  /** Render the full id without truncation. Useful in pages that have
+   *  the horizontal real estate, e.g. session detail header. */
+  showFull?: boolean;
+}) {
+  const visible = showFull ? id : shortenSessionId(id);
+  const handleClick = onClick
+    ? onClick
+    : () => {
+        // Default: copy the canonical id to clipboard. No toast — the
+        // tooltip already says "click to copy", and a 39-char string
+        // landing in the user's paste buffer is its own confirmation.
+        if (typeof navigator !== 'undefined' && navigator.clipboard) {
+          void navigator.clipboard.writeText(id).catch(() => {
+            /* clipboard API can fail under non-secure contexts; swallow */
+          });
+        }
+      };
+  const title = onClick ? id : `${id}\n(click to copy)`;
   return (
     <span
       className="mono"
-      onClick={onClick}
+      onClick={handleClick}
+      title={title}
       style={{
         color: 'var(--ink)',
         background: 'var(--surface-2)',
@@ -214,10 +254,11 @@ export function SessionPill({ id, onClick }: { id: string; onClick?: () => void 
         padding: '1px 6px',
         borderRadius: '5px',
         fontSize: '11px',
-        cursor: onClick ? 'pointer' : 'default',
+        cursor: 'pointer',
+        userSelect: 'all',
       }}
     >
-      {id}
+      {visible}
     </span>
   );
 }

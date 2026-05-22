@@ -90,7 +90,23 @@ function SessionDetailPage() {
   return (
     <div>
       <div className="session-head">
-        <span className="sid">{session?.id ?? id}</span>
+        {/* Detail page is the one place that has horizontal room for
+            the full canonical session id — show it without truncation
+            and make it click-to-copy so users can paste it into
+            jsonl path lookups under ~/.claude/projects/. */}
+        <span
+          className="sid"
+          title={`${session?.id ?? id}\n(click to copy)`}
+          style={{ cursor: 'pointer', userSelect: 'all' }}
+          onClick={() => {
+            const full = session?.id ?? id;
+            if (typeof navigator !== 'undefined' && navigator.clipboard) {
+              void navigator.clipboard.writeText(full).catch(() => {});
+            }
+          }}
+        >
+          {session?.id ?? id}
+        </span>
         <span className="proj">{project}</span>
         <span style={{ color: 'var(--ink-muted)', fontSize: 12.5 }}>
           {currentPhase ?? (isLoading ? 'loading…' : 'no phase recorded')}

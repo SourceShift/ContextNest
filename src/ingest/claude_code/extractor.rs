@@ -114,13 +114,17 @@ impl MemoryRecord {
 ///
 /// `session_uuid` is the full Claude Code session UUID. `project_cwd` is
 /// the reconstructed project path (empty string if unknown). The substrate
-/// session id (`cc-<first-8-of-uuid>`) is derived internally.
+/// session id is `cc-<full-uuid>` — the `cc-` prefix tags the ingest
+/// source (Claude Code) and the full UUID guarantees no aliasing across
+/// sessions whose UUIDs happen to share their first 8 chars. The old
+/// `cc-<first-8>` form is migrated to this canonical shape at WAL
+/// replay time (see `bootstrap_wal` in `bin/contextnest.rs`).
 pub fn extract_memories(
     events: &[RawEvent],
     session_uuid: &str,
     project_cwd: &str,
 ) -> Vec<MemoryRecord> {
-    let cn_session_id = format!("cc-{}", &session_uuid[..session_uuid.len().min(8)]);
+    let cn_session_id = format!("cc-{session_uuid}");
     let mut out = Vec::new();
 
     // 1. session_title from the first non-empty ai-title.
@@ -682,16 +686,15 @@ mod tests {
         );
         assert!(decision.metadata.contains_key("decision_text"));
 
-        // CN session id derived from first 8 chars of the uuid
-        assert_eq!(decision.session_id_cn, "cc-sess-1-v");
-        // Wait — uuid was "sess-1-very-long-uuid"; first 8 chars are "sess-1-v"
-        // The format is `cc-<first-8-of-uuid>`; verify exact prefix length
+        // CN session id is `cc-<full-uuid>` — no truncation, no aliasing.
+        assert_eq!(decision.session_id_cn, "cc-sess-1-very-long-uuid");
         for r in &recs {
             assert!(
                 r.session_id_cn.starts_with("cc-"),
                 "session id starts with cc-"
             );
-            assert!(r.session_id_cn.len() <= "cc-".len() + 8 + 1);
+            // Suffix is the entire uuid, byte-for-byte.
+            assert_eq!(&r.session_id_cn["cc-".len()..], "sess-1-very-long-uuid");
         }
 
         // Every memory carries kind + src_session metadata
