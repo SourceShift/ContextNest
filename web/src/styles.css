@@ -1588,10 +1588,11 @@ body {
   filter: drop-shadow(0 0 6px currentColor);
 }
 
-.field-overlay-bl {
-  position: absolute;
-  bottom: 14px;
-  left: 14px;
+/* Legend panel — lives inside `.field-overlay-tr`, stacked under the
+ * zoom-nav. Previously absolute-positioned in the bottom-left corner,
+ * but the bottom strip is owned by `.field-scrubber` (z-index: 4) which
+ * silently occluded the legend on narrow canvases. */
+.field-legend-panel {
   background: rgba(10, 10, 10, 0.85);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
@@ -1764,6 +1765,14 @@ body {
   position: absolute;
   top: 14px;
   right: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  /* Bound the legend so the canvas remains usable on shorter viewports —
+   * inner scrolling rather than pushing the panel off-screen. */
+  max-height: calc(100% - 28px);
+  overflow-y: auto;
 }
 .zoom-nav {
   display: flex;
