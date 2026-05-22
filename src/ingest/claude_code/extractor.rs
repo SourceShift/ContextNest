@@ -304,6 +304,34 @@ pub fn extract_memories(
                                 rec = rec.with_meta("layer", Value::String(layer.to_string()));
                             }
                         }
+                        // `how_to_test` — free-form recipe the agent
+                        // believes will exercise the feature. Plain
+                        // string so curl one-liners, cargo test
+                        // commands, and "click bell icon then look
+                        // for new row" instructions all fit without
+                        // forcing the agent into a tagged-union
+                        // schema decision at write time.
+                        if let Some(how) = feat.get("how_to_test").and_then(Value::as_str) {
+                            if !how.is_empty() {
+                                rec = rec.with_meta("how_to_test", Value::String(how.to_string()));
+                            }
+                        }
+                        // `defs` — symbol names the agent says
+                        // implement the feature (e.g. `fn retrieve()`,
+                        // `struct BasinSnapshot`). Free-form so the
+                        // agent doesn't have to commit to a parsing
+                        // convention up front. Empty array filtered to
+                        // keep the metadata sidecar lean.
+                        if let Some(defs_arr) = feat.get("defs").and_then(Value::as_array) {
+                            let filtered: Vec<Value> = defs_arr
+                                .iter()
+                                .filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                                .cloned()
+                                .collect();
+                            if !filtered.is_empty() {
+                                rec = rec.with_meta("defs", Value::Array(filtered));
+                            }
+                        }
                         out.push(rec);
                     }
                 }
