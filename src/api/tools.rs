@@ -79,6 +79,22 @@ pub struct RetrieveRequest {
     pub top_k: usize,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Optional explicit list of sessions to search.
+    ///
+    /// When set (and non-empty), the handler switches to **cross-session**
+    /// mode: it snapshots every active fragment via
+    /// `SessionIndex::active_fragments_session_map`, filters to fragments
+    /// whose owning session is in this list, and merges the scored hits
+    /// into one response. The returned `RetrieveHit.session_id` is then
+    /// populated per hit so the caller can tell where each result came
+    /// from. `session_id` (singular) is ignored when this is set.
+    ///
+    /// Wire-compat: existing single-session callers (cc_hooks, MCP, etc.)
+    /// keep passing `session_id` and never see this field. The search UI
+    /// in the dashboard passes this to replace the previous N-call
+    /// per-session fan-out with a single backend call.
+    #[serde(default)]
+    pub session_ids: Option<Vec<String>>,
     /// Optional per-fragment metadata filter. When set, a fragment is
     /// only returned if its stored metadata contains every key from this
     /// map with the exact same value. Missing key on the fragment = no
@@ -111,6 +127,11 @@ pub struct RetrieveHit {
     /// on + render UIs without a second request.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Owning session of this fragment. Populated only when the caller
+    /// requested cross-session retrieval (via `session_ids`); omitted in
+    /// single-session mode to preserve wire-compat for existing clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -455,9 +476,25 @@ pub async fn retrieve(
     State(services): State<ContextNestServices>,
     Json(req): Json<RetrieveRequest>,
 ) -> impl IntoResponse {
-    let session_id = req
-        .session_id
-        .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+    // Branch decision: cross-session mode (when caller passed an
+    // explicit `session_ids` list) vs the original single-session mode.
+    // `multi_session` carries a fragment_id → owning session_id map so
+    // each `RetrieveHit` can be tagged with its origin; in single-session
+    // mode the map stays empty and hits are emitted without `session_id`.
+    let multi_session: Option<HashMap<String, String>> = match req.session_ids.as_ref() {
+        Some(ids) if !ids.is_empty() => {
+            let wanted: HashSet<&String> = ids.iter().collect();
+            // One read-lock snapshot, then filter in-process — same
+            // pattern the inbox endpoint uses for its cross-session feed.
+            let all = services.session_index.active_fragments_session_map().await;
+            let map: HashMap<String, String> = all
+                .into_iter()
+                .filter(|(_, sess)| wanted.contains(sess))
+                .collect();
+            Some(map)
+        }
+        _ => None,
+    };
 
     let query_embedding = match services.embedding.generate_embedding(&req.query).await {
         Ok(e) => e,
@@ -469,7 +506,15 @@ pub async fn retrieve(
         }
     };
 
-    let active_ids = services.session_index.list_active(&session_id).await;
+    let active_ids: Vec<String> = if let Some(map) = multi_session.as_ref() {
+        map.keys().cloned().collect()
+    } else {
+        let session_id = req
+            .session_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+        services.session_index.list_active(&session_id).await
+    };
     if active_ids.is_empty() {
         return (StatusCode::OK, Json(RetrieveResponse { hits: Vec::new() }));
     }
@@ -547,12 +592,16 @@ pub async fn retrieve(
         .map(|(fragment, similarity)| {
             let fragment_meta = metadata.get(&fragment.id);
             let content = texts.get(&fragment.id).cloned().unwrap_or_default();
+            let owner = multi_session
+                .as_ref()
+                .and_then(|m| m.get(&fragment.id).cloned());
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
                 similarity,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
+                session_id: owner,
             }
         })
         .collect();
@@ -565,6 +614,7 @@ pub async fn retrieve(
         if content.is_none() && meta.is_none() {
             continue;
         }
+        let owner = multi_session.as_ref().and_then(|m| m.get(id).cloned());
         scored.push(RetrieveHit {
             id: id.clone(),
             content: content.unwrap_or_default(),
@@ -576,6 +626,7 @@ pub async fn retrieve(
             // ahead of sidecar-only hits in mixed result sets.
             similarity: 0.0,
             metadata: meta.unwrap_or_default(),
+            session_id: owner,
         });
     }
     drop(texts);
