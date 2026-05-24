@@ -874,6 +874,279 @@ pub async fn top_feature_for_session(
     }))
 }
 
+// =============================================================================
+// `GET /api/v1/sessions/:id/summary`
+//
+// Aggregated session summary in the shape downstream routers (notably
+// the z-dashboard categorizer) want when treating ContextNest as the
+// single source of truth — replacing the daemon's own LLM transcript
+// summarisation. Walks every active fragment for the session ONCE and
+// pulls out:
+//
+//   domain         — text of the session's Domain record (latest seen)
+//   progress       — Domain.metadata.progress
+//   topics         — Domain.metadata.topics (deduped union)
+//   goal           — latest GoalPhase by ts
+//   current_state  — latest State by ts
+//   top_jobs       — last 5 Accomplishment texts (newest first)
+//   facts          — last 5 Learning texts (newest first)
+//   tasks          — every Todo with id/subject/status, dedup-keyed
+//   started_at     — min ts across all fragments
+//   last_ts        — max ts across all fragments
+//
+// Same complexity as `top_feature_for_session` — single read-lock pass
+// over `fragment_metadata`. No LLM, no async beyond the lock.
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct SessionSummaryTask {
+    pub id: Option<String>,
+    pub subject: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionSummaryPayload {
+    pub domain: Option<String>,
+    pub progress: Option<String>,
+    pub topics: Vec<String>,
+    pub goal: Option<String>,
+    pub current_state: Option<String>,
+    pub top_jobs: Vec<String>,
+    pub facts: Vec<String>,
+    pub tasks: Vec<SessionSummaryTask>,
+    pub started_at: Option<String>,
+    pub last_ts: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionSummaryResponse {
+    pub session_id: String,
+    pub fragment_count: usize,
+    pub summary: SessionSummaryPayload,
+}
+
+/// Limit applied to top_jobs and facts — the downstream Insight.summary
+/// schema in z-dashboard takes up to 3 of each in the prompt but the
+/// daemon may also use these for non-categorize purposes (e.g. session
+/// hover cards). 5 strikes a balance: enough for hovers, small enough
+/// that the payload stays sub-kilobyte for the common case.
+const SUMMARY_KEEP: usize = 5;
+
+pub async fn session_summary(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionSummaryResponse>, StatusCode> {
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    // Per-kind accumulators. We walk metadata once and route each
+    // matching fragment into the correct bucket.
+    let mut domain_text: Option<String> = None;
+    let mut domain_ts: Option<String> = None;
+    let mut progress: Option<String> = None;
+    let mut topics: Vec<String> = Vec::new();
+    // GoalPhase / State are timestamp-ranked: keep (ts, text) tuples and
+    // pick the latest at the end. ts comparison is lexicographic ISO 8601.
+    let mut goals: Vec<(String, String)> = Vec::new();
+    let mut states: Vec<(String, String)> = Vec::new();
+    let mut top_jobs: Vec<(String, String)> = Vec::new();
+    let mut facts: Vec<(String, String)> = Vec::new();
+    // Tasks dedup keyed by id-if-present-else-subject — mirrors the
+    // ingest-time dedup so we don't return the same logical task twice.
+    let mut tasks: std::collections::HashMap<String, SessionSummaryTask> =
+        std::collections::HashMap::new();
+    let mut started_at: Option<String> = None;
+    let mut last_ts: Option<String> = None;
+    let mut fragment_count: usize = 0;
+
+    for (frag_id, meta) in metadata.iter() {
+        let src = meta.get("src_session").and_then(|v| v.as_str());
+        if src != Some(session_id.as_str()) {
+            continue;
+        }
+        fragment_count += 1;
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Track started_at (min ts) and last_ts (max ts) across all
+        // fragments — independent of kind.
+        if let Some(ts_str) = &ts {
+            started_at = Some(match started_at.take() {
+                None => ts_str.clone(),
+                Some(prev) => {
+                    if ts_str < &prev {
+                        ts_str.clone()
+                    } else {
+                        prev
+                    }
+                }
+            });
+            last_ts = Some(match last_ts.take() {
+                None => ts_str.clone(),
+                Some(prev) => {
+                    if ts_str > &prev {
+                        ts_str.clone()
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+
+        match kind {
+            "domain" => {
+                if let Some(t) = texts.get(frag_id) {
+                    if !t.is_empty() {
+                        // Take the record with the latest ts. The
+                        // extractor already emits only one per session,
+                        // but be defensive against ingest-time bugs.
+                        let take = match (&domain_ts, &ts) {
+                            (None, _) => true,
+                            (Some(_), None) => false,
+                            (Some(prev), Some(cur)) => cur > prev,
+                        };
+                        if take {
+                            domain_text = Some(t.clone());
+                            domain_ts = ts.clone();
+                            progress = meta
+                                .get("progress")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            topics = meta
+                                .get("topics")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            "goal_phase" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(frag_id), &ts) {
+                    if !t.is_empty() {
+                        goals.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            "state" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(frag_id), &ts) {
+                    if !t.is_empty() {
+                        states.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            "accomplishment" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(frag_id), &ts) {
+                    if !t.is_empty() {
+                        top_jobs.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            "learning" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(frag_id), &ts) {
+                    if !t.is_empty() {
+                        facts.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            "todo" => {
+                if let Some(subject) = texts.get(frag_id).filter(|s| !s.is_empty()) {
+                    let id = meta
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let status = meta
+                        .get("task_status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending")
+                        .to_string();
+                    let dedup_key = id.clone().unwrap_or_else(|| subject.clone());
+                    tasks.insert(
+                        dedup_key,
+                        SessionSummaryTask {
+                            id,
+                            subject: subject.clone(),
+                            status,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(texts);
+    drop(metadata);
+
+    if fragment_count == 0 {
+        // Session not found in the substrate — distinguish from "found
+        // but empty" by returning 404 so the daemon can fall through to
+        // a local-cache lookup if it wants to.
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Pick latest by ts for single-value fields.
+    goals.sort_by(|a, b| b.0.cmp(&a.0));
+    states.sort_by(|a, b| b.0.cmp(&a.0));
+    top_jobs.sort_by(|a, b| b.0.cmp(&a.0));
+    facts.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let goal = goals.into_iter().next().map(|(_, t)| t);
+    let current_state = states.into_iter().next().map(|(_, t)| t);
+    let top_jobs_out: Vec<String> = top_jobs
+        .into_iter()
+        .take(SUMMARY_KEEP)
+        .map(|(_, t)| t)
+        .collect();
+    let facts_out: Vec<String> = facts
+        .into_iter()
+        .take(SUMMARY_KEEP)
+        .map(|(_, t)| t)
+        .collect();
+    let mut tasks_out: Vec<SessionSummaryTask> = tasks.into_values().collect();
+    // Stable task order: pending first (they're what the dashboard wants
+    // to highlight), then in_progress, completed, failed, others. Within
+    // a status bucket sort alphabetically by subject for determinism.
+    fn status_rank(s: &str) -> u8 {
+        match s {
+            "in_progress" => 0,
+            "pending" => 1,
+            "failed" => 2,
+            "completed" => 3,
+            _ => 4,
+        }
+    }
+    tasks_out.sort_by(|a, b| {
+        status_rank(&a.status)
+            .cmp(&status_rank(&b.status))
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+
+    Ok(Json(SessionSummaryResponse {
+        session_id,
+        fragment_count,
+        summary: SessionSummaryPayload {
+            domain: domain_text,
+            progress,
+            topics,
+            goal,
+            current_state,
+            top_jobs: top_jobs_out,
+            facts: facts_out,
+            tasks: tasks_out,
+            started_at,
+            last_ts,
+        },
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
@@ -885,5 +1158,6 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
             "/api/v1/sessions/:id/top-feature",
             get(top_feature_for_session),
         )
+        .route("/api/v1/sessions/:id/summary", get(session_summary))
         .route("/api/v1/features", get(list_features))
 }
