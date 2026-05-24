@@ -690,11 +690,17 @@ pub async fn top_feature_for_session(
     let mut session_files: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    for (frag_id, meta) in metadata.iter() {
-        let src = meta.get("src_session").and_then(|v| v.as_str());
-        if src != Some(session_id.as_str()) {
+    // Use session_index to enumerate THIS session's fragment IDs. The
+    // raw `src_session` metadata stores the UUID *without* the `cc-`
+    // prefix, while the path param carries the full `cc-<uuid>` form —
+    // matching on the metadata sidecar would silently miss every real
+    // session. The index is the canonical mapping cc_session_id →
+    // Vec<frag_id>; reuse it here the same way list_sessions does.
+    let active_ids = services.session_index.list_active(&session_id).await;
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
             continue;
-        }
+        };
         let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "feature" => {
@@ -958,14 +964,18 @@ pub async fn session_summary(
         std::collections::HashMap::new();
     let mut started_at: Option<String> = None;
     let mut last_ts: Option<String> = None;
-    let mut fragment_count: usize = 0;
 
-    for (frag_id, meta) in metadata.iter() {
-        let src = meta.get("src_session").and_then(|v| v.as_str());
-        if src != Some(session_id.as_str()) {
+    // session_index is the canonical cc_session_id → frag_ids map.
+    // Walking metadata.iter() and filtering by `src_session` would silently
+    // miss every real session because the metadata sidecar stores the
+    // raw UUID without the `cc-` prefix that the path param carries.
+    let active_ids = services.session_index.list_active(&session_id).await;
+    let fragment_count = active_ids.len();
+
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
             continue;
-        }
-        fragment_count += 1;
+        };
         let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let ts = meta
             .get("ts")
