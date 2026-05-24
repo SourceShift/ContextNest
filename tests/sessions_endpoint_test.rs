@@ -400,3 +400,178 @@ async fn top_feature_prefers_repeated_feature() {
     );
     assert_eq!(top["freq"].as_u64().unwrap(), 3);
 }
+
+// =============================================================================
+// Session-summary endpoint tests
+// =============================================================================
+
+/// Helper: hit GET /api/v1/sessions/:id/summary and return parsed JSON.
+async fn summary(server: &TestServer, session_id: &str) -> serde_json::Value {
+    let res = server
+        .get(&format!("/api/v1/sessions/{session_id}/summary"))
+        .await;
+    res.assert_status_ok();
+    res.json()
+}
+
+/// A session with one record per kind round-trips into the expected
+/// Insight-shaped summary payload: domain text + progress + topics from
+/// the Domain record's metadata, latest goal/state, all accomplishments
+/// and learnings, todo with status.
+#[tokio::test]
+async fn summary_assembles_full_insight_shape() {
+    let server = make_server().await;
+    let sid = "cc-sum-1";
+
+    // Domain record carries the topics + progress metadata.
+    store(
+        &server,
+        sid,
+        "backend",
+        json!({
+            "kind": "domain",
+            "src_session": sid,
+            "ts": "2026-05-20T10:00:00Z",
+            "progress": "in-progress",
+            "topics": ["auth", "session-routing"],
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Implementing the new top-feature endpoint",
+        json!({
+            "kind": "goal_phase",
+            "src_session": sid,
+            "ts": "2026-05-20T10:05:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Endpoint shipped, awaiting daemon-side wiring",
+        json!({
+            "kind": "state",
+            "src_session": sid,
+            "ts": "2026-05-20T10:10:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Wrote the route handler",
+        json!({
+            "kind": "accomplishment",
+            "src_session": sid,
+            "ts": "2026-05-20T10:06:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Closed-set LLM classification is cheap enough at session-close",
+        json!({
+            "kind": "learning",
+            "src_session": sid,
+            "ts": "2026-05-20T10:07:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Update daemon to consume summary endpoint",
+        json!({
+            "kind": "todo",
+            "src_session": sid,
+            "ts": "2026-05-20T10:08:00Z",
+            "task_id": "wire-daemon",
+            "task_status": "pending",
+        }),
+    )
+    .await;
+
+    let body = summary(&server, sid).await;
+    let s = &body["summary"];
+
+    assert_eq!(s["domain"].as_str().unwrap(), "backend");
+    assert_eq!(s["progress"].as_str().unwrap(), "in-progress");
+    assert_eq!(
+        s["topics"].as_array().unwrap(),
+        &[json!("auth"), json!("session-routing")]
+    );
+    assert_eq!(
+        s["goal"].as_str().unwrap(),
+        "Implementing the new top-feature endpoint"
+    );
+    assert_eq!(
+        s["current_state"].as_str().unwrap(),
+        "Endpoint shipped, awaiting daemon-side wiring"
+    );
+    assert_eq!(s["top_jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(s["top_jobs"][0].as_str().unwrap(), "Wrote the route handler");
+    assert_eq!(s["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(s["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(s["tasks"][0]["id"].as_str().unwrap(), "wire-daemon");
+    assert_eq!(s["tasks"][0]["status"].as_str().unwrap(), "pending");
+    assert_eq!(s["last_ts"].as_str().unwrap(), "2026-05-20T10:10:00Z");
+    assert_eq!(s["started_at"].as_str().unwrap(), "2026-05-20T10:00:00Z");
+}
+
+/// Latest goal/state wins when the session emits multiple turns. This
+/// is the contract the categorizer relies on — drift is captured by
+/// taking the most-recent record, not by averaging.
+#[tokio::test]
+async fn summary_picks_latest_goal_and_state() {
+    let server = make_server().await;
+    let sid = "cc-sum-latest";
+
+    // Two goal_phase records — newer one wins.
+    store(
+        &server,
+        sid,
+        "old goal",
+        json!({"kind": "goal_phase", "src_session": sid, "ts": "2026-05-20T09:00:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "new goal",
+        json!({"kind": "goal_phase", "src_session": sid, "ts": "2026-05-20T11:00:00Z"}),
+    )
+    .await;
+
+    // Two state records.
+    store(
+        &server,
+        sid,
+        "old state",
+        json!({"kind": "state", "src_session": sid, "ts": "2026-05-20T09:30:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "new state",
+        json!({"kind": "state", "src_session": sid, "ts": "2026-05-20T11:30:00Z"}),
+    )
+    .await;
+
+    let body = summary(&server, sid).await;
+    assert_eq!(body["summary"]["goal"].as_str().unwrap(), "new goal");
+    assert_eq!(body["summary"]["current_state"].as_str().unwrap(), "new state");
+}
+
+/// 404 for an unknown session — the categorizer relies on this to
+/// distinguish "CN has no data" from "CN said empty summary".
+#[tokio::test]
+async fn summary_unknown_session_returns_404() {
+    let server = make_server().await;
+    let res = server.get("/api/v1/sessions/cc-does-not-exist/summary").await;
+    assert_eq!(res.status_code(), 404, "unknown session must 404");
+}
