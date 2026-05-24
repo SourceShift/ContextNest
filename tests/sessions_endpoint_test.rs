@@ -247,3 +247,156 @@ async fn soft_deleted_fragment_excluded_from_count() {
         "last_ts reflects the surviving active fragment"
     );
 }
+
+// =============================================================================
+// Top-feature endpoint tests
+// =============================================================================
+
+/// Helper: hit GET /api/v1/sessions/:id/top-feature and return parsed JSON.
+async fn top_feature(server: &TestServer, session_id: &str) -> Value {
+    let res = server
+        .get(&format!("/api/v1/sessions/{session_id}/top-feature"))
+        .await;
+    res.assert_status_ok();
+    res.json()
+}
+
+/// A session with no Feature records returns top_feature: null and
+/// candidate_count: 0 — the contract z-dashboard relies on to decide
+/// "no anchor → fall back to project tag".
+#[tokio::test]
+async fn top_feature_no_features_returns_null() {
+    let server = make_server().await;
+
+    // Stash one non-feature fragment so the session exists.
+    store(
+        &server,
+        "cc-no-feat",
+        "just a plain accomplishment",
+        json!({
+            "kind": "accomplishment",
+            "src_session": "cc-no-feat",
+            "ts": "2026-05-20T10:00:00Z",
+        }),
+    )
+    .await;
+
+    let body = top_feature(&server, "cc-no-feat").await;
+    assert!(body["top_feature"].is_null(), "no features → null payload");
+    assert_eq!(body["candidate_count"].as_u64().unwrap(), 0);
+    assert_eq!(body["session_id"].as_str().unwrap(), "cc-no-feat");
+}
+
+/// When file_overlap is the only signal that distinguishes two features,
+/// the one whose declared files match files_touched wins.
+#[tokio::test]
+async fn top_feature_prefers_file_overlap() {
+    let server = make_server().await;
+
+    // files_touched for the session lists the file the WINNING feature claims.
+    store(
+        &server,
+        "cc-overlap",
+        "session touched 1 file(s)",
+        json!({
+            "kind": "files_touched",
+            "src_session": "cc-overlap",
+            "files": ["src/foo.rs"],
+            "ts": "2026-05-20T10:00:00Z",
+        }),
+    )
+    .await;
+
+    // Feature A: declares src/foo.rs → overlap = 1.0
+    store(
+        &server,
+        "cc-overlap",
+        "feature_with_overlap",
+        json!({
+            "kind": "feature",
+            "src_session": "cc-overlap",
+            "files": ["src/foo.rs"],
+            "ts": "2026-05-20T10:05:00Z",
+        }),
+    )
+    .await;
+
+    // Feature B: declares an unrelated file → overlap = 0
+    // Bumped to a later ts so recency alone would favour it; file_overlap
+    // weight (0.40) must beat the smaller recency delta to make this a
+    // real test of the overlap signal.
+    store(
+        &server,
+        "cc-overlap",
+        "feature_without_overlap",
+        json!({
+            "kind": "feature",
+            "src_session": "cc-overlap",
+            "files": ["unrelated/baz.rs"],
+            "ts": "2026-05-20T10:10:00Z",
+        }),
+    )
+    .await;
+
+    let body = top_feature(&server, "cc-overlap").await;
+    let top = &body["top_feature"];
+    assert_eq!(
+        top["feature"].as_str().unwrap(),
+        "feature_with_overlap",
+        "file_overlap should beat recency at default weights"
+    );
+    assert!(
+        top["file_overlap"].as_f64().unwrap() > 0.99,
+        "winner reports full overlap"
+    );
+    assert_eq!(body["candidate_count"].as_u64().unwrap(), 2);
+}
+
+/// Frequency (same feature name across multiple turns) should outweigh
+/// a single-shot feature with marginally better recency.
+#[tokio::test]
+async fn top_feature_prefers_repeated_feature() {
+    let server = make_server().await;
+
+    // Feature A appears 3 times → high freq signal.
+    for ts in [
+        "2026-05-20T10:00:00Z",
+        "2026-05-20T10:05:00Z",
+        "2026-05-20T10:10:00Z",
+    ] {
+        store(
+            &server,
+            "cc-freq",
+            "Repeated Feature",
+            json!({
+                "kind": "feature",
+                "src_session": "cc-freq",
+                "ts": ts,
+            }),
+        )
+        .await;
+    }
+
+    // Feature B once, later ts. No files on either side → file_overlap is
+    // 0 for both; the only discriminators are freq + recency.
+    store(
+        &server,
+        "cc-freq",
+        "Single Feature",
+        json!({
+            "kind": "feature",
+            "src_session": "cc-freq",
+            "ts": "2026-05-20T10:15:00Z",
+        }),
+    )
+    .await;
+
+    let body = top_feature(&server, "cc-freq").await;
+    let top = &body["top_feature"];
+    assert_eq!(
+        top["feature"].as_str().unwrap(),
+        "Repeated Feature",
+        "freq=3 should outscore freq=1 + slight recency lead at default weights"
+    );
+    assert_eq!(top["freq"].as_u64().unwrap(), 3);
+}

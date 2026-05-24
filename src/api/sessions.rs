@@ -10,7 +10,7 @@
 //! list UI routes.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::get,
@@ -598,6 +598,283 @@ pub async fn list_features(
     }))
 }
 
+// =============================================================================
+// `GET /api/v1/sessions/:id/top-feature`
+//
+// Returns the single highest-scoring `Feature` record for this session,
+// ranking every `delivered_features[]` entry the agent emitted against
+// the session's `files_touched` aggregate. The downstream consumer
+// (z-dashboard's categorize.ts) uses this as the anchor signal for
+// tab routing — features ship, goals drift.
+//
+// Score components (defaults; surfaced in the response for transparency):
+//   freq          0.35 · ln1p(count of records sharing this feature name)
+//   file_overlap  0.40 · |feature.files ∩ session.files_touched| / |feature.files|
+//   recency       0.15 · normalized 0..1 rank by ts within the session
+//   defs          0.05 · ln1p(len(metadata.defs))
+//   has_refs      0.05 · constant if feature carries PR/commit refs
+// =============================================================================
+//
+// Tie-break order on equal scores: recency desc, then feature text asc
+// (deterministic so the dashboard never flip-flops between two equally-
+// good features turn-to-turn).
+// =============================================================================
+
+/// Default ranking weights. Tunable later via config; kept as a struct
+/// (rather than free constants) so the response payload can echo back
+/// the exact weights that produced the score.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TopFeatureWeights {
+    pub freq: f32,
+    pub file_overlap: f32,
+    pub recency: f32,
+    pub defs: f32,
+    pub refs: f32,
+}
+
+impl Default for TopFeatureWeights {
+    fn default() -> Self {
+        Self {
+            freq: 0.35,
+            file_overlap: 0.40,
+            recency: 0.15,
+            defs: 0.05,
+            refs: 0.05,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopFeatureCandidate {
+    pub feature: String,
+    pub score: f32,
+    pub freq: u32,
+    pub file_overlap: f32,
+    pub recency: f32,
+    pub layer: Option<String>,
+    pub ts: Option<String>,
+    pub files: Vec<String>,
+    pub refs: Vec<Value>,
+    pub defs: Vec<String>,
+    pub how_to_test: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TopFeatureResponse {
+    pub session_id: String,
+    pub top_feature: Option<TopFeatureCandidate>,
+    pub candidate_count: usize,
+    pub weights: TopFeatureWeights,
+}
+
+pub async fn top_feature_for_session(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<TopFeatureResponse>, StatusCode> {
+    let weights = TopFeatureWeights::default();
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    // Pass 1: collect this session's Feature records + the session-level
+    // files_touched aggregate. Walking metadata once keeps this O(N) over
+    // the substrate, same complexity as the sibling handlers above.
+    struct RawFeature {
+        text: String,
+        ts: Option<String>,
+        files: Vec<String>,
+        refs: Vec<Value>,
+        layer: Option<String>,
+        defs: Vec<String>,
+        how_to_test: Option<String>,
+    }
+    let mut feats: Vec<RawFeature> = Vec::new();
+    let mut session_files: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        let src = meta.get("src_session").and_then(|v| v.as_str());
+        if src != Some(session_id.as_str()) {
+            continue;
+        }
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            "feature" => {
+                let text = texts.get(frag_id).cloned().unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let files: Vec<String> = meta
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let refs: Vec<Value> = meta
+                    .get("refs")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let layer = meta
+                    .get("layer")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let defs: Vec<String> = meta
+                    .get("defs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let how_to_test = meta
+                    .get("how_to_test")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let ts = meta
+                    .get("ts")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                feats.push(RawFeature {
+                    text,
+                    ts,
+                    files,
+                    refs,
+                    layer,
+                    defs,
+                    how_to_test,
+                });
+            }
+            "files_touched" => {
+                if let Some(arr) = meta.get("files").and_then(|v| v.as_array()) {
+                    for f in arr.iter().filter_map(|v| v.as_str()) {
+                        if !f.is_empty() {
+                            session_files.insert(f.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(texts);
+    drop(metadata);
+
+    if feats.is_empty() {
+        return Ok(Json(TopFeatureResponse {
+            session_id,
+            top_feature: None,
+            candidate_count: 0,
+            weights,
+        }));
+    }
+
+    // Pass 2: group by lowercased feature text for the freq signal.
+    // Lowercasing absorbs trivial casing drift across turns ("GET …" vs
+    // "Get …") without merging semantically-different features that
+    // happen to share a token.
+    let mut freq_by_key: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for f in &feats {
+        let key = f.text.to_lowercase();
+        *freq_by_key.entry(key).or_insert(0) += 1;
+    }
+
+    // Pass 3: assign recency rank from ts ordering. Empty ts sorts oldest.
+    // Single-record sessions get recency=1.0 (no ordering signal lost).
+    let mut indices: Vec<usize> = (0..feats.len()).collect();
+    indices.sort_by(|&a, &b| {
+        feats[a]
+            .ts
+            .as_deref()
+            .unwrap_or("")
+            .cmp(feats[b].ts.as_deref().unwrap_or(""))
+    });
+    let mut recency_rank = vec![0.0_f32; feats.len()];
+    let n = feats.len();
+    for (rank, &idx) in indices.iter().enumerate() {
+        recency_rank[idx] = if n == 1 {
+            1.0
+        } else {
+            rank as f32 / (n - 1) as f32
+        };
+    }
+
+    // Pass 4: score every candidate, find argmax.
+    let mut best: Option<(usize, f32, u32, f32)> = None;
+    for (i, f) in feats.iter().enumerate() {
+        let freq = *freq_by_key.get(&f.text.to_lowercase()).unwrap_or(&1);
+        let file_overlap = if f.files.is_empty() || session_files.is_empty() {
+            0.0
+        } else {
+            let hit = f
+                .files
+                .iter()
+                .filter(|p| session_files.contains(*p))
+                .count() as f32;
+            hit / f.files.len() as f32
+        };
+        let recency = recency_rank[i];
+        let defs_signal = (f.defs.len() as f32).ln_1p();
+        let has_refs = !f.refs.is_empty();
+        let score = weights.freq * (freq as f32).ln_1p()
+            + weights.file_overlap * file_overlap
+            + weights.recency * recency
+            + weights.defs * defs_signal
+            + if has_refs { weights.refs } else { 0.0 };
+        let candidate = (i, score, freq, file_overlap);
+        best = Some(match best {
+            None => candidate,
+            Some(prev) => {
+                // Tiebreak: higher score wins; on equal score prefer
+                // higher recency; on equal recency prefer lexicographically
+                // smaller text for deterministic output.
+                if score > prev.1 {
+                    candidate
+                } else if (score - prev.1).abs() < f32::EPSILON {
+                    if recency > recency_rank[prev.0] {
+                        candidate
+                    } else if (recency - recency_rank[prev.0]).abs() < f32::EPSILON
+                        && f.text < feats[prev.0].text
+                    {
+                        candidate
+                    } else {
+                        prev
+                    }
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+
+    let (best_idx, best_score, best_freq, best_overlap) = best.expect("non-empty feats");
+    let chosen = &feats[best_idx];
+    let top = TopFeatureCandidate {
+        feature: chosen.text.clone(),
+        score: best_score,
+        freq: best_freq,
+        file_overlap: best_overlap,
+        recency: recency_rank[best_idx],
+        layer: chosen.layer.clone(),
+        ts: chosen.ts.clone(),
+        files: chosen.files.clone(),
+        refs: chosen.refs.clone(),
+        defs: chosen.defs.clone(),
+        how_to_test: chosen.how_to_test.clone(),
+    };
+
+    Ok(Json(TopFeatureResponse {
+        session_id,
+        top_feature: Some(top),
+        candidate_count: feats.len(),
+        weights,
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
@@ -605,5 +882,9 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/by-file", get(sessions_by_file))
         .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
+        .route(
+            "/api/v1/sessions/:id/top-feature",
+            get(top_feature_for_session),
+        )
         .route("/api/v1/features", get(list_features))
 }
