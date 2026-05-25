@@ -69,7 +69,7 @@ tree-sitter-rust = "0.24"
 # Configuration
 config = "0.15"
 dotenvy = "0.15"
-toml = "0.8"
+toml = "1.1"
 
 # Logging
 tracing = "0.1"
