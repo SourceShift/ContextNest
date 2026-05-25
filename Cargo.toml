@@ -63,7 +63,7 @@ serde_json = "1.0"
 neo4rs = "0.9.0-rc.6"  # Neo4j driver
 
 # Parser
-tree-sitter = "0.20"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 
 # Configuration
