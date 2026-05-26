@@ -823,7 +823,7 @@ impl NeuralField {
             } => {
                 // Simplified genetic algorithm
                 if self.patterns.len() > 1 && rand::random::<f32>() < *mutation_rate {
-                    let idx = rand::random::<usize>() % self.patterns.len();
+                    let idx = rand::random_range(0..self.patterns.len());
                     self.patterns[idx].strength = rand::random::<f32>();
                 }
             }

@@ -717,10 +717,10 @@ impl ProductionKeyManager {
 
     /// Generate AES key
     async fn generate_aes_key(&self, key_size: u16) -> ContextNestResult<Vec<u8>> {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let mut key = vec![0u8; key_size as usize / 8];
-        rng.fill_bytes(&mut key);
+        rng.fill(&mut key);
         Ok(key)
     }
 
@@ -729,8 +729,9 @@ impl ProductionKeyManager {
         // In production, use proper RSA key generation
         // This is a placeholder implementation
         use rsa::{pkcs8::EncodePrivateKey, RsaPrivateKey};
+        let mut rng = rsa::rand_core::OsRng;
 
-        let private_key = RsaPrivateKey::new(&mut rand::thread_rng(), key_size as usize)
+        let private_key = RsaPrivateKey::new(&mut rng, key_size as usize)
             .map_err(|e| ContextNestError::Crypto(format!("RSA key generation failed: {}", e)))?;
 
         private_key
@@ -743,8 +744,9 @@ impl ProductionKeyManager {
     async fn generate_ecdsa_key(&self, key_size: u16) -> ContextNestResult<Vec<u8>> {
         use elliptic_curve::pkcs8::EncodePrivateKey;
         use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::rand_core::OsRng;
 
-        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let signing_key = SigningKey::random(&mut OsRng);
 
         signing_key
             .to_pkcs8_der()
@@ -755,21 +757,21 @@ impl ProductionKeyManager {
     /// Generate EdDSA key
     async fn generate_eddsa_key(&self, _key_size: u16) -> ContextNestResult<Vec<u8>> {
         use ed25519_dalek::SigningKey;
-        use rand::RngCore;
+        use rand::RngExt;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut seed = [0u8; 32];
-        rng.fill_bytes(&mut seed);
+        rng.fill(&mut seed);
         let signing_key = SigningKey::from_bytes(&seed);
         Ok(signing_key.to_bytes().to_vec())
     }
 
     /// Generate HMAC key
     async fn generate_hmac_key(&self, key_size: u16) -> ContextNestResult<Vec<u8>> {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let mut key = vec![0u8; key_size as usize / 8];
-        rng.fill_bytes(&mut key);
+        rng.fill(&mut key);
         Ok(key)
     }
 

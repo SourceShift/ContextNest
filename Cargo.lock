@@ -708,7 +708,7 @@ dependencies = [
  "p256",
  "parking_lot",
  "proptest",
- "rand 0.8.6",
+ "rand 0.10.1",
  "redis",
  "regex",
  "reqwest 0.11.27",

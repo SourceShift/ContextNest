@@ -223,8 +223,8 @@ impl FieldProjector {
         &self,
         config: &ProjectionConfig,
     ) -> ContextNestResult<ProjectionMatrix> {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
 
         let mut matrix = Vec::with_capacity(config.target_dim);
         let scale = (config.source_dim as f32).sqrt().recip();
@@ -233,7 +233,7 @@ impl FieldProjector {
             let mut row = Vec::with_capacity(config.source_dim);
             for _ in 0..config.source_dim {
                 // Use Gaussian random values scaled appropriately
-                let val: f32 = rng.gen_range(-1.0..1.0) * scale;
+                let val: f32 = rng.random_range(-1.0..1.0) * scale;
                 row.push(val);
             }
             matrix.push(row);

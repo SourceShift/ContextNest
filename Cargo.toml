@@ -111,7 +111,7 @@ redis = { version = "0.24", features = ["tokio-comp", "connection-manager"], opt
 validator = { version = "0.18", features = ["derive"] }
 
 # Cryptographic utilities
-rand = "0.8"
+rand = "0.10"
 base64 = "0.21"
 hex = "0.4"
 
