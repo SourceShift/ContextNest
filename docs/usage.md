@@ -100,7 +100,7 @@ curl -s -X POST http://localhost:8080/api/v1/tools/retrieve \
   -d '{
     "query": "what does Claude need from me?",
     "top_k": 50,
-    "session_id": "cc-abc12345",
+    "session_id": "abc12345-1234-5678-90ab-cdef01234567",
     "metadata_filter": {
       "kind": "user_action",
       "urgency": "now"
@@ -112,7 +112,7 @@ curl -s -X POST http://localhost:8080/api/v1/tools/retrieve \
   -d '{
     "query": "open decisions",
     "top_k": 20,
-    "session_id": "cc-abc12345",
+    "session_id": "abc12345-1234-5678-90ab-cdef01234567",
     "metadata_filter": {
       "kind": "decision",
       "awaiting_decision": true
@@ -160,7 +160,7 @@ contextnest inbox --project ContextNest
 contextnest inbox --urgency now
 
 # One specific session:
-contextnest inbox --session-id cc-4c998114
+contextnest inbox --session-id 4c998114-1234-5678-90ab-cdef01234567
 
 # Machine-readable (pipe into jq / scripts):
 contextnest inbox --json | jq '.[] | select(.urgency=="now")'

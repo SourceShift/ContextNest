@@ -62,7 +62,7 @@ async fn push_feature(
         kind: MemoryKind::Feature,
         text: feature.to_string(),
         importance: 0.90,
-        session_id_cn: format!("cc-{session_uuid}"),
+        session_id_cn: session_uuid.to_string(),
         metadata: meta,
     };
     sink.store(&record).await.unwrap();
