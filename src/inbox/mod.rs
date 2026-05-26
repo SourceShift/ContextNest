@@ -15,7 +15,7 @@ use serde_json::Value;
 /// One thing the user is waiting on, surfaced from a stored memory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InboxItem {
-    /// Substrate session id (`cc-<8char>`).
+    /// Substrate session id — the bare Claude Code session UUID.
     pub session_id: String,
     /// Reconstructed project path. Empty when not stored.
     pub project_cwd: String,
@@ -35,9 +35,9 @@ pub struct InboxItem {
     /// ISO 8601 timestamp from the original event. Used for tiebreaking
     /// sort within the same urgency bucket.
     pub timestamp: String,
-    /// Originating Claude Code session UUID (full, not the `cc-<8char>`
-    /// substrate id). Lets the user `cd` to the right transcript on
-    /// disk if they want to read the full context.
+    /// Originating Claude Code session UUID. Since the substrate
+    /// `session_id` is now the bare UUID, this is the same value;
+    /// kept for backward-compat with the JSON payload.
     pub src_session_uuid: String,
 }
 
@@ -105,12 +105,12 @@ impl InboxItem {
                 .or_else(|| {
                     // Fallback — when the response shape doesn't carry
                     // session_id at the top, derive it from the
-                    // src_session uuid. Substrate canonical form is
-                    // `cc-<full-uuid>` (no truncation).
+                    // src_session uuid. The substrate canonical form is
+                    // the bare Claude Code session UUID.
                     metadata
                         .get("src_session")
                         .and_then(|v| v.as_str())
-                        .map(|uuid| format!("cc-{uuid}"))
+                        .map(|uuid| uuid.to_string())
                 })
                 .unwrap_or_else(|| "unknown".to_string()),
             project_cwd: metadata
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn parses_user_action_hit_into_item() {
         let hit = user_action_hit(
-            "cc-abc12345",
+            "abc12345",
             "/work/ContextNest",
             "Reload page",
             "now",
@@ -316,13 +316,13 @@ mod tests {
         assert_eq!(it.content, "Reload page");
         assert_eq!(it.reason, "picks up new bundle");
         assert_eq!(it.project_cwd, "/work/ContextNest");
-        assert_eq!(it.session_id, "cc-abc12345");
+        assert_eq!(it.session_id, "abc12345");
     }
 
     #[test]
     fn parses_decision_hit_with_implicit_now_urgency() {
         let hit = decision_hit(
-            "cc-abc12345",
+            "abc12345",
             "/work/X",
             "Does the menu open?",
             "2026-05-20T11:00:00Z",
@@ -394,7 +394,7 @@ mod tests {
     fn render_text_groups_by_session_and_shows_urgency() {
         let items = vec![
             InboxItem::from_hit(&user_action_hit(
-                "cc-aaa11111",
+                "aaa11111",
                 "/work/A",
                 "Click button",
                 "now",
@@ -404,14 +404,14 @@ mod tests {
             ))
             .unwrap(),
             InboxItem::from_hit(&decision_hit(
-                "cc-aaa11111",
+                "aaa11111",
                 "/work/A",
                 "Does it work?",
                 "2026-05-20T10:05:00Z",
             ))
             .unwrap(),
             InboxItem::from_hit(&user_action_hit(
-                "cc-bbb22222",
+                "bbb22222",
                 "/work/B",
                 "Run cargo test",
                 "later",
@@ -424,16 +424,16 @@ mod tests {
 
         let rendered = render_text(&items);
         assert!(rendered.contains("📋 ContextNest"));
-        assert!(rendered.contains("session-cc-aaa11111"));
-        assert!(rendered.contains("session-cc-bbb22222"));
+        assert!(rendered.contains("session-aaa11111"));
+        assert!(rendered.contains("session-bbb22222"));
         assert!(rendered.contains("Click button"));
         assert!(rendered.contains("→ fires the thing"));
         assert!(rendered.contains("❓ Confirm: Does it work?"));
 
-        // The "now" session (cc-aaa11111) should appear BEFORE the
-        // "later" session (cc-bbb22222) — urgency drives session order.
-        let aaa = rendered.find("cc-aaa11111").unwrap();
-        let bbb = rendered.find("cc-bbb22222").unwrap();
+        // The "now" session (aaa11111) should appear BEFORE the
+        // "later" session (bbb22222) — urgency drives session order.
+        let aaa = rendered.find("aaa11111").unwrap();
+        let bbb = rendered.find("bbb22222").unwrap();
         assert!(
             aaa < bbb,
             "session with urgency=now should appear before session with urgency=later"
@@ -450,7 +450,7 @@ mod tests {
     fn render_json_is_valid_array() {
         let items =
             vec![
-                InboxItem::from_hit(&user_action_hit("cc-x", "/p", "a", "now", 1, "r", "t"))
+                InboxItem::from_hit(&user_action_hit("x-sess", "/p", "a", "now", 1, "r", "t"))
                     .unwrap(),
             ];
         let s = render_json(&items).unwrap();

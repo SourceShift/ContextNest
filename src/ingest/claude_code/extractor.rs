@@ -141,17 +141,15 @@ impl MemoryRecord {
 ///
 /// `session_uuid` is the full Claude Code session UUID. `project_cwd` is
 /// the reconstructed project path (empty string if unknown). The substrate
-/// session id is `cc-<full-uuid>` — the `cc-` prefix tags the ingest
-/// source (Claude Code) and the full UUID guarantees no aliasing across
-/// sessions whose UUIDs happen to share their first 8 chars. The old
-/// `cc-<first-8>` form is migrated to this canonical shape at WAL
+/// session id is the bare UUID — the older `cc-<uuid>` and
+/// `cc-<first-8>` forms are migrated to the bare-UUID shape at WAL
 /// replay time (see `bootstrap_wal` in `bin/contextnest.rs`).
 pub fn extract_memories(
     events: &[RawEvent],
     session_uuid: &str,
     project_cwd: &str,
 ) -> Vec<MemoryRecord> {
-    let cn_session_id = format!("cc-{session_uuid}");
+    let cn_session_id = session_uuid.to_string();
     let mut out = Vec::new();
 
     // 1. session_title from the first non-empty ai-title.
@@ -864,15 +862,14 @@ mod tests {
         );
         assert!(decision.metadata.contains_key("decision_text"));
 
-        // CN session id is `cc-<full-uuid>` — no truncation, no aliasing.
-        assert_eq!(decision.session_id_cn, "cc-sess-1-very-long-uuid");
+        // CN session id is the bare Claude Code UUID — no prefix, no truncation.
+        assert_eq!(decision.session_id_cn, "sess-1-very-long-uuid");
         for r in &recs {
             assert!(
-                r.session_id_cn.starts_with("cc-"),
-                "session id starts with cc-"
+                !r.session_id_cn.starts_with("cc-"),
+                "session id should not carry the legacy cc- prefix"
             );
-            // Suffix is the entire uuid, byte-for-byte.
-            assert_eq!(&r.session_id_cn["cc-".len()..], "sess-1-very-long-uuid");
+            assert_eq!(r.session_id_cn, "sess-1-very-long-uuid");
         }
 
         // Every memory carries kind + src_session metadata
@@ -907,7 +904,7 @@ mod tests {
         // edge case: shorter than 8 chars
         let recs = extract_memories(&[ev_ai_title("title here")], "abc", "");
         assert!(!recs.is_empty());
-        // CN session id should be "cc-abc" (truncated at uuid length, not panicking)
-        assert_eq!(recs[0].session_id_cn, "cc-abc");
+        // CN session id mirrors the raw uuid byte-for-byte (no prefix).
+        assert_eq!(recs[0].session_id_cn, "abc");
     }
 }

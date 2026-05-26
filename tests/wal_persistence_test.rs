@@ -37,7 +37,7 @@ async fn store_appends_record_to_wal() {
         .json(&json!({
             "content": "first fragment from handler",
             "importance": 0.8,
-            "session_id": "cc-wal",
+            "session_id": "sess-wal",
             "metadata": {"kind": "user_action", "urgency": "now"},
         }))
         .await;
@@ -56,7 +56,7 @@ async fn store_appends_record_to_wal() {
             metadata,
         } => {
             assert_eq!(fragment_id, &frag_id);
-            assert_eq!(session_id, "cc-wal");
+            assert_eq!(session_id, "sess-wal");
             assert_eq!(content, "first fragment from handler");
             assert!((*importance - 0.8).abs() < 1e-6);
             assert_eq!(metadata.get("kind").unwrap(), &json!("user_action"));
@@ -94,7 +94,7 @@ async fn replay_restores_state_visible_to_inbox_endpoint() {
                 .json(&json!({
                     "content": content,
                     "importance": 0.5,
-                    "session_id": "cc-restart",
+                    "session_id": "sess-restart",
                     "metadata": meta,
                 }))
                 .await;
@@ -151,7 +151,7 @@ async fn replay_restores_state_visible_to_inbox_endpoint() {
     // the round-trip via the universal retrieve surface.
     let res: Value = server
         .post("/api/v1/tools/retrieve")
-        .json(&json!({"query": "anything", "session_id": "cc-restart", "top_k": 50}))
+        .json(&json!({"query": "anything", "session_id": "sess-restart", "top_k": 50}))
         .await
         .json();
     let hits = res["hits"].as_array().expect("hits");
@@ -178,7 +178,7 @@ async fn replay_is_idempotent_when_run_twice() {
                 .post("/api/v1/tools/store")
                 .json(&json!({
                     "content": format!("frag {i}"),
-                    "session_id": "cc-idem",
+                    "session_id": "sess-idem",
                     "metadata": {"kind": "user_action"},
                 }))
                 .await
@@ -222,7 +222,7 @@ async fn replay_is_idempotent_when_run_twice() {
     let server = TestServer::new(app).unwrap();
     let res: Value = server
         .post("/api/v1/tools/retrieve")
-        .json(&json!({"query": "frag", "session_id": "cc-idem", "top_k": 50}))
+        .json(&json!({"query": "frag", "session_id": "sess-idem", "top_k": 50}))
         .await
         .json();
     assert_eq!(
@@ -251,7 +251,7 @@ async fn live_hook_ingest_via_services_sink_writes_to_wal() {
         kind: MemoryKind::UserAction,
         text: "deploy the WAL gap fix to production".to_string(),
         importance: 0.7,
-        session_id_cn: "cc-livehook".to_string(),
+        session_id_cn: "sess-livehook".to_string(),
         metadata: HashMap::from([
             ("kind".to_string(), json!("user_action")),
             ("urgency".to_string(), json!("now")),
@@ -274,7 +274,7 @@ async fn live_hook_ingest_via_services_sink_writes_to_wal() {
             metadata,
             ..
         } => {
-            assert_eq!(session_id, "cc-livehook");
+            assert_eq!(session_id, "sess-livehook");
             assert_eq!(content, "deploy the WAL gap fix to production");
             assert_eq!(metadata.get("kind").unwrap(), &json!("user_action"));
         }
@@ -293,7 +293,7 @@ async fn sidecars_only_replay_restores_active_fragments() {
     let records = vec![
         (
             "frag-todo".to_string(),
-            "cc-fast".to_string(),
+            "sess-fast".to_string(),
             "ship the WAL fix".to_string(),
             std::collections::HashMap::from([
                 ("kind".to_string(), json!("todo")),
@@ -302,7 +302,7 @@ async fn sidecars_only_replay_restores_active_fragments() {
         ),
         (
             "frag-action".to_string(),
-            "cc-fast".to_string(),
+            "sess-fast".to_string(),
             "verify replay end-to-end".to_string(),
             std::collections::HashMap::from([
                 ("kind".to_string(), json!("user_action")),
@@ -311,7 +311,7 @@ async fn sidecars_only_replay_restores_active_fragments() {
         ),
         (
             "frag-learning".to_string(),
-            "cc-fast".to_string(),
+            "sess-fast".to_string(),
             "another fragment".to_string(),
             std::collections::HashMap::from([("kind".to_string(), json!("learning"))]),
         ),
@@ -328,7 +328,7 @@ async fn sidecars_only_replay_restores_active_fragments() {
     // "returns empty" semantics broke the dashboard's per-kind sections.
     let res: Value = server
         .post("/api/v1/tools/retrieve")
-        .json(&json!({"query": "anything", "session_id": "cc-fast", "top_k": 50}))
+        .json(&json!({"query": "anything", "session_id": "sess-fast", "top_k": 50}))
         .await
         .json();
     let hits = res["hits"].as_array().unwrap();
@@ -367,19 +367,19 @@ async fn retrieve_with_metadata_filter_works_on_sidecar_only_substrate() {
         vec![
             (
                 "f1".to_string(),
-                "cc-filter".to_string(),
+                "sess-filter".to_string(),
                 "do the migration".to_string(),
                 std::collections::HashMap::from([("kind".to_string(), json!("todo"))]),
             ),
             (
                 "f2".to_string(),
-                "cc-filter".to_string(),
+                "sess-filter".to_string(),
                 "learned something".to_string(),
                 std::collections::HashMap::from([("kind".to_string(), json!("learning"))]),
             ),
             (
                 "f3".to_string(),
-                "cc-filter".to_string(),
+                "sess-filter".to_string(),
                 "another todo".to_string(),
                 std::collections::HashMap::from([("kind".to_string(), json!("todo"))]),
             ),
@@ -393,7 +393,7 @@ async fn retrieve_with_metadata_filter_works_on_sidecar_only_substrate() {
         .post("/api/v1/tools/retrieve")
         .json(&json!({
             "query": "todo",
-            "session_id": "cc-filter",
+            "session_id": "sess-filter",
             "top_k": 50,
             "metadata_filter": {"kind": "todo"},
         }))
@@ -411,21 +411,23 @@ async fn retrieve_with_metadata_filter_works_on_sidecar_only_substrate() {
 }
 
 #[tokio::test]
-async fn migration_rewrites_short_session_ids_to_full_uuid() {
-    use contextnest::services::wal::migrate_short_session_ids;
+async fn migration_rewrites_legacy_session_ids_to_bare_uuid() {
+    use contextnest::services::wal::migrate_legacy_session_ids;
 
     let dir = tempdir().unwrap();
     let wal_path = dir.path().join("wal.jsonl");
 
-    // Hand-craft a WAL that mimics what an old build would have written:
-    // one short-form `cc-9b8a1f3e` record carrying the full uuid in
-    // metadata.src_session, plus one long-form record (already migrated),
-    // plus one short-form record WITHOUT src_session (should be skipped).
+    // Hand-craft a WAL that mimics every legacy shape the migrator must
+    // handle: an old short-form `cc-9b8a1f3e` carrying the full UUID in
+    // metadata.src_session, a long-form `cc-<full-uuid>` (drop the prefix),
+    // a bare UUID (already migrated, pass through), and a short-form
+    // WITHOUT src_session (skip — operator must investigate).
     let writer = Wal::open_for_append(wal_path.clone()).unwrap();
     let full_uuid = "9b8a1f3e-51e2-bc40-89ab-cdef01234567";
+    let bare_uuid = "abcdef01-2345-6789-abcd-ef0123456789";
     writer
         .append(&WalRecord::Store {
-            fragment_id: "frag-old".into(),
+            fragment_id: "frag-short".into(),
             session_id: "cc-9b8a1f3e".into(),
             content: "old short-form record".into(),
             importance: 0.5,
@@ -434,11 +436,20 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
         .unwrap();
     writer
         .append(&WalRecord::Store {
-            fragment_id: "frag-new".into(),
+            fragment_id: "frag-long".into(),
             session_id: format!("cc-{full_uuid}"),
-            content: "already-canonical record".into(),
+            content: "long-form cc- record".into(),
             importance: 0.5,
             metadata: HashMap::from([("src_session".to_string(), json!(full_uuid))]),
+        })
+        .unwrap();
+    writer
+        .append(&WalRecord::Store {
+            fragment_id: "frag-bare".into(),
+            session_id: bare_uuid.to_string(),
+            content: "already bare-uuid".into(),
+            importance: 0.5,
+            metadata: HashMap::new(),
         })
         .unwrap();
     writer
@@ -453,17 +464,22 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
     drop(writer);
 
     let records = Wal::read_records(&wal_path).unwrap();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
 
     let (migrated_records, report) =
-        migrate_short_session_ids(&wal_path, records).expect("migration ok");
+        migrate_legacy_session_ids(&wal_path, records).expect("migration ok");
 
-    // Migration report shape: 1 rewrite, 1 untouched orphan, 1 already-long.
-    assert_eq!(report.migrated, 1, "exactly one short-form was rewritten");
-    assert_eq!(report.skipped_no_src_session, 1, "orphan was skipped");
+    // Two records migrated (short-form expanded, long-form stripped), one
+    // bare-UUID untouched, one orphan skipped for lack of src_session.
+    assert_eq!(
+        report.migrated, 2,
+        "short-form + long-form both rewritten to bare UUID"
+    );
+    assert_eq!(
+        report.skipped_no_src_session, 1,
+        "orphan was skipped — no oracle"
+    );
 
-    // In-memory records: the short-form became long-form, others
-    // unchanged.
     let by_id: HashMap<_, _> = migrated_records
         .iter()
         .map(|r| match r {
@@ -474,8 +490,9 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
             } => (fragment_id.clone(), session_id.clone()),
         })
         .collect();
-    assert_eq!(by_id["frag-old"], format!("cc-{full_uuid}"));
-    assert_eq!(by_id["frag-new"], format!("cc-{full_uuid}"));
+    assert_eq!(by_id["frag-short"], full_uuid);
+    assert_eq!(by_id["frag-long"], full_uuid);
+    assert_eq!(by_id["frag-bare"], bare_uuid);
     assert_eq!(by_id["frag-orphan"], "cc-deadbeef");
 
     // On-disk WAL rewritten: re-read and confirm.
@@ -486,11 +503,16 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
             WalRecord::Store { session_id, .. } => session_id.clone(),
         })
         .collect();
-    assert!(after_session_ids.contains(&format!("cc-{full_uuid}")));
+    assert!(after_session_ids.contains(&full_uuid.to_string()));
+    assert!(after_session_ids.contains(&bare_uuid.to_string()));
     assert!(after_session_ids.contains(&"cc-deadbeef".to_string()));
     assert!(
         !after_session_ids.contains(&"cc-9b8a1f3e".to_string()),
         "short-form must be gone from disk",
+    );
+    assert!(
+        !after_session_ids.contains(&format!("cc-{full_uuid}")),
+        "long-form cc- prefix must be gone from disk",
     );
 
     // .bak recovery breadcrumb exists and still has the pre-migration data.
@@ -503,9 +525,10 @@ async fn migration_rewrites_short_session_ids_to_full_uuid() {
         })
         .collect();
     assert!(bak_session_ids.contains(&"cc-9b8a1f3e".to_string()));
+    assert!(bak_session_ids.contains(&format!("cc-{full_uuid}")));
 
     // Re-running the migration is a no-op (idempotent).
-    let (_, second) = migrate_short_session_ids(&wal_path, Wal::read_records(&wal_path).unwrap())
+    let (_, second) = migrate_legacy_session_ids(&wal_path, Wal::read_records(&wal_path).unwrap())
         .expect("idempotent rerun");
     assert_eq!(second.migrated, 0, "second pass must migrate nothing");
 }
