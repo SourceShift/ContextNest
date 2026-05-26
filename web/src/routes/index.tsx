@@ -20,9 +20,23 @@ export const Route = createFileRoute('/')({
 
 const URG_RANK: Record<Urgency, number> = { now: 0, soon: 1, later: 2 };
 
+type SortMode = 'newest' | 'oldest' | 'urgency';
+type KindFilter = 'all' | 'user_action' | 'decision';
+
+// Parse the stored ISO ts to epoch ms. Missing/invalid → -Infinity so it
+// sorts last under 'newest' (newest first) and first under 'oldest'.
+function tsMs(stored: string): number {
+  if (!stored) return -Infinity;
+  const t = Date.parse(stored);
+  return Number.isFinite(t) ? t : -Infinity;
+}
+
 function InboxPage() {
   const [urgFilter, setUrgFilter] = useState<'all' | Urgency>('all');
   const [projFilter, setProjFilter] = useState<string>('all');
+  const [sessionFilter, setSessionFilter] = useState<string>('all');
+  const [kindFilter, setKindFilter] = useState<KindFilter>('all');
+  const [sortMode, setSortMode] = useState<SortMode>('newest');
   const [ackedIds, setAckedIds] = useState<Set<string>>(new Set());
 
   const { data: inboxData, isLoading, isError, error, refetch } = useInbox();
@@ -35,9 +49,11 @@ function InboxPage() {
       inboxData.filter((it) => {
         if (urgFilter !== 'all' && it.urgency !== urgFilter) return false;
         if (projFilter !== 'all' && it.project !== projFilter) return false;
+        if (sessionFilter !== 'all' && it.sessionId !== sessionFilter) return false;
+        if (kindFilter !== 'all' && it.kind !== kindFilter) return false;
         return true;
       }),
-    [inboxData, urgFilter, projFilter],
+    [inboxData, urgFilter, projFilter, sessionFilter, kindFilter],
   );
 
   const counts = useMemo(
@@ -50,18 +66,49 @@ function InboxPage() {
     [inboxData],
   );
 
+  const kindCounts = useMemo(
+    () => ({
+      all: inboxData.length,
+      user_action: inboxData.filter((i) => i.kind === 'user_action').length,
+      decision: inboxData.filter((i) => i.kind === 'decision').length,
+    }),
+    [inboxData],
+  );
+
+  // Flat sorted list — used by 'newest' / 'oldest' modes.
+  const flatItems = useMemo(() => {
+    const arr = filteredItems.slice();
+    if (sortMode === 'newest') {
+      arr.sort((a, b) => tsMs(b.stored) - tsMs(a.stored) || a.id.localeCompare(b.id));
+    } else if (sortMode === 'oldest') {
+      arr.sort((a, b) => tsMs(a.stored) - tsMs(b.stored) || a.id.localeCompare(b.id));
+    }
+    return arr;
+  }, [filteredItems, sortMode]);
+
+  // Grouped-by-session view — used by 'urgency' mode (legacy triage layout).
+  // Within each session: urgency rank → step → ts desc.
+  // Across sessions: min(urgency rank) → newest ts in group.
   const { grouped, sessionOrder } = useMemo(() => {
     const g: Record<string, InboxItemMock[]> = {};
     for (const it of filteredItems) {
       (g[it.sessionId] ||= []).push(it);
     }
     Object.values(g).forEach((arr) =>
-      arr.sort((a, b) => URG_RANK[a.urgency] - URG_RANK[b.urgency] || a.step - b.step),
+      arr.sort(
+        (a, b) =>
+          URG_RANK[a.urgency] - URG_RANK[b.urgency] ||
+          a.step - b.step ||
+          tsMs(b.stored) - tsMs(a.stored),
+      ),
     );
     const order = Object.keys(g).sort((a, b) => {
       const ra = Math.min(...g[a].map((x) => URG_RANK[x.urgency]));
       const rb = Math.min(...g[b].map((x) => URG_RANK[x.urgency]));
-      return ra - rb;
+      if (ra !== rb) return ra - rb;
+      const ta = Math.max(...g[a].map((x) => tsMs(x.stored)));
+      const tb = Math.max(...g[b].map((x) => tsMs(x.stored)));
+      return tb - ta;
     });
     return { grouped: g, sessionOrder: order };
   }, [filteredItems]);
@@ -80,6 +127,28 @@ function InboxPage() {
     () => Array.from(new Set([...knownProjects, ...inboxProjects])).sort(),
     [knownProjects, inboxProjects],
   );
+
+  // Session-id dropdown options: every session that contributes to the
+  // CURRENT (project+urgency+kind)-filtered view, ordered newest-first by
+  // the freshest item in that session.
+  const sessionOptions = useMemo(() => {
+    const preSession = inboxData.filter((it) => {
+      if (urgFilter !== 'all' && it.urgency !== urgFilter) return false;
+      if (projFilter !== 'all' && it.project !== projFilter) return false;
+      if (kindFilter !== 'all' && it.kind !== kindFilter) return false;
+      return true;
+    });
+    const freshness: Record<string, number> = {};
+    for (const it of preSession) {
+      const t = tsMs(it.stored);
+      if (!(it.sessionId in freshness) || t > freshness[it.sessionId]) {
+        freshness[it.sessionId] = t;
+      }
+    }
+    return Object.entries(freshness)
+      .sort((a, b) => b[1] - a[1])
+      .map(([id]) => id);
+  }, [inboxData, urgFilter, projFilter, kindFilter]);
 
   const ack = (id: string) => setAckedIds((prev) => new Set(prev).add(id));
 
@@ -117,7 +186,27 @@ function InboxPage() {
             </button>
           ))}
         </div>
+        <div className="tabs" style={{ marginLeft: 8 }}>
+          {(['all', 'user_action', 'decision'] as const).map((k) => (
+            <button
+              key={k}
+              className={kindFilter === k ? 'active' : ''}
+              onClick={() => setKindFilter(k)}
+              type="button"
+              title={k === 'all' ? 'All kinds' : `kind = ${k}`}
+            >
+              {k === 'all' ? 'All kinds' : k.replace('_', ' ')}{' '}
+              <span className="pill">{kindCounts[k]}</span>
+            </button>
+          ))}
+        </div>
         <div className="grow" />
+        <SortSelect value={sortMode} onChange={setSortMode} />
+        <SessionSelect
+          value={sessionFilter}
+          onChange={setSessionFilter}
+          options={sessionOptions}
+        />
         <ProjectSelect value={projFilter} onChange={setProjFilter} options={projects} />
       </div>
 
@@ -147,14 +236,20 @@ function InboxPage() {
         </div>
       )}
 
-      {!showSkeleton && !isError && sessionOrder.length === 0 && (
-        <div className="empty with-card">
-          <div className="empty-title">Nothing matches this filter</div>
-          <div className="empty-body">Clear the urgency or project filter to see more items.</div>
-        </div>
-      )}
+      {!showSkeleton &&
+        !isError &&
+        ((sortMode === 'urgency' && sessionOrder.length === 0) ||
+          (sortMode !== 'urgency' && flatItems.length === 0)) && (
+          <div className="empty with-card">
+            <div className="empty-title">Nothing matches this filter</div>
+            <div className="empty-body">
+              Clear urgency / kind / session / project filters to see more items.
+            </div>
+          </div>
+        )}
 
       {!showSkeleton &&
+        sortMode === 'urgency' &&
         sessionOrder.map((sid) => {
           const sessionItem = inboxData.find((i) => i.sessionId === sid);
           return (
@@ -170,6 +265,151 @@ function InboxPage() {
             </div>
           );
         })}
+
+      {!showSkeleton &&
+        sortMode !== 'urgency' &&
+        flatItems.map((it) => (
+          <InboxCard key={it.id} item={it} ack={ack} acked={ackedIds.has(it.id)} />
+        ))}
+    </div>
+  );
+}
+
+function SortSelect({
+  value,
+  onChange,
+}: {
+  value: SortMode;
+  onChange: (v: SortMode) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const label: Record<SortMode, string> = {
+    newest: 'newest first',
+    oldest: 'oldest first',
+    urgency: 'urgency (grouped)',
+  };
+  return (
+    <div style={{ position: 'relative' }}>
+      <button className="btn" onClick={() => setOpen((o) => !o)} type="button" title="Sort order">
+        <Icon.Clock className="ic" />
+        <span>
+          sort: <span className="mono">{label[value]}</span>
+        </span>
+        <Icon.Chevron style={{ transform: 'rotate(90deg)', color: 'var(--ink-faint)' }} />
+      </button>
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            right: 0,
+            top: 'calc(100% + 4px)',
+            background: 'var(--surface-2)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: 4,
+            minWidth: 200,
+            zIndex: 10,
+            boxShadow: 'var(--shadow-pop)',
+          }}
+        >
+          {(['newest', 'oldest', 'urgency'] as const).map((m) => (
+            <div
+              key={m}
+              onClick={() => {
+                onChange(m);
+                setOpen(false);
+              }}
+              style={{
+                padding: '6px 10px',
+                borderRadius: 4,
+                cursor: 'pointer',
+                background: value === m ? 'var(--surface-3)' : 'transparent',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 12,
+                color: value === m ? 'var(--ink)' : 'var(--ink-muted)',
+              }}
+            >
+              {label[m]}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SessionSelect({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  options: string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const short = (id: string) => {
+    if (id === 'all') return 'all';
+    // cc-46d752ff-1933-4088-8af8-a44c106af45a -> cc-46d752ff…f45a
+    const stripped = id.replace(/^cc-/, '');
+    const head = stripped.slice(0, 8);
+    const tail = stripped.slice(-4);
+    return `cc-${head}…${tail}`;
+  };
+  return (
+    <div style={{ position: 'relative' }}>
+      <button
+        className="btn"
+        onClick={() => setOpen((o) => !o)}
+        type="button"
+        title="Filter by session"
+      >
+        <Icon.ArrowRight className="ic" />
+        <span>
+          session: <span className="mono">{short(value)}</span>
+        </span>
+        <Icon.Chevron style={{ transform: 'rotate(90deg)', color: 'var(--ink-faint)' }} />
+      </button>
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            right: 0,
+            top: 'calc(100% + 4px)',
+            background: 'var(--surface-2)',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            padding: 4,
+            minWidth: 240,
+            maxHeight: 320,
+            overflowY: 'auto',
+            zIndex: 10,
+            boxShadow: 'var(--shadow-pop)',
+          }}
+        >
+          {['all', ...options].map((o) => (
+            <div
+              key={o}
+              onClick={() => {
+                onChange(o);
+                setOpen(false);
+              }}
+              style={{
+                padding: '6px 10px',
+                borderRadius: 4,
+                cursor: 'pointer',
+                background: value === o ? 'var(--surface-3)' : 'transparent',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 12,
+                color: value === o ? 'var(--ink)' : 'var(--ink-muted)',
+              }}
+              title={o}
+            >
+              {short(o)}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
