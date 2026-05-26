@@ -522,17 +522,8 @@ pub fn extract_memories(
     // routers that need session-level metadata without parsing every
     // memory record themselves.
     if let Some(domain_text) = latest_domain {
-        let mut rec = MemoryRecord::new(
-            MemoryKind::Domain,
-            domain_text,
-            cn_session_id.clone(),
-        );
-        rec = annotate_session_meta(
-            rec,
-            session_uuid,
-            project_cwd,
-            latest_domain_ts.as_deref(),
-        );
+        let mut rec = MemoryRecord::new(MemoryKind::Domain, domain_text, cn_session_id.clone());
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, latest_domain_ts.as_deref());
         if let Some(prog) = latest_progress {
             rec = rec.with_meta("progress", Value::String(prog));
         }

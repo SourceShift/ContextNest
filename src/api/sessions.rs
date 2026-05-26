@@ -687,8 +687,7 @@ pub async fn top_feature_for_session(
         how_to_test: Option<String>,
     }
     let mut feats: Vec<RawFeature> = Vec::new();
-    let mut session_files: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut session_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Use session_index to enumerate THIS session's fragment IDs. The
     // raw `src_session` metadata stores the UUID *without* the `cc-`
@@ -781,8 +780,7 @@ pub async fn top_feature_for_session(
     // Lowercasing absorbs trivial casing drift across turns ("GET …" vs
     // "Get …") without merging semantically-different features that
     // happen to share a token.
-    let mut freq_by_key: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+    let mut freq_by_key: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for f in &feats {
         let key = f.text.to_lowercase();
         *freq_by_key.entry(key).or_insert(0) += 1;
