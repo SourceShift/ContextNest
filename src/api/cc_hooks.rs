@@ -411,15 +411,18 @@ async fn store_task_completion(
     };
 
     let session_uuid = &payload.session_id;
-    // Canonical substrate session_id is `cc-<full-uuid>` (matches what
-    // `extractor::extract_memories` emits for the same session). Older
-    // builds truncated to the first 8 chars; WAL migration upgrades
-    // pre-existing short-form records at startup.
-    let cn_sid = if session_uuid.is_empty() {
-        "cc-unknown".to_string()
-    } else {
-        format!("cc-{session_uuid}")
-    };
+    // Canonical substrate session_id is the bare Claude Code session UUID
+    // (matches what `extractor::extract_memories` emits for the same
+    // session). Older builds used a `cc-<uuid>` form and earlier ones
+    // truncated to the first 8 chars; WAL migration upgrades both
+    // pre-existing forms to bare UUIDs at startup.
+    if session_uuid.is_empty() {
+        // No session UUID means we can't attribute this accomplishment
+        // to any timeline — drop it rather than mint a sentinel that
+        // pollutes the inbox.
+        return Ok(());
+    }
+    let cn_sid = session_uuid.to_string();
 
     let mut record = MemoryRecord::new(
         MemoryKind::Accomplishment,

@@ -168,15 +168,18 @@ function SearchPage() {
     return m;
   }, [sessions.data]);
 
-  // Pick the target sessions: when sessions chips are present, scope to
-  // those; otherwise hand the substrate the full session list. The
-  // substrate's cross-session mode (POST /api/v1/tools/retrieve with
-  // `session_ids`) does the merge under a single snapshot lock, so we
-  // no longer need the per-session HTTP fan-out the old UI relied on.
+  // Pick target sessions only when chips actually scope the query. With no
+  // session/project chips, omit both session_id and session_ids so the backend
+  // performs global search from its own session index.
   const targetSessionIds: string[] = useMemo(() => {
     if (chipsByKey.session.length > 0) return chipsByKey.session;
-    return sessions.data.map((s) => s.id);
-  }, [sessions.data, chipsByKey.session]);
+    if (chipsByKey.project.length > 0) {
+      return sessions.data
+        .filter((s) => chipsByKey.project.includes(basename(s.project_cwd)))
+        .map((s) => s.id);
+    }
+    return [];
+  }, [chipsByKey.project, chipsByKey.session, sessions.data]);
 
   // Client-side post-filter for everything BE can't enforce:
   //   1. multi-value OR within a category
@@ -238,7 +241,9 @@ function SearchPage() {
       sortMode,
       limit,
     ],
-    enabled: qDebounced.trim().length > 0 && targetSessionIds.length > 0,
+    enabled:
+      qDebounced.trim().length > 0 &&
+      (chipsByKey.project.length === 0 || targetSessionIds.length > 0),
     staleTime: 5_000,
     queryFn: async (): Promise<SearchResultRow[]> => {
       const singleSession = chipsByKey.session.length === 1 ? chipsByKey.session[0] : null;
@@ -257,7 +262,9 @@ function SearchPage() {
         top_k,
         ...(singleSession
           ? { session_id: singleSession }
-          : { session_ids: targetSessionIds }),
+          : chipsByKey.session.length > 1 || chipsByKey.project.length > 0
+            ? { session_ids: targetSessionIds }
+            : {}),
         metadata_filter:
           Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
       });
@@ -339,7 +346,11 @@ function SearchPage() {
           {q
             ? searchQuery.isLoading
               ? 'searching…'
-              : `${results.length} hits · ${chips.length} filter${chips.length === 1 ? '' : 's'} · ${targetSessionIds.length} session(s) searched`
+              : `${results.length} hits · ${chips.length} filters · ${
+                  chipsByKey.session.length > 0 || chipsByKey.project.length > 0
+                    ? `${targetSessionIds.length} session(s)`
+                    : 'all sessions'
+                } searched`
             : 'type to search'}
         </span>
       </div>

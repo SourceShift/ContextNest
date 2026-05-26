@@ -206,7 +206,7 @@ async fn make_server() -> (ContextNestServices, TestServer) {
 
 async fn push_files_touched(services: &ContextNestServices, session_uuid: &str, files: Vec<&str>) {
     let sink = ServicesSink::new(services.clone());
-    let session_id_cn = format!("cc-{session_uuid}");
+    let session_id_cn = session_uuid.to_string();
     let summary = format!("session touched {} file(s)", files.len());
     let files_value: Vec<Value> = files.iter().map(|f| json!(f)).collect();
     let mut meta = std::collections::HashMap::new();
@@ -231,7 +231,7 @@ async fn push_feature(
     files: Vec<&str>,
 ) {
     let sink = ServicesSink::new(services.clone());
-    let session_id_cn = format!("cc-{session_uuid}");
+    let session_id_cn = session_uuid.to_string();
     let files_value: Vec<Value> = files.iter().map(|f| json!(f)).collect();
     let mut meta = std::collections::HashMap::new();
     meta.insert("kind".to_string(), json!("feature"));

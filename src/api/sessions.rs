@@ -29,7 +29,8 @@ use crate::services::ContextNestServices;
 /// Summary of a single session as returned by `GET /api/v1/sessions`.
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
-    /// The substrate session ID (e.g. `"cc-879fccc6"`).
+    /// The substrate session ID — the bare Claude Code session UUID
+    /// (e.g. `"879fccc6-3a1f-4b2c-9d8e-1234567890ab"`).
     pub id: String,
     /// Count of ACTIVE (non-soft-deleted) fragments in this session.
     pub fragment_count: usize,

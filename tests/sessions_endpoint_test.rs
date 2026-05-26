@@ -91,10 +91,10 @@ async fn empty_substrate_returns_empty_sessions() {
 async fn two_sessions_correct_fragment_counts_and_order() {
     let server = make_server().await;
 
-    // Session "cc-aaa" — one fragment with an earlier timestamp.
+    // Session "sess-aaa" — one fragment with an earlier timestamp.
     store(
         &server,
-        "cc-aaa",
+        "sess-aaa",
         "fragment in session aaa",
         json!({
             "project_cwd": "/Users/admin/code/aaa",
@@ -104,10 +104,10 @@ async fn two_sessions_correct_fragment_counts_and_order() {
     )
     .await;
 
-    // Session "cc-bbb" — two fragments, second has a later timestamp.
+    // Session "sess-bbb" — two fragments, second has a later timestamp.
     store(
         &server,
-        "cc-bbb",
+        "sess-bbb",
         "first fragment in session bbb",
         json!({
             "project_cwd": "/Users/admin/code/bbb",
@@ -118,7 +118,7 @@ async fn two_sessions_correct_fragment_counts_and_order() {
     .await;
     store(
         &server,
-        "cc-bbb",
+        "sess-bbb",
         "second fragment in session bbb",
         json!({
             "project_cwd": "/Users/admin/code/bbb",
@@ -133,27 +133,27 @@ async fn two_sessions_correct_fragment_counts_and_order() {
 
     assert_eq!(sessions.len(), 2, "exactly two sessions expected");
 
-    // Newest first: cc-bbb (last_ts 11:00) before cc-aaa (last_ts 09:00).
+    // Newest first: sess-bbb (last_ts 11:00) before sess-aaa (last_ts 09:00).
     assert_eq!(
         sessions[0]["id"].as_str().unwrap(),
-        "cc-bbb",
-        "cc-bbb should be first (newer last_ts)"
+        "sess-bbb",
+        "sess-bbb should be first (newer last_ts)"
     );
     assert_eq!(
         sessions[1]["id"].as_str().unwrap(),
-        "cc-aaa",
-        "cc-aaa should be second (older last_ts)"
+        "sess-aaa",
+        "sess-aaa should be second (older last_ts)"
     );
 
     assert_eq!(
         sessions[0]["fragment_count"].as_u64().unwrap(),
         2,
-        "cc-bbb has 2 active fragments"
+        "sess-bbb has 2 active fragments"
     );
     assert_eq!(
         sessions[1]["fragment_count"].as_u64().unwrap(),
         1,
-        "cc-aaa has 1 active fragment"
+        "sess-aaa has 1 active fragment"
     );
 }
 
@@ -165,7 +165,7 @@ async fn metadata_fields_round_trip() {
 
     store(
         &server,
-        "cc-meta-trip",
+        "sess-meta-trip",
         "content with full metadata",
         json!({
             "project_cwd": "/foo",
@@ -183,7 +183,7 @@ async fn metadata_fields_round_trip() {
     assert_eq!(sessions.len(), 1, "one session in this server instance");
     let s = &sessions[0];
 
-    assert_eq!(s["id"].as_str().unwrap(), "cc-meta-trip");
+    assert_eq!(s["id"].as_str().unwrap(), "sess-meta-trip");
     assert_eq!(s["fragment_count"].as_u64().unwrap(), 1);
     assert_eq!(s["project_cwd"].as_str().unwrap(), "/foo");
     assert_eq!(s["src_session_uuid"].as_str().unwrap(), "uuid-here");
@@ -198,7 +198,7 @@ async fn soft_deleted_fragment_excluded_from_count() {
     // Store two fragments in the same session.
     let id_a = store(
         &server,
-        "cc-discard-test",
+        "sess-discard-test",
         "fragment A — will be soft-deleted",
         json!({
             "project_cwd": "/bar",
@@ -209,7 +209,7 @@ async fn soft_deleted_fragment_excluded_from_count() {
 
     store(
         &server,
-        "cc-discard-test",
+        "sess-discard-test",
         "fragment B — stays active",
         json!({
             "project_cwd": "/bar",
@@ -229,7 +229,7 @@ async fn soft_deleted_fragment_excluded_from_count() {
     );
 
     // Soft-delete fragment A.
-    soft_discard(&server, "cc-discard-test", &id_a).await;
+    soft_discard(&server, "sess-discard-test", &id_a).await;
 
     // Now only 1 active fragment should be counted.
     let body_after = list_sessions(&server).await;

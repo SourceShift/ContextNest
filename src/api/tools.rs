@@ -492,11 +492,16 @@ pub async fn retrieve(
     State(services): State<ContextNestServices>,
     Json(req): Json<RetrieveRequest>,
 ) -> impl IntoResponse {
-    // Branch decision: cross-session mode (when caller passed an
-    // explicit `session_ids` list) vs the original single-session mode.
+    // Branch decision: global/cross-session mode vs single-session mode.
     // `multi_session` carries a fragment_id → owning session_id map so
-    // each `RetrieveHit` can be tagged with its origin; in single-session
-    // mode the map stays empty and hits are emitted without `session_id`.
+    // each `RetrieveHit` can be tagged with its origin. Single-session
+    // mode is used only when the caller explicitly passes `session_id`,
+    // preserving the old wire shape where hits omit `session_id`.
+    //
+    // Important UI contract: omitting both session_id and session_ids means
+    // "search globally". The dashboard should not send hundreds of session
+    // IDs just to express no filter; that bloats requests and makes global
+    // search depend on the frontend's session-list freshness.
     let multi_session: Option<HashMap<String, String>> = match req.session_ids.as_ref() {
         Some(ids) if !ids.is_empty() => {
             let wanted: HashSet<&String> = ids.iter().collect();
@@ -508,6 +513,9 @@ pub async fn retrieve(
                 .filter(|(_, sess)| wanted.contains(sess))
                 .collect();
             Some(map)
+        }
+        _ if req.session_id.is_none() => {
+            Some(services.session_index.active_fragments_session_map().await)
         }
         _ => None,
     };

@@ -56,7 +56,7 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// 1. Determine which session_ids to scan:
 ///    - If `--session-id` is set, use exactly that.
 ///    - Else discover Claude Code sessions on disk (same path as `ingest`)
-///      and derive `cc-<8char>` substrate session_ids from each UUID.
+///      and use each session's bare UUID as the substrate session_id.
 /// 2. For each session, run TWO retrieve calls in parallel:
 ///    - `metadata_filter: {kind: "user_action"}` (optionally + urgency)
 ///    - `metadata_filter: {kind: "decision", awaiting_decision: true}`
@@ -96,9 +96,9 @@ async fn inbox(
             .into());
         }
         let discovered = discover_sessions(&projects_root, project.as_deref(), None)?;
-        // Derive substrate session ids: cc-<8char> of each Claude Code UUID.
-        // Dedup in case multiple .jsonl files share a UUID prefix (unlikely
-        // but defensive).
+        // Derive substrate session ids: bare UUID of each Claude Code
+        // session. Dedup in case multiple .jsonl files share a UUID
+        // (unlikely but defensive).
         let mut seen = HashSet::new();
         discovered
             .iter()
@@ -106,7 +106,7 @@ async fn inbox(
                 if s.session_uuid.is_empty() {
                     return None;
                 }
-                let cn_id = format!("cc-{}", s.session_uuid);
+                let cn_id = s.session_uuid.clone();
                 if seen.insert(cn_id.clone()) {
                     Some(cn_id)
                 } else {
@@ -923,19 +923,20 @@ async fn bootstrap_wal(
         );
     }
 
-    // One-shot migration: old WAL records carry session_id = `cc-<first-8>`,
-    // new code emits `cc-<full-uuid>`. Rewrite in-place using each
-    // record's metadata.src_session as the source of truth, then
-    // atomically replace the on-disk WAL so the next restart is a no-op.
-    // Idempotent — long-form records pass through untouched.
+    // One-shot migration: old WAL records carry session_id =
+    // `cc-<full-uuid>` (or even older `cc-<first-8>`); current code emits
+    // the bare UUID. Rewrite in-place — strip the `cc-` prefix and, for
+    // short-form records, expand via metadata.src_session. Atomically
+    // replace the on-disk WAL so the next restart is a no-op. Idempotent —
+    // already-bare records pass through untouched.
     let (records, mig_report) =
-        contextnest::services::wal::migrate_short_session_ids(path, records)?;
+        contextnest::services::wal::migrate_legacy_session_ids(path, records)?;
     if mig_report.migrated > 0 || mig_report.skipped_no_src_session > 0 {
         tracing::info!(
             migrated = mig_report.migrated,
             skipped = mig_report.skipped_no_src_session,
             wal_path = %path.display(),
-            "session_id migration: WAL rewritten to canonical cc-<full-uuid>",
+            "session_id migration: WAL rewritten to canonical bare-UUID form",
         );
     }
 

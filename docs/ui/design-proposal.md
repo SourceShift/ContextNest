@@ -66,7 +66,7 @@ Six routes total. Each one maps to a specific ContextNest capability:
 │ ◉ I │  Inbox         Claude needs you on 3 sessions                  │
 │ ⏱ S │                                                                │
 │ 🔍 / │  ┌────────────────────────────────────────────────────────────┐│
-│ ⚡ P │  │ ● NOW  · cc-4c998114 · ContextNest                        ││
+│ ⚡ P │  │ ● NOW  · 4c998114 · ContextNest                        ││
 │ 🛠 T │  │   Approve squash-merge of PR #20 (CI green)                ││
 │ ⚙ … │  │   Why: ships v0.2 Claude Code visibility feature set       ││
 │     │  │   ❓ Confirm: Squash-merge PR #20 same flow as #17/#18/#19?││
@@ -74,7 +74,7 @@ Six routes total. Each one maps to a specific ContextNest capability:
 │     │  └────────────────────────────────────────────────────────────┘│
 │     │                                                                │
 │     │  ┌────────────────────────────────────────────────────────────┐│
-│     │  │ ◐ SOON · cc-879fccc6 · researcher                          ││
+│     │  │ ◐ SOON · 879fccc6 · researcher                          ││
 │     │  │   2 items waiting — click to expand                        ││
 │     │  └────────────────────────────────────────────────────────────┘│
 │     │                                                                │
@@ -94,15 +94,15 @@ filters:  [● now]  [◐ soon]  [◯ later]  [all projects]  [refresh: 30s]
 ┌──────────────────────────────────────────────────────────────────────┐
 │ ⏱ Sessions                              ▾ all projects   ⌕ filter   │
 ├──────────────────────────────────────────────────────────────────────┤
-│  cc-4c998114  ◉  ContextNest                          12 min ago     │
+│  4c998114  ◉  ContextNest                          12 min ago     │
 │      Goal: Ship the real-time Claude Code hook receiver              │
 │      ▒▒▒▒▒▒▒▒▒▒░░  784 memories · 36 goal-phases · 2 decisions       │
 │                                                                      │
-│  cc-879fccc6  ◐  researcher                            1 hour ago    │
+│  879fccc6  ◐  researcher                            1 hour ago    │
 │      Goal: <not yet ingested — click to backfill>                    │
 │      ░░░░░░░░░░░░  0 memories                                        │
 │                                                                      │
-│  cc-2ad88d5e  ◯  ContextNest                            yesterday    │
+│  2ad88d5e  ◯  ContextNest                            yesterday    │
 │      Goal: v0.1.0 release follow-up                                  │
 │      ▒▒▒░░░░░░░░░  142 memories · 8 goal-phases                      │
 │                                                                      │
@@ -119,7 +119,7 @@ filters:  [● now]  [◐ soon]  [◯ later]  [all projects]  [refresh: 30s]
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ⏱ cc-4c998114                       12 min ago  ·  ContextNest      │
+│ ⏱ 4c998114                       12 min ago  ·  ContextNest      │
 ├──────────────────────────────────────────────────────────────────────┤
 │  ▾ Goal phases (36)            ▾ Accomplishments (230)              │
 │                                                                      │
@@ -160,17 +160,17 @@ filters:  [● now]  [◐ soon]  [◯ later]  [all projects]  [refresh: 30s]
 │  Filters: [kind:learning ×]  [+ kind] [+ project] [+ urgency]        │
 │                                                                      │
 │  ───────────────────────────────────────────────────────────────     │
-│  ▸ learning  ·  cc-4c998114  ·  sim=0.93                             │
+│  ▸ learning  ·  4c998114  ·  sim=0.93                             │
 │    is_none_or is stable since Rust 1.82 — repo MSRV is 1.80;         │
 │    use matches!(opt, None | Some(...)) instead                       │
 │    Stored 14:42 · ContextNest                                        │
 │                                                                      │
-│  ▸ learning  ·  cc-4c998114  ·  sim=0.87                             │
+│  ▸ learning  ·  4c998114  ·  sim=0.87                             │
 │    CI runs cargo clippy --all-targets WITHOUT -D warnings, so 600+   │
 │    pre-existing warnings don't block merge                           │
 │    Stored 14:21 · ContextNest                                        │
 │                                                                      │
-│  ▸ accomplishment · cc-4c998114 · sim=0.71                           │
+│  ▸ accomplishment · 4c998114 · sim=0.71                           │
 │    Applied rustfmt + reran 8 inbox unit tests (all pass)             │
 │    Stored 13:55 · ContextNest                                        │
 └──────────────────────────────────────────────────────────────────────┘
@@ -224,8 +224,8 @@ filters:  [● now]  [◐ soon]  [◯ later]  [all projects]  [refresh: 30s]
 │  LLM:        openai gpt-4o-mini                  [edit]              │
 │                                                                      │
 │  Recent activity                                                     │
-│  ▷ 14:52  store     learning   cc-4c998114   162 fragments           │
-│  ▷ 14:51  retrieve  filter     cc-4c998114   3 hits                  │
+│  ▷ 14:52  store     learning   4c998114   162 fragments           │
+│  ▷ 14:51  retrieve  filter     4c998114   3 hits                  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

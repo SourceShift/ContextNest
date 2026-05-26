@@ -87,9 +87,50 @@ impl EmbeddingService {
         None
     }
 
-    /// Generate embedding for text
+    /// Generate embedding for text.
+    ///
+    /// Inputs longer than the configured `max_input_length` (interpreted as
+    /// a conservative **character** budget) are truncated before being
+    /// sent to the provider. This guards the OpenAI-compatible providers
+    /// (Qwen3 on DeepInfra, OpenAI text-embedding-3, etc.) from rejecting
+    /// the call with a "context_length exceeded" error — a single token
+    /// over the model's limit is enough to fail the request and lose the
+    /// fragment's embedding. Char-based clamping is intentionally
+    /// conservative: for typical English / code text, 1 token ≈ 3-5
+    /// characters, so capping by char count keeps the input safely under
+    /// the token limit without requiring a tokenizer dependency. A
+    /// follow-up could swap in a proper BPE tokenizer (tiktoken) if a
+    /// tighter fit becomes worth the dep.
     pub async fn generate_embedding(&self, text: &str) -> ContextNestResult<Vec<f32>> {
-        // Check cache first
+        // Resolve the default model up-front so we can read its
+        // max_input_length before the cache lookup — different models
+        // produce different vectors for the same text, but the cache key
+        // is content-only, so we must clamp the text first to keep the
+        // key stable across pre-vs-post-clamp calls of the same payload.
+        let default_model = self
+            .config
+            .models
+            .get(&self.config.default_model)
+            .ok_or_else(|| {
+                ContextNestError::Api("Default embedding model not found".to_string())
+            })?;
+
+        let max_chars = default_model.settings.max_input_length;
+        let truncated: Option<String> = first_n_chars(text, max_chars).map(|s| {
+            tracing::warn!(
+                original_chars = text.chars().count(),
+                truncated_chars = s.chars().count(),
+                max_chars,
+                "embedding input exceeded max_input_length — truncating before \
+                 provider call (raise [services.embedding.models.<name>.settings] \
+                 max_input_length if the model's context window allows more)"
+            );
+            s.to_string()
+        });
+        let text = truncated.as_deref().unwrap_or(text);
+
+        // Check cache first (post-clamp so the key matches what we'll
+        // actually send to the provider).
         let cache_key = self.create_cache_key(text);
 
         {
@@ -98,15 +139,6 @@ impl EmbeddingService {
                 return Ok(cached.clone());
             }
         }
-
-        // Generate new embedding
-        let default_model = self
-            .config
-            .models
-            .get(&self.config.default_model)
-            .ok_or_else(|| {
-                ContextNestError::Api("Default embedding model not found".to_string())
-            })?;
 
         let embedding = match default_model.model_type {
             crate::config::EmbeddingModelType::OpenAI => {
@@ -1126,6 +1158,108 @@ mod first_n_chars_tests {
     #[test]
     fn empty_input_returns_none() {
         assert_eq!(first_n_chars("", 3), None);
+    }
+}
+
+#[cfg(test)]
+mod max_input_length_clamping_tests {
+    //! Regression for the embedder context-window overflow bug.
+    //!
+    //! The default `local` model has `max_input_length = 512`. Inputs
+    //! longer than that must be truncated to that char count before any
+    //! provider dispatch, otherwise OpenAI-shaped providers reject the
+    //! request with a "context_length exceeded" 400 and the fragment
+    //! never gets an embedding.
+    //!
+    //! We exercise the wire-up via the local-embedding path (no HTTP
+    //! provider, no API key needed) and use the cache as a witness:
+    //! both the over-long input and the manually-truncated input must
+    //! produce the same embedding, because they hash to the same cache
+    //! key after truncation.
+
+    use super::*;
+    use crate::config::EmbeddingServicesConfig;
+
+    #[tokio::test]
+    async fn long_input_is_truncated_to_max_input_length() {
+        let config = EmbeddingServicesConfig::default();
+        let max_chars = config
+            .models
+            .get(&config.default_model)
+            .expect("default model present in default config")
+            .settings
+            .max_input_length;
+        assert_eq!(
+            max_chars, 512,
+            "this regression assumes the v0.1 default — adjust if the default changes"
+        );
+
+        let service = EmbeddingService::new(config).expect("service builds");
+
+        let long_text = "x".repeat(max_chars * 4); // 4× over budget
+        let truncated_text = "x".repeat(max_chars);
+
+        let embedding_long = service
+            .generate_embedding(&long_text)
+            .await
+            .expect("embed long");
+        let embedding_truncated = service
+            .generate_embedding(&truncated_text)
+            .await
+            .expect("embed truncated");
+
+        assert_eq!(
+            embedding_long, embedding_truncated,
+            "over-budget input must be truncated to max_input_length before \
+             dispatch, so both yield the same cache-keyed embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_at_or_under_limit_is_not_truncated() {
+        let config = EmbeddingServicesConfig::default();
+        let max_chars = config
+            .models
+            .get(&config.default_model)
+            .expect("default model present")
+            .settings
+            .max_input_length;
+        let service = EmbeddingService::new(config).expect("service builds");
+
+        // Two distinct inputs, both under the limit, must produce
+        // distinct embeddings — proving we do NOT collapse inputs that
+        // fit within the budget.
+        let short_a = "alpha alpha alpha alpha";
+        let short_b = "beta beta beta beta";
+        assert!(short_a.chars().count() < max_chars);
+        assert!(short_b.chars().count() < max_chars);
+
+        let emb_a = service.generate_embedding(short_a).await.expect("embed a");
+        let emb_b = service.generate_embedding(short_b).await.expect("embed b");
+
+        assert_ne!(
+            emb_a, emb_b,
+            "distinct under-budget inputs must produce distinct embeddings — \
+             clamping must not fire when text fits"
+        );
+    }
+
+    #[tokio::test]
+    async fn multibyte_input_truncates_at_char_boundary_not_byte_boundary() {
+        // Guard against the classic "&s[..n] panics inside a UTF-8
+        // codepoint" trap. Use CJK characters which are 3 bytes each so
+        // a naive byte slice at max_input_length would land mid-codepoint.
+        let config = EmbeddingServicesConfig::default();
+        let service = EmbeddingService::new(config).expect("service builds");
+
+        // 1000 CJK chars = 3000 bytes, char count > max_input_length=512
+        let multibyte_text: String = "中".repeat(1000);
+
+        // Must not panic — if it does, the test fails noisily.
+        let _ = service
+            .generate_embedding(&multibyte_text)
+            .await
+            .expect("multibyte embed should not panic on byte-vs-char boundary");
     }
 }
 

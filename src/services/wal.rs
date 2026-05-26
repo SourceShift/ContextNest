@@ -148,25 +148,37 @@ impl Wal {
     }
 }
 
-/// Result of [`migrate_short_session_ids`].
+/// Result of [`migrate_legacy_session_ids`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MigrationReport {
-    /// Records whose `session_id` was rewritten from the old
-    /// `cc-<first-8>` form to the canonical `cc-<full-uuid>` form.
+    /// Records whose `session_id` was rewritten to the canonical bare-UUID
+    /// form. Covers both legacy shapes:
+    /// - `cc-<full-uuid>` → `<full-uuid>` (drop prefix)
+    /// - `cc-<first-8>` + `metadata.src_session` → `<full-uuid>` (drop
+    ///   prefix and expand from oracle)
     pub migrated: usize,
-    /// Short-form records that lacked a `metadata.src_session` oracle
-    /// and were therefore left unchanged.
+    /// Short-form records (`cc-<first-8>`) that lacked a
+    /// `metadata.src_session` oracle and were therefore left unchanged.
+    /// These should be rare; manual recovery would mean grepping the
+    /// original transcript for the full UUID.
     pub skipped_no_src_session: usize,
 }
 
-/// One-shot migration from the legacy `cc-<first-8-of-uuid>` short-form
-/// session id to the canonical `cc-<full-uuid>` long form.
+/// One-shot migration to the canonical bare-UUID `session_id`.
 ///
-/// Detection: a record is migrated iff its `session_id` is shorter than
-/// `cc-` + 36 chars AND starts with `cc-` AND carries a non-empty
-/// `metadata.src_session`. Long-form records pass through untouched;
-/// records without an `src_session` oracle (manual API stores, test
-/// fixtures) are kept as-is.
+/// The substrate previously emitted `cc-<full-uuid>` (and earlier
+/// `cc-<first-8-of-uuid>`). The `cc-` namespacing has been retired —
+/// Claude Code session UUIDs are themselves globally unique, so the
+/// extra namespace tag was redundant and confused the dashboard /
+/// curl examples.
+///
+/// Detection per record:
+/// - Bare UUID (no `cc-` prefix): pass through unchanged.
+/// - `cc-` prefix with ≥36 chars after the prefix: strip prefix.
+/// - `cc-` prefix with fewer than 36 chars (legacy short form): strip
+///   prefix AND replace with `metadata.src_session` if present.
+/// - `cc-` prefix without `src_session` oracle: leave as-is and bump
+///   `skipped_no_src_session` — the operator can investigate.
 ///
 /// If any records changed, the on-disk WAL at `path` is rewritten:
 /// write `wal.new` (fsync), rename current `wal` → `wal.bak`, rename
@@ -177,11 +189,11 @@ pub struct MigrationReport {
 /// Idempotency: rerunning the function after a successful migration
 /// finds nothing to do and skips the rewrite — safe to call on every
 /// boot.
-pub fn migrate_short_session_ids(
+pub fn migrate_legacy_session_ids(
     path: &Path,
     records: Vec<WalRecord>,
 ) -> std::io::Result<(Vec<WalRecord>, MigrationReport)> {
-    const LONG_FORM_MIN_LEN: usize = "cc-".len() + 36;
+    const UUID_LEN: usize = 36;
 
     let mut report = MigrationReport::default();
     let mut out: Vec<WalRecord> = Vec::with_capacity(records.len());
@@ -195,28 +207,34 @@ pub fn migrate_short_session_ids(
                 importance,
                 metadata,
             } => {
-                if session_id.len() >= LONG_FORM_MIN_LEN || !session_id.starts_with("cc-") {
-                    out.push(WalRecord::Store {
-                        fragment_id,
-                        session_id,
-                        content,
-                        importance,
-                        metadata,
-                    });
-                    continue;
-                }
-                let full_uuid = metadata
-                    .get("src_session")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let new_session_id = match full_uuid {
-                    Some(uuid) if !uuid.is_empty() => {
-                        report.migrated += 1;
-                        format!("cc-{uuid}")
-                    }
-                    _ => {
-                        report.skipped_no_src_session += 1;
+                let stripped = session_id.strip_prefix("cc-");
+                let new_session_id = match stripped {
+                    None => {
+                        // Already bare UUID — nothing to do.
                         session_id
+                    }
+                    Some(rest) if rest.len() >= UUID_LEN => {
+                        // `cc-<full-uuid>` — just drop the prefix.
+                        report.migrated += 1;
+                        rest.to_string()
+                    }
+                    Some(_) => {
+                        // `cc-<short-form>` — try the src_session oracle.
+                        let full_uuid = metadata
+                            .get("src_session")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        match full_uuid {
+                            Some(uuid) => {
+                                report.migrated += 1;
+                                uuid
+                            }
+                            None => {
+                                report.skipped_no_src_session += 1;
+                                session_id
+                            }
+                        }
                     }
                 };
                 out.push(WalRecord::Store {
@@ -269,7 +287,7 @@ mod tests {
     fn sample_store(id: &str) -> WalRecord {
         WalRecord::Store {
             fragment_id: id.to_string(),
-            session_id: "cc-test".to_string(),
+            session_id: "test-sess".to_string(),
             content: format!("content for {id}"),
             importance: 0.7,
             metadata: HashMap::from([

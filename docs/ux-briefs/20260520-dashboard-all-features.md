@@ -171,7 +171,7 @@ Each feature gets its own subsection. **Designers consistently undermodel states
 
 **Card content (every item):**
 - Urgency dot + label (now / soon / later — colours from `--color-urgency-*`)
-- Session id (mono, `cc-<8char>`) + project basename
+- Session id (mono, bare UUID — typically truncated to first 8 chars for display) + project basename
 - Action text (the imperative sentence from z-insight `requires_user_action[]`)
 - Reason (single line, `--color-ink-muted`)
 - Decision (only if `kind=decision` — render with a `?` glyph)
@@ -207,7 +207,7 @@ Each feature gets its own subsection. **Designers consistently undermodel states
 - Row list, default sort = last activity desc
 
 **Row content:**
-- Substrate session id `cc-<8char>` (mono)
+- Substrate session id — the bare Claude Code UUID, mono, truncated to first 8 chars for display
 - Urgency dot (last decision/action urgency, defaults to grey)
 - Project basename (clickable → filter to that project)
 - Last activity timestamp (relative: "12 min ago", "yesterday", "3d ago")
@@ -255,7 +255,7 @@ Each feature gets its own subsection. **Designers consistently undermodel states
 | Cold | Header + skeleton goal-phase cards |
 | Empty (session has 0 fragments) | `[backfill this session]` button calling batch ingest |
 | Partial (some kinds returned, others errored) | Render what loaded; small error badge per failing section |
-| Error (session 404) | "Session `cc-xxxxxxxx` not found in substrate. [backfill] or [view all sessions]" |
+| Error (session 404) | "Session `<uuid>` not found in substrate. [backfill] or [view all sessions]" |
 
 **Edge cases:**
 - A session with > 1000 memories — paginate within each accordion section
