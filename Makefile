@@ -6,13 +6,13 @@
 
 AF := .agentflow
 
-.PHONY: help install test test-quick migrate migrate-force clean lint check
+.PHONY: help install setup test test-quick migrate migrate-force clean lint check dev-be dev-fe
 
 help:
 	@echo "mini-orch — autonomous LLM code delivery orchestrator"
 	@echo
 	@echo "Targets:"
-	@echo "  install        — first-time setup (deps + config templates + npm install + state.db init)"
+	@echo "  install        — mini-orch first-time setup (deps + config templates + state.db)"
 	@echo "  test           — full umbrella test suite (~350 tests across 5 suites)"
 	@echo "  test-quick     — kickoff-lints + self-healing + agent-comms (fast smoke)"
 	@echo "  migrate        — apply any new SQL migrations to state.db"
@@ -20,6 +20,12 @@ help:
 	@echo "  lint           — syntax-check all .sh files"
 	@echo "  check          — verify deps + config templates copied"
 	@echo "  clean          — remove node_modules, runs/, *.bak (state.db preserved)"
+	@echo
+	@echo "ContextNest dev (substrate + dashboard):"
+	@echo "  setup          — one-shot install of BE deps + FE deps for ContextNest"
+	@echo "  dev-be         — run the substrate with hot-reload on .rs changes (cargo-watch)"
+	@echo "  dev-fe         — run the web dashboard (vite) on http://localhost:5057"
+	@echo "  cn-*           — see 'make cn-help' for the full ContextNest target list"
 
 install:
 	./install.sh
@@ -230,3 +236,35 @@ cn-wal-clear:
 # Marker target — re-runs cn-build if the binary is missing.
 $(CN_BIN):
 	$(MAKE) cn-build
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level dev convenience targets
+#
+# Thin wrappers around the cn-* family so first-time contributors can do
+# `make setup && make dev-be` (or `make dev-fe`) without learning the full
+# cn-* matrix. Intentionally short names; the cn-* targets remain the
+# authoritative recipes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup: ## One-shot setup: ContextNest BE deps + FE deps. Idempotent.
+	@echo "→ ContextNest backend setup"
+	@if [ -f ./install.sh ]; then ./install.sh; else \
+	  echo "no install.sh — ensure cargo + rustup are available, then run 'make cn-build'"; \
+	fi
+	@echo "→ ContextNest frontend deps (pnpm install in web/)"
+	@if [ -d web ]; then \
+	  (cd web && pnpm install); \
+	else \
+	  echo "no web/ dir — skipping FE setup"; \
+	fi
+	@echo "✓ setup complete — try 'make dev-be' in one terminal and 'make dev-fe' in another"
+
+dev-be: ## Run the substrate backend with auto-rebuild on .rs changes. Wraps cn-watch.
+	$(MAKE) cn-watch
+
+dev-fe: ## Run the web dashboard (vite). Hot-reload via Vite HMR.
+	@if [ ! -d web/node_modules ]; then \
+	  echo "web/node_modules missing — running pnpm install first"; \
+	  (cd web && pnpm install); \
+	fi
+	@cd web && pnpm dev
