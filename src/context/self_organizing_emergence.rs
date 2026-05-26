@@ -809,7 +809,7 @@ impl SelfOrganizingEmergence {
             let mut point = vec![0.0f32; field.properties.embedding_dim];
 
             // Generate random point based on existing patterns
-            if let Some(ref_pattern) = field.patterns.iter().choose(&mut rand::thread_rng()) {
+            if let Some(ref_pattern) = field.patterns.iter().choose(&mut rand::rng()) {
                 for (i, val) in ref_pattern.embedding.iter().enumerate() {
                     point[i] = val + (rand::random::<f32>() - 0.5) * 0.5;
                 }
