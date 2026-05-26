@@ -39,11 +39,11 @@ async fn empty_substrate_reports_zeros() {
 #[tokio::test]
 async fn kind_counts_are_aggregated_across_sessions() {
     let server = make_server().await;
-    store(&server, "cc-a", "first", "learning").await;
-    store(&server, "cc-a", "second", "learning").await;
-    store(&server, "cc-a", "third", "user_action").await;
-    store(&server, "cc-b", "fourth", "learning").await;
-    store(&server, "cc-b", "fifth", "todo").await;
+    store(&server, "sess-a", "first", "learning").await;
+    store(&server, "sess-a", "second", "learning").await;
+    store(&server, "sess-a", "third", "user_action").await;
+    store(&server, "sess-b", "fourth", "learning").await;
+    store(&server, "sess-b", "fifth", "todo").await;
 
     let body: Value = server.get("/api/v1/stats").await.json();
     assert_eq!(body["total_fragments"], 5);
@@ -60,7 +60,7 @@ async fn fragments_without_kind_bucket_under_unknown() {
         .post("/api/v1/tools/store")
         .json(&json!({
             "content": "no-meta fragment",
-            "session_id": "cc-x",
+            "session_id": "sess-x",
         }))
         .await;
     res.assert_status_ok();
@@ -77,7 +77,7 @@ async fn soft_deleted_fragments_excluded_from_stats() {
         .post("/api/v1/tools/store")
         .json(&json!({
             "content": "to be discarded",
-            "session_id": "cc-soft",
+            "session_id": "sess-soft",
             "metadata": {"kind": "learning"},
         }))
         .await;
@@ -91,7 +91,7 @@ async fn soft_deleted_fragments_excluded_from_stats() {
         .json(&json!({
             "attractor_id": frag_id,
             "soft_delete": true,
-            "session_id": "cc-soft",
+            "session_id": "sess-soft",
         }))
         .await
         .assert_status_ok();
@@ -104,15 +104,15 @@ async fn soft_deleted_fragments_excluded_from_stats() {
 #[tokio::test]
 async fn sessions_endpoint_includes_by_kind_per_session() {
     let server = make_server().await;
-    store(&server, "cc-counts", "a", "learning").await;
-    store(&server, "cc-counts", "b", "learning").await;
-    store(&server, "cc-counts", "c", "decision").await;
+    store(&server, "sess-counts", "a", "learning").await;
+    store(&server, "sess-counts", "b", "learning").await;
+    store(&server, "sess-counts", "c", "decision").await;
 
     let body: Value = server.get("/api/v1/sessions").await.json();
     let sessions = body["sessions"].as_array().unwrap();
     let row = sessions
         .iter()
-        .find(|s| s["id"] == "cc-counts")
+        .find(|s| s["id"] == "sess-counts")
         .expect("session entry");
     assert_eq!(row["by_kind"]["learning"], 2);
     assert_eq!(row["by_kind"]["decision"], 1);

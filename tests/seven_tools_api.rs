@@ -513,6 +513,42 @@ async fn retrieve_with_session_ids_merges_across_sessions() {
 }
 
 #[tokio::test]
+async fn retrieve_without_any_session_filter_searches_globally() {
+    let server = make_server().await;
+
+    for session in ["global-alpha", "global-beta"] {
+        server
+            .post("/api/v1/tools/store")
+            .json(&json!({
+                "content": format!("global-search-fast-path marker in {session}"),
+                "session_id": session,
+            }))
+            .await
+            .assert_status_ok();
+    }
+
+    let res = server
+        .post("/api/v1/tools/retrieve")
+        .json(&json!({
+            "query": "global-search-fast-path",
+            "top_k": 10,
+        }))
+        .await;
+    res.assert_status_ok();
+    let body: serde_json::Value = res.json();
+    let hits = body["hits"].as_array().expect("hits array");
+
+    let seen_sessions: std::collections::HashSet<&str> = hits
+        .iter()
+        .filter_map(|h| h["session_id"].as_str())
+        .collect();
+    assert!(
+        seen_sessions.contains("global-alpha") && seen_sessions.contains("global-beta"),
+        "omitting session_id/session_ids must search globally and tag hit sessions: {body:?}",
+    );
+}
+
+#[tokio::test]
 async fn retrieve_without_session_ids_preserves_single_session_shape() {
     // Regression guard: single-session callers (cc_hooks, MCP) must keep
     // getting hits WITHOUT a `session_id` field, so the JSON shape doesn't

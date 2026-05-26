@@ -60,6 +60,18 @@ pub enum MemoryKind {
     /// feature lives in); `metadata.refs` carries any free-form
     /// pointers like commit hashes or PR numbers.
     Feature,
+    /// Session-level domain bucket from the z-insight block's top-level
+    /// `domain` field (one of frontend|backend|research|ai-ml|infra|ops|
+    /// tooling|tests|docs|data|design|other). Aggregated to ONE record
+    /// per session, holding the LATEST non-empty value seen across the
+    /// turn stream. `metadata.progress` carries the latest non-empty
+    /// `progress` value (starting|in-progress|blocked|wrapping-up|idle|
+    /// done) and `metadata.topics` carries the deduped union of every
+    /// `topics[]` array the session emitted. Used by downstream routers
+    /// (e.g. the z-dashboard categorizer) so they can fetch session
+    /// metadata from CN instead of trusting their own local insight
+    /// store.
+    Domain,
 }
 
 impl MemoryKind {
@@ -79,6 +91,7 @@ impl MemoryKind {
             Self::Summary => "summary",
             Self::FilesTouched => "files_touched",
             Self::Feature => "feature",
+            Self::Domain => "domain",
         }
     }
 
@@ -106,6 +119,10 @@ impl MemoryKind {
             // behind — they're literally the answer to "what did this
             // session ship". Importance just below summary.
             Self::Feature => 0.90,
+            // Domain is durable session-level metadata — one aggregate
+            // record per session, used as the primary axis by the
+            // z-dashboard categorizer. Same tier as SessionTitle/GoalPhase.
+            Self::Domain => 0.85,
         }
     }
 }
@@ -141,17 +158,15 @@ impl MemoryRecord {
 ///
 /// `session_uuid` is the full Claude Code session UUID. `project_cwd` is
 /// the reconstructed project path (empty string if unknown). The substrate
-/// session id is `cc-<full-uuid>` — the `cc-` prefix tags the ingest
-/// source (Claude Code) and the full UUID guarantees no aliasing across
-/// sessions whose UUIDs happen to share their first 8 chars. The old
-/// `cc-<first-8>` form is migrated to this canonical shape at WAL
+/// session id is the bare UUID — the older `cc-<uuid>` and
+/// `cc-<first-8>` forms are migrated to the bare-UUID shape at WAL
 /// replay time (see `bootstrap_wal` in `bin/contextnest.rs`).
 pub fn extract_memories(
     events: &[RawEvent],
     session_uuid: &str,
     project_cwd: &str,
 ) -> Vec<MemoryRecord> {
-    let cn_session_id = format!("cc-{session_uuid}");
+    let cn_session_id = session_uuid.to_string();
     let mut out = Vec::new();
 
     // 1. session_title from the first non-empty ai-title.
@@ -213,6 +228,25 @@ pub fn extract_memories(
     // from "changed".
     let mut files_touched: HashSet<String> = HashSet::new();
     let mut first_file_ts: Option<String> = None;
+
+    // Session-level domain aggregation. We track:
+    //   * latest_domain    — the LAST non-empty `block.domain` seen. The
+    //                         agent's self-tag drifts as a session pivots
+    //                         (frontend → infra → backend); the most-recent
+    //                         answer is the most useful one for routing.
+    //   * latest_progress  — same logic for `block.progress`.
+    //   * latest_domain_ts — timestamp of the block that set latest_domain.
+    //                         Used as the Domain record's `ts` so downstream
+    //                         consumers can recency-sort.
+    //   * topics_union     — every `topics[]` element ever emitted by the
+    //                         session, deduped. Union (not last-seen) because
+    //                         topics are typically stable cumulative tags
+    //                         — "auth", "testing", "rust" — that all
+    //                         describe what the session has been about.
+    let mut latest_domain: Option<String> = None;
+    let mut latest_progress: Option<String> = None;
+    let mut latest_domain_ts: Option<String> = None;
+    let mut topics_union: HashSet<String> = HashSet::new();
 
     for ev in events {
         if ev.event_type != "assistant" {
@@ -343,6 +377,29 @@ pub fn extract_memories(
                     &cn_session_id,
                     &mut out,
                 );
+                // Track latest domain/progress + union topics for the
+                // session-level Domain record emitted after the walk.
+                if let Some(dom) = block.get("domain").and_then(Value::as_str) {
+                    if !dom.is_empty() {
+                        latest_domain = Some(dom.to_string());
+                        latest_domain_ts = ev.timestamp.clone();
+                    }
+                }
+                if let Some(prog) = block.get("progress").and_then(Value::as_str) {
+                    if !prog.is_empty() {
+                        latest_progress = Some(prog.to_string());
+                    }
+                }
+                if let Some(topics) = block.get("topics").and_then(Value::as_array) {
+                    for t in topics {
+                        if let Some(s) = t.as_str() {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                topics_union.insert(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
                 // Stash goal + task data for post-processing.
                 if let Some(goal) = block.get("goal").and_then(Value::as_str) {
                     if !goal.is_empty() {
@@ -453,6 +510,33 @@ pub fn extract_memories(
         rec = annotate_session_meta(rec, session_uuid, project_cwd, first_file_ts.as_deref());
         let files_value: Vec<Value> = files.into_iter().map(Value::String).collect();
         rec = rec.with_meta("files", Value::Array(files_value));
+        out.push(rec);
+    }
+
+    // 8. domain — one aggregate record per session, holding the latest
+    // self-reported `domain` plus latest `progress` and the union of all
+    // `topics[]` seen. Skipped entirely when the session never emitted a
+    // domain (e.g. a pure terminal-source ingest). Drives downstream
+    // routers that need session-level metadata without parsing every
+    // memory record themselves.
+    if let Some(domain_text) = latest_domain {
+        let mut rec = MemoryRecord::new(MemoryKind::Domain, domain_text, cn_session_id.clone());
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, latest_domain_ts.as_deref());
+        if let Some(prog) = latest_progress {
+            rec = rec.with_meta("progress", Value::String(prog));
+        }
+        if !topics_union.is_empty() {
+            let mut topics: Vec<String> = topics_union.into_iter().collect();
+            topics.sort();
+            // Cap at 12 — matches z-insight's max(8) plus a buffer for
+            // sessions that span enough turns to enumerate a few extras.
+            // Keeps the metadata sidecar lean even on long sessions.
+            if topics.len() > 12 {
+                topics.truncate(12);
+            }
+            let topics_value: Vec<Value> = topics.into_iter().map(Value::String).collect();
+            rec = rec.with_meta("topics", Value::Array(topics_value));
+        }
         out.push(rec);
     }
 
@@ -864,15 +948,14 @@ mod tests {
         );
         assert!(decision.metadata.contains_key("decision_text"));
 
-        // CN session id is `cc-<full-uuid>` — no truncation, no aliasing.
-        assert_eq!(decision.session_id_cn, "cc-sess-1-very-long-uuid");
+        // CN session id is the bare Claude Code UUID — no prefix, no truncation.
+        assert_eq!(decision.session_id_cn, "sess-1-very-long-uuid");
         for r in &recs {
             assert!(
-                r.session_id_cn.starts_with("cc-"),
-                "session id starts with cc-"
+                !r.session_id_cn.starts_with("cc-"),
+                "session id should not carry the legacy cc- prefix"
             );
-            // Suffix is the entire uuid, byte-for-byte.
-            assert_eq!(&r.session_id_cn["cc-".len()..], "sess-1-very-long-uuid");
+            assert_eq!(r.session_id_cn, "sess-1-very-long-uuid");
         }
 
         // Every memory carries kind + src_session metadata
@@ -907,7 +990,7 @@ mod tests {
         // edge case: shorter than 8 chars
         let recs = extract_memories(&[ev_ai_title("title here")], "abc", "");
         assert!(!recs.is_empty());
-        // CN session id should be "cc-abc" (truncated at uuid length, not panicking)
-        assert_eq!(recs[0].session_id_cn, "cc-abc");
+        // CN session id mirrors the raw uuid byte-for-byte (no prefix).
+        assert_eq!(recs[0].session_id_cn, "abc");
     }
 }

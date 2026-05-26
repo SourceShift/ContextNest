@@ -189,13 +189,15 @@ async fn every_record_carries_session_metadata() {
 
     let captured = sink.captured.read().await;
     for r in captured.iter() {
-        // Substrate session id namespaced consistently
+        // Substrate session id is the bare Claude Code session UUID — no
+        // legacy `cc-` prefix.
         assert!(
-            r.session_id_cn.starts_with("cc-"),
-            "kind={:?} sess={}",
+            !r.session_id_cn.starts_with("cc-"),
+            "session id should not carry the legacy cc- prefix: kind={:?} sess={}",
             r.kind,
             r.session_id_cn
         );
+        assert_eq!(r.session_id_cn, "abc12345-fixture-session");
         // Every record carries src_session + kind + project_cwd metadata
         assert!(r.metadata.contains_key("kind"));
         assert_eq!(

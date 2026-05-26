@@ -147,17 +147,18 @@ function FieldPage() {
   }, [queryText]);
 
   // Send the query against the same scope the user has filtered to.
-  // Single-session mode if a session is picked, otherwise cross-session
-  // over every session in the current project filter (or all sessions).
+  // Single-session mode if a session is picked; otherwise omit session
+  // filters and let the backend search globally from its own session index.
   const querySessionIds = useMemo(() => {
     if (focusedSession) return [focusedSession];
-    return sessionOptions.map((s) => s.id);
-  }, [focusedSession, sessionOptions]);
+    if (focusedProject) return sessionOptions.map((s) => s.id);
+    return [];
+  }, [focusedProject, focusedSession, sessionOptions]);
 
   const queryActive = queryDebounced.trim().length >= 2;
   const queryResults = useQuery({
     queryKey: ['field-query', queryDebounced, querySessionIds, focusedSession],
-    enabled: queryActive && querySessionIds.length > 0,
+    enabled: queryActive && (!focusedProject || querySessionIds.length > 0),
     staleTime: 10_000,
     queryFn: async () => {
       // top_k=40 because /field shows a lot of fragments at once; the
@@ -167,7 +168,9 @@ function FieldPage() {
         top_k: 40,
         ...(focusedSession
           ? { session_id: focusedSession }
-          : { session_ids: querySessionIds }),
+          : focusedProject
+            ? { session_ids: querySessionIds }
+            : {}),
       });
     },
   });
