@@ -119,30 +119,35 @@ function SearchPage() {
     return m;
   }, [sessions.data]);
 
-  // Pick the target sessions: explicit chip → single-session retrieve;
-  // otherwise hand the substrate the full session list. The substrate's
-  // cross-session mode (POST /api/v1/tools/retrieve with `session_ids`)
-  // does the merge under a single snapshot lock, so we no longer need
-  // the per-session HTTP fan-out the old UI relied on.
+  // Pick target sessions only when the user actually scopes by session or
+  // project. With no scope chip, omit both session_id and session_ids so the
+  // substrate performs a global search from its own session index.
   const targetSessionIds: string[] = useMemo(() => {
     if (sessionChip) return [sessionChip.v];
-    return sessions.data.map((s) => s.id);
-  }, [sessions.data, sessionChip]);
+    if (projectChip) {
+      return sessions.data
+        .filter((s) => basename(s.project_cwd) === projectChip.v)
+        .map((s) => s.id);
+    }
+    return [];
+  }, [projectChip, sessions.data, sessionChip]);
 
   const searchQuery = useQuery({
     queryKey: ['search', qDebounced, metadataFilter, targetSessionIds],
-    enabled: qDebounced.trim().length > 0 && targetSessionIds.length > 0,
+    enabled: qDebounced.trim().length > 0 && (!projectChip || targetSessionIds.length > 0),
     staleTime: 5_000,
     queryFn: async (): Promise<SearchResultRow[]> => {
-      // ONE call covers every requested session. The substrate tags
-      // each hit with its owning `session_id` so we can group/colorize
-      // results client-side.
+      // Unscoped search intentionally sends no session list. Project-scoped
+      // search sends only sessions from that project; session-scoped search
+      // uses the single-session wire-compatible path.
       const res = await api.retrieve({
         query: qDebounced,
         top_k: 50,
         ...(sessionChip
           ? { session_id: sessionChip.v }
-          : { session_ids: targetSessionIds }),
+          : projectChip
+            ? { session_ids: targetSessionIds }
+            : {}),
         metadata_filter:
           Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
       });
@@ -219,7 +224,11 @@ function SearchPage() {
           {q
             ? searchQuery.isLoading
               ? 'searching…'
-              : `${results.length} hits · ${chips.length} filters · ${targetSessionIds.length} session(s) searched`
+              : `${results.length} hits · ${chips.length} filters · ${
+                  sessionChip || projectChip
+                    ? `${targetSessionIds.length} session(s)`
+                    : 'all sessions'
+                } searched`
             : 'type to search'}
         </span>
       </div>

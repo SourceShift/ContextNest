@@ -376,7 +376,7 @@ mod tests {
             kind,
             text: text.to_string(),
             importance: kind.default_importance(),
-            session_id_cn: "cc-test123".to_string(),
+            session_id_cn: "test123".to_string(),
             metadata: HashMap::new(),
         }
     }

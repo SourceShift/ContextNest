@@ -60,7 +60,7 @@ async fn todo_fragments_surface_in_inbox() {
     let server = make_server().await;
     store(
         &server,
-        "cc-todo",
+        "sess-todo",
         "User picks: ship the feature or keep iterating",
         json!({"kind": "todo", "ts": "2026-05-20T17:00:00Z"}),
     )
@@ -77,7 +77,7 @@ async fn user_actions_surface_in_inbox() {
     let server = make_server().await;
     store(
         &server,
-        "cc-aaaa",
+        "sess-aaaa",
         "run the migration before EOD",
         json!({"kind": "user_action", "urgency": "now", "ts": "2026-05-20T18:00:00Z"}),
     )
@@ -86,7 +86,7 @@ async fn user_actions_surface_in_inbox() {
     let body = inbox(&server).await;
     let items = body["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["session_id"], "cc-aaaa");
+    assert_eq!(items[0]["session_id"], "sess-aaaa");
     assert_eq!(items[0]["metadata"]["kind"], "user_action");
 }
 
@@ -95,7 +95,7 @@ async fn awaiting_decisions_surface_other_decisions_do_not() {
     let server = make_server().await;
     store(
         &server,
-        "cc-bbbb",
+        "sess-bbbb",
         "should we adopt embeddings or token overlap?",
         json!({
             "kind": "decision",
@@ -106,7 +106,7 @@ async fn awaiting_decisions_surface_other_decisions_do_not() {
     .await;
     store(
         &server,
-        "cc-bbbb",
+        "sess-bbbb",
         "we resolved to use embeddings",
         json!({
             "kind": "decision",
@@ -127,21 +127,21 @@ async fn non_inbox_kinds_are_filtered_out() {
     let server = make_server().await;
     store(
         &server,
-        "cc-cccc",
+        "sess-cccc",
         "learned a new mermaid quirk",
         json!({"kind": "learning"}),
     )
     .await;
     store(
         &server,
-        "cc-cccc",
+        "sess-cccc",
         "shipped the schema extension",
         json!({"kind": "accomplishment"}),
     )
     .await;
     store(
         &server,
-        "cc-cccc",
+        "sess-cccc",
         "stop polling so aggressively",
         json!({"kind": "user_action", "urgency": "soon"}),
     )
@@ -158,21 +158,21 @@ async fn cross_session_items_are_returned_in_one_response() {
     let server = make_server().await;
     store(
         &server,
-        "cc-sess1",
+        "sess1",
         "session 1 action",
         json!({"kind": "user_action", "ts": "2026-05-20T10:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-sess2",
+        "sess2",
         "session 2 action",
         json!({"kind": "user_action", "ts": "2026-05-20T11:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-sess3",
+        "sess3",
         "session 3 awaiting decision",
         json!({
             "kind": "decision",
@@ -190,9 +190,9 @@ async fn cross_session_items_are_returned_in_one_response() {
         .iter()
         .map(|i| i["session_id"].as_str().unwrap())
         .collect();
-    assert!(sessions.contains("cc-sess1"));
-    assert!(sessions.contains("cc-sess2"));
-    assert!(sessions.contains("cc-sess3"));
+    assert!(sessions.contains("sess1"));
+    assert!(sessions.contains("sess2"));
+    assert!(sessions.contains("sess3"));
 }
 
 #[tokio::test]
@@ -200,21 +200,21 @@ async fn items_are_sorted_by_ts_descending() {
     let server = make_server().await;
     store(
         &server,
-        "cc-sort",
+        "sess-sort",
         "oldest",
         json!({"kind": "user_action", "ts": "2026-05-18T10:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-sort",
+        "sess-sort",
         "newest",
         json!({"kind": "user_action", "ts": "2026-05-20T10:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-sort",
+        "sess-sort",
         "middle",
         json!({"kind": "user_action", "ts": "2026-05-19T10:00:00Z"}),
     )
@@ -233,14 +233,14 @@ async fn soft_deleted_fragments_do_not_appear() {
     let server = make_server().await;
     let keep_id = store(
         &server,
-        "cc-soft",
+        "sess-soft",
         "still active",
         json!({"kind": "user_action", "ts": "2026-05-20T10:00:00Z"}),
     )
     .await;
     let drop_id = store(
         &server,
-        "cc-soft",
+        "sess-soft",
         "about to be discarded",
         json!({"kind": "user_action", "ts": "2026-05-20T11:00:00Z"}),
     )
@@ -251,7 +251,7 @@ async fn soft_deleted_fragments_do_not_appear() {
         .json(&json!({
             "attractor_id": drop_id,
             "soft_delete": true,
-            "session_id": "cc-soft",
+            "session_id": "sess-soft",
         }))
         .await;
     res.assert_status_ok();
@@ -283,7 +283,7 @@ async fn duplicate_emissions_collapse_to_newest_per_session_kind_content() {
     ] {
         store(
             &server,
-            "cc-dup",
+            "sess-dup",
             "Pick A/B/C for reload strategy",
             json!({"kind": "user_action", "urgency": "now", "ts": ts}),
         )
@@ -314,14 +314,14 @@ async fn dedup_keeps_distinct_content_in_same_session() {
     let server = make_server().await;
     store(
         &server,
-        "cc-distinct",
+        "sess-distinct",
         "First user action",
         json!({"kind": "user_action", "ts": "2026-05-21T10:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-distinct",
+        "sess-distinct",
         "Second user action",
         json!({"kind": "user_action", "ts": "2026-05-21T11:00:00Z"}),
     )
@@ -331,7 +331,7 @@ async fn dedup_keeps_distinct_content_in_same_session() {
     let items = body["items"].as_array().expect("items array");
     let count_in_session = items
         .iter()
-        .filter(|i| i["session_id"] == "cc-distinct")
+        .filter(|i| i["session_id"] == "sess-distinct")
         .count();
     assert_eq!(count_in_session, 2, "distinct content stays distinct");
 }
@@ -344,14 +344,14 @@ async fn dedup_preserves_cross_session_duplicates() {
     let server = make_server().await;
     store(
         &server,
-        "cc-sessA",
+        "sessA",
         "Run wrangler login",
         json!({"kind": "user_action", "ts": "2026-05-21T10:00:00Z"}),
     )
     .await;
     store(
         &server,
-        "cc-sessB",
+        "sessB",
         "Run wrangler login",
         json!({"kind": "user_action", "ts": "2026-05-21T11:00:00Z"}),
     )
@@ -379,7 +379,7 @@ async fn fragments_without_metadata_do_not_appear() {
         .json(&json!({
             "content": "metadata-less fragment",
             "importance": 0.5,
-            "session_id": "cc-nometa",
+            "session_id": "sess-nometa",
         }))
         .await;
     res.assert_status_ok();
