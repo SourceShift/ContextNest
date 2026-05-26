@@ -513,7 +513,10 @@ async fn summary_assembles_full_insight_shape() {
         "Endpoint shipped, awaiting daemon-side wiring"
     );
     assert_eq!(s["top_jobs"].as_array().unwrap().len(), 1);
-    assert_eq!(s["top_jobs"][0].as_str().unwrap(), "Wrote the route handler");
+    assert_eq!(
+        s["top_jobs"][0].as_str().unwrap(),
+        "Wrote the route handler"
+    );
     assert_eq!(s["facts"].as_array().unwrap().len(), 1);
     assert_eq!(s["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(s["tasks"][0]["id"].as_str().unwrap(), "wire-daemon");
@@ -564,7 +567,10 @@ async fn summary_picks_latest_goal_and_state() {
 
     let body = summary(&server, sid).await;
     assert_eq!(body["summary"]["goal"].as_str().unwrap(), "new goal");
-    assert_eq!(body["summary"]["current_state"].as_str().unwrap(), "new state");
+    assert_eq!(
+        body["summary"]["current_state"].as_str().unwrap(),
+        "new state"
+    );
 }
 
 /// 404 for an unknown session — the categorizer relies on this to
@@ -572,6 +578,8 @@ async fn summary_picks_latest_goal_and_state() {
 #[tokio::test]
 async fn summary_unknown_session_returns_404() {
     let server = make_server().await;
-    let res = server.get("/api/v1/sessions/cc-does-not-exist/summary").await;
+    let res = server
+        .get("/api/v1/sessions/cc-does-not-exist/summary")
+        .await;
     assert_eq!(res.status_code(), 404, "unknown session must 404");
 }
