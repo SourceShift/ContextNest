@@ -75,8 +75,14 @@ function logicalHitKey(hit: RetrieveHit): string {
       ? hit.metadata.src_session
       : hit.session_id ?? '';
   const taskId = typeof hit.metadata.task_id === 'string' ? hit.metadata.task_id : '';
+  const ts =
+    source === 'TaskCompleted'
+      ? ''
+      : typeof hit.metadata.ts === 'string'
+        ? hit.metadata.ts
+        : '';
   const text = hit.content.trim().replace(/\s+/g, ' ');
-  return [kind, source, srcSession, taskId, text].join('\u001f');
+  return [kind, source, srcSession, taskId, ts, text].join('\u001f');
 }
 
 function compareByTimestampDesc(a: RetrieveHit, b: RetrieveHit): number {

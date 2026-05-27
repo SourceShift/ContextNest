@@ -94,7 +94,8 @@ async fn store_uses_stable_fragment_id_for_logical_duplicates() {
             "metadata": {
                 "kind": "accomplishment",
                 "source": "TaskCompleted",
-                "ts": "2026-05-27T06:46:11.998Z"
+                "ts": "2026-05-27T06:40:58.804Z",
+                "last_accessed": "2026-05-27T06:46:11.998Z"
             },
         }))
         .await
