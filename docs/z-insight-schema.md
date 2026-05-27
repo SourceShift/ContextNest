@@ -32,6 +32,17 @@ re-summarise free-form text.
   "current_state":      "Foundation MVP scope locked; epic specs landed; starting implementation.",
   "facts":              ["FragmentSidecar widening is the smallest change unlocking metadata filtering"],
 
+  "read_context":      [],
+  "verification":      [],
+  "evidence_refs":     [],
+  "decisions":         [],
+  "failures":          [],
+  "prompt_directives": [],
+  "assumptions":       [],
+  "artifacts":         [],
+  "memory_candidates": [],
+  "risk_flags":        [],
+
   "tasks": [
     {"id": "T-43", "subject": "Build ingester module — parser + extractor + sink", "status": "in_progress"},
     {"id": "T-44", "subject": "Add Ingest CLI subcommand",                         "status": "pending"}
@@ -82,6 +93,43 @@ re-summarise free-form text.
 
 ### New fields (ContextNest extensions — all optional, backward-compatible)
 
+### Sparse trajectory emission policy
+
+The trajectory arrays default to `[]`. Emit entries only when a turn crosses
+one of these gates:
+
+- **Decision gate:** a choice was settled that should prevent future agents
+  from reopening the same question.
+- **Verification gate:** a command, test, dry-run, curl probe, or manual check
+  materially changed confidence in the work.
+- **Failure/recovery gate:** a non-obvious failed attempt, blocked command,
+  wrong hypothesis, or recovery path should not be repeated.
+- **Risk gate:** the turn touched security, privacy, data loss, shared infra,
+  WAL/schema migration, secrets, or other high-consequence state.
+- **Promotion gate:** the turn produced a reusable instruction, repeated
+  pattern, durable workflow, or high-consequence gotcha.
+- **Artifact gate:** a durable file/report/fixture/patch was produced and is
+  likely worth finding by path later.
+
+Hard caps per turn:
+
+| Field | Max entries |
+|---|---:|
+| `read_context` | 3 |
+| `verification` | 3 |
+| `evidence_refs` | 5 |
+| `decisions` | 2 |
+| `failures` | 2 |
+| `prompt_directives` | 1 |
+| `assumptions` | 2 |
+| `artifacts` | 3 |
+| `memory_candidates` | 2 |
+| `risk_flags` | 2 |
+
+These caps are prompt-level guidance, not a storage limit. They keep per-turn
+token cost and memory noise bounded while still preserving high-signal
+trajectory evidence for later phase/session aggregation.
+
 | Field | Type | Required? | Purpose |
 |---|---|---|---|
 | `current_task` | string | optional | **What I'm doing THIS turn** specifically. Distinct from `goal` (which is session-level + stable). `goal` answers "where are we headed?"; `current_task` answers "where am I right now?" |
@@ -91,6 +139,16 @@ re-summarise free-form text.
 | `blockers` | string[] | optional | Concrete blockers preventing progress. Distinct from `progress: "blocked"` (which is just a flag) — these are the actual reasons. Each blocker should be one short string. |
 | `requires_user_action` | object[] | optional | **Imperative steps the USER must do** (reload a page, click a button, run a command, confirm an outcome). Distinct from `tasks[]` which is the assistant's own work. Each entry: `{step, action, reason, urgency}` where `urgency` ∈ `"now"`/`"soon"`/`"later"`. See semantics below. |
 | `delivered_features` | object[] | optional | **Features this turn shipped**, named in the assistant's own words. Lets the substrate answer "which session added the query-overlay mode" without grepping commits or PRs. Each entry: `{feature, files?, refs?, layer?}` — see [`delivered_features[]` shape](#delivered_features-shape) below. Higher-signal than walking `tool_use` because the agent names the feature; the per-file `tool_use` index in the ingester answers "which session touched X.tsx" complementarily. |
+| `read_context` | object[] | optional | Files, docs, transcripts, or external sources the assistant inspected before acting. Distinct from `files_touched`, which records only mutations. |
+| `verification` | object[] | optional | Commands, curl probes, manual checks, dry-runs, or tests with status and summary. Used to distinguish verified work from plans and assumptions. |
+| `evidence_refs` | object[] | optional | Structured pointers supporting claims in the block: file anchors, commands, PRs, commits, URLs, transcript turns, or logs. |
+| `decisions` | object[] | optional | Settled decisions already made. Distinct from `decision` + `awaiting_decision`, which means the user still needs to decide. |
+| `failures` | object[] | optional | Error, failed-command, permission-denial, or recovery traces. Used for future trajectory analysis and anti-pattern extraction. |
+| `prompt_directives` | object[] | optional | Compact, scoped candidate instructions that a future prompt compiler may inject. Should include trigger, directive, scope, confidence, and evidence when possible. |
+| `assumptions` | object[] | optional | Premises that shaped the work and may go stale. Should carry basis and validity/staleness hints. |
+| `artifacts` | object[] | optional | Docs, reports, plans, research notes, todos, or patches produced this turn that are not shipped product features. |
+| `memory_candidates` | object[] | optional | Candidate long-term preferences, rules, gotchas, workflows, or anti-patterns that need later promotion. |
+| `risk_flags` | object[] | optional | Security, privacy, data-loss, migration, or high-consequence constraints that future prompts should surface early. |
 
 ### `requires_user_action[]` shape
 
@@ -159,6 +217,68 @@ unambiguous form:
 - Used by future "what code defines feature X" queries; not yet
   consumed by an endpoint but stored so it's there when needed.
 
+### `verification[]` shape
+
+```jsonc
+{
+  "kind": "shell",                 // shell|curl|manual|test|dry_run
+  "command": "cargo test --lib",   // optional for manual checks
+  "status": "passed",              // passed|failed|blocked|not_run
+  "summary": "All extractor tests passed",
+  "counts": {"tests": 12, "failures": 0}
+}
+```
+
+Failed and blocked verification records are stored with higher importance than
+passed records because future sessions need to see unresolved checks early.
+
+### `read_context[]` shape
+
+```jsonc
+{
+  "path": "src/ingest/claude_code/extractor.rs",
+  "kind": "source",                 // doc|source|test|config|transcript|external
+  "reason": "Match the existing MemoryKind pattern",
+  "salient": "metadata.kind is the routing key",
+  "refs": ["src/ingest/claude_code/extractor.rs:78"]
+}
+```
+
+Use this for meaningful grounding context, not every file skimmed. The
+ingester stores item-level `kind` as `metadata.item_kind` so it does not
+overwrite the memory router in `metadata.kind`.
+
+### `decisions[]` shape
+
+```jsonc
+{
+  "decision": "Use optional z-insight arrays before changing storage schema",
+  "made_by": "assistant",
+  "alternatives": ["free-form facts only", "new SQL tables first"],
+  "rationale": "Existing parser can accept optional fields safely",
+  "reversibility": "two_way",
+  "scope": "project"
+}
+```
+
+Use `decisions[]` only for settled choices. Use `awaiting_decision` +
+`decision` when the user still needs to choose.
+
+### `prompt_directives[]` shape
+
+```jsonc
+{
+  "trigger": "When modifying Claude ingest schema",
+  "directive": "Run a dry-run ingest before changing storage behavior",
+  "scope": "project",
+  "confidence": "high",
+  "evidence": ["session abc123"]
+}
+```
+
+These are candidate prompt-capsule lines. Keep them short, scoped, and
+evidence-linked so bad directives can be audited and demoted later.
+
 ## What the ingester does with this
 
 ContextNest's ingester (`src/ingest/claude_code/`) parses every
@@ -177,6 +297,16 @@ ContextNest's ingester (`src/ingest/claude_code/`) parses every
 | `awaiting_decision: true` + `decision` | `decision` | `{decision_text, awaiting_decision: true, ts, src_session}` |
 | `blockers[]` (per item) | `blocker` | `{ts, src_session}` |
 | `requires_user_action[]` (per item) | `user_action` | `{step, reason, urgency, ts, src_session}` |
+| `read_context[]` (per item) | `read_context` | item fields, with item-level `kind` stored as `item_kind` |
+| `verification[]` (per item) | `verification` | item fields, with failed/blocked status assigned higher importance |
+| `evidence_refs[]` (per item) | `evidence_ref` | item fields, with item-level `kind` stored as `item_kind` |
+| `decisions[]` (per item) | `decision_made` | item fields |
+| `failures[]` (per item) | `failure` | item fields |
+| `prompt_directives[]` (per item) | `prompt_directive` | item fields, with confidence influencing importance |
+| `assumptions[]` (per item) | `assumption` | item fields |
+| `artifacts[]` (per item) | `artifact` | item fields, with item-level `kind` stored as `item_kind` |
+| `memory_candidates[]` (per item) | `memory_candidate` | item fields, with item-level `kind` stored as `item_kind` |
+| `risk_flags[]` (per item) | `risk_flag` | item fields, with high/critical severity assigned higher importance |
 | (whole session) | `session_title` (from `ai-title` events) | `{ts, src_session}` |
 
 ## How to start emitting the new fields

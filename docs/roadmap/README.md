@@ -12,6 +12,10 @@ referenced epic spec is approved and tracked through CHANGELOG.
 - [**v0.3-llm-proxy.md**](v0.3-llm-proxy.md) — concrete spec for the
   self-caching LLM proxy. The cheapest first milestone after v0.2;
   proves the memory-as-substrate thesis applied to a single primitive.
+- [**v0.4-z-insight-trajectory-signals.md**](v0.4-z-insight-trajectory-signals.md)
+  Transcript-derived proposal for richer `z-insight` fields that let
+  ContextNest build evidence-linked prompt capsules from long-term Claude
+  trajectories.
 
 ## Future placeholders
 
