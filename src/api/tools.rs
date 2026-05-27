@@ -1250,12 +1250,21 @@ fn logical_hit_key(hit: &RetrieveHit) -> String {
         .get("task_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let ts = if source == "TaskCompleted" {
+        ""
+    } else {
+        hit.metadata
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
     format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         kind,
         source,
         src_session,
         task_id,
+        ts,
         normalize_logical_content(&hit.content)
     )
 }
