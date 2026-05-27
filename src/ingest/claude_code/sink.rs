@@ -15,6 +15,7 @@
 //! receives.
 
 use crate::error::{ContextNestError, ContextNestResult};
+use crate::services::fragment_id::stable_fragment_id;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -311,7 +312,7 @@ impl Sink for ServicesSink {
     /// [`crate::api::tools::restore_sidecars_bulk`] — see that doc for
     /// the retrieve-returns-empty-for-replayed-fragments caveat.
     async fn store(&self, record: &MemoryRecord) -> ContextNestResult<()> {
-        let fragment_id = uuid::Uuid::new_v4().to_string();
+        let fragment_id = stable_fragment_id(&record.session_id_cn, &record.text, &record.metadata);
 
         // Sidecar inserts only. No embedding, no process_memories, no LLM.
         self.services

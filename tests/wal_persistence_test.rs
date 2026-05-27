@@ -65,6 +65,117 @@ async fn store_appends_record_to_wal() {
 }
 
 #[tokio::test]
+async fn store_uses_stable_fragment_id_for_logical_duplicates() {
+    let dir = tempdir().unwrap();
+    let wal_path = dir.path().join("wal.jsonl");
+
+    let server = make_server_with_wal(wal_path.clone()).await;
+
+    let first: Value = server
+        .post("/api/v1/tools/store")
+        .json(&json!({
+            "content": "Completed: Token sanity check",
+            "importance": 0.75,
+            "session_id": "sess-stable",
+            "metadata": {
+                "kind": "accomplishment",
+                "source": "TaskCompleted",
+                "ts": "2026-05-27T06:40:58.804Z"
+            },
+        }))
+        .await
+        .json();
+    let second: Value = server
+        .post("/api/v1/tools/store")
+        .json(&json!({
+            "content": "Completed: Token sanity check",
+            "importance": 0.75,
+            "session_id": "sess-stable",
+            "metadata": {
+                "kind": "accomplishment",
+                "source": "TaskCompleted",
+                "ts": "2026-05-27T06:46:11.998Z"
+            },
+        }))
+        .await
+        .json();
+
+    assert_eq!(
+        first["attractor_id"], second["attractor_id"],
+        "same logical memory should overwrite the same fragment id"
+    );
+}
+
+#[tokio::test]
+async fn retrieve_dedupes_existing_duplicate_fragments_by_logical_row() {
+    let services = ContextNestServices::new_default().await.unwrap();
+    restore_sidecars_bulk(
+        &services,
+        vec![
+            (
+                "old-random-a".to_string(),
+                "sess-dup".to_string(),
+                "Completed: Token sanity check".to_string(),
+                std::collections::HashMap::from([
+                    ("kind".to_string(), json!("accomplishment")),
+                    ("source".to_string(), json!("TaskCompleted")),
+                    ("src_session".to_string(), json!("sess-dup")),
+                    ("ts".to_string(), json!("2026-05-27T06:40:58.804Z")),
+                ]),
+            ),
+            (
+                "old-random-b".to_string(),
+                "sess-dup".to_string(),
+                "Completed: Token sanity check".to_string(),
+                std::collections::HashMap::from([
+                    ("kind".to_string(), json!("accomplishment")),
+                    ("source".to_string(), json!("TaskCompleted")),
+                    ("src_session".to_string(), json!("sess-dup")),
+                    ("ts".to_string(), json!("2026-05-27T06:46:11.998Z")),
+                ]),
+            ),
+            (
+                "old-random-c".to_string(),
+                "sess-dup".to_string(),
+                "Completed: Create worker prompt template".to_string(),
+                std::collections::HashMap::from([
+                    ("kind".to_string(), json!("accomplishment")),
+                    ("source".to_string(), json!("TaskCompleted")),
+                    ("src_session".to_string(), json!("sess-dup")),
+                    ("ts".to_string(), json!("2026-05-27T06:42:43.038Z")),
+                ]),
+            ),
+        ],
+    )
+    .await;
+
+    let app = create_simple_app(services).await.unwrap();
+    let server = TestServer::new(app).unwrap();
+    let res: Value = server
+        .post("/api/v1/tools/retrieve")
+        .json(&json!({
+            "query": "accomplishment",
+            "session_id": "sess-dup",
+            "top_k": 50,
+            "metadata_filter": {"kind": "accomplishment"}
+        }))
+        .await
+        .json();
+    let hits = res["hits"].as_array().unwrap();
+
+    assert_eq!(hits.len(), 2, "duplicate logical rows should collapse");
+    let sanity = hits
+        .iter()
+        .find(|hit| hit["content"] == "Completed: Token sanity check")
+        .expect("sanity hit");
+    assert_eq!(
+        sanity["metadata"]["ts"],
+        json!("2026-05-27T06:46:11.998Z"),
+        "dedupe should keep the newest metadata for display"
+    );
+}
+
+#[tokio::test]
 async fn replay_restores_state_visible_to_inbox_endpoint() {
     let dir = tempdir().unwrap();
     let wal_path = dir.path().join("wal.jsonl");

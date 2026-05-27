@@ -46,6 +46,7 @@ use crate::memory::attractors::memory_attractor_manager::{
     MemoryProcessingRequest, ProcessingOptions, ProcessingPriority,
 };
 use crate::memory::attractors::MemoryFragment;
+use crate::services::fragment_id::stable_fragment_id;
 use crate::services::ContextNestServices;
 use std::collections::HashSet;
 
@@ -291,7 +292,7 @@ pub async fn store(
         .session_id
         .unwrap_or_else(|| DEFAULT_SESSION.to_string());
     let importance = req.importance.unwrap_or(0.5).clamp(0.0, 1.0);
-    let fragment_id = uuid::Uuid::new_v4().to_string();
+    let fragment_id = stable_fragment_id(&session_id, &req.content, &req.metadata);
 
     match store_with_id(
         &services,
@@ -721,6 +722,7 @@ pub async fn retrieve(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
+    dedupe_logical_hits(&mut scored);
     scored.truncate(req.top_k);
 
     // Phase 2 of the neural-field epic: bump `last_accessed` on every
@@ -1205,6 +1207,90 @@ fn metadata_filter_matches(
             .map(|actual| actual == expected)
             .unwrap_or(false)
     })
+}
+
+fn dedupe_logical_hits(hits: &mut Vec<RetrieveHit>) {
+    let mut out: Vec<RetrieveHit> = Vec::with_capacity(hits.len());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+
+    for hit in hits.drain(..) {
+        let key = logical_hit_key(&hit);
+        if let Some(existing_idx) = seen.get(&key).copied() {
+            if prefer_hit(&hit, &out[existing_idx]) {
+                out[existing_idx] = hit;
+            }
+        } else {
+            seen.insert(key, out.len());
+            out.push(hit);
+        }
+    }
+
+    *hits = out;
+}
+
+fn logical_hit_key(hit: &RetrieveHit) -> String {
+    let kind = hit
+        .metadata
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source = hit
+        .metadata
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let src_session = hit
+        .metadata
+        .get("src_session")
+        .and_then(|v| v.as_str())
+        .or(hit.session_id.as_deref())
+        .unwrap_or("");
+    let task_id = hit
+        .metadata
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        kind,
+        source,
+        src_session,
+        task_id,
+        normalize_logical_content(&hit.content)
+    )
+}
+
+fn normalize_logical_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn prefer_hit(candidate: &RetrieveHit, current: &RetrieveHit) -> bool {
+    let cand_ts = metadata_ts_millis(&candidate.metadata);
+    let curr_ts = metadata_ts_millis(&current.metadata);
+    cand_ts
+        .cmp(&curr_ts)
+        .then_with(|| {
+            candidate
+                .similarity
+                .partial_cmp(&current.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            candidate
+                .importance
+                .partial_cmp(&current.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .is_gt()
+}
+
+fn metadata_ts_millis(metadata: &HashMap<String, serde_json::Value>) -> i64 {
+    metadata
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(i64::MIN)
 }
 
 /// POST /api/v1/tools/update — mutate an existing fragment's properties.
