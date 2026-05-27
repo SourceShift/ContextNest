@@ -1215,6 +1215,20 @@ pub struct TrajectoryCostProfile {
     pub risk_flags: usize,
 }
 
+/// One row of session-to-basin overlap. Emitted on the trajectory response so
+/// the dashboard can surface the substrate's clustering judgement without
+/// re-querying `/field/basins`. `members_in_session` answers "how many of THIS
+/// session's fragments did the substrate cluster into this basin"; `heat_24h`
+/// answers "is this basin alive right now" (write-time, basin-wide).
+#[derive(Debug, Serialize)]
+pub struct BasinLink {
+    pub basin_id: String,
+    pub members_in_session: usize,
+    pub total_members: usize,
+    pub heat_24h: usize,
+    pub hottest_kind: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TrajectoryResponse {
     pub session_id: String,
@@ -1223,6 +1237,11 @@ pub struct TrajectoryResponse {
     pub records: Vec<TrajectoryRecord>,
     pub promotion_queue: Vec<TrajectoryRecord>,
     pub cost_profile: TrajectoryCostProfile,
+    /// Basins this session's fragments live in, ranked by `members_in_session`
+    /// desc. Empty when the consolidation worker hasn't crystallised any of
+    /// the session's fragments into basins yet (cold-substrate / pre-Phase-3
+    /// state, see `docs/architecture-honest.md`).
+    pub basin_links: Vec<BasinLink>,
 }
 
 #[derive(Debug, Clone)]
@@ -1295,6 +1314,77 @@ pub async fn session_trajectory(
     }
     drop(texts);
     drop(metadata);
+
+    // Basin overlap — answers "which substrate-clustered groups does this
+    // session's content live in?" Geometry comes from the manager; per-fragment
+    // ts (write-time) gives the heat signal. Holding the metadata read guard
+    // through the synchronous loop is intentional — never await inside.
+    let basin_snapshots = services.attractor_manager.list_basin_snapshots().await;
+    let basin_links: Vec<BasinLink> = if basin_snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let session_id_set: std::collections::HashSet<&String> = active_ids.iter().collect();
+        let metadata = services.fragment_metadata.read().await;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+
+        let mut links: Vec<BasinLink> = Vec::new();
+        for snapshot in &basin_snapshots {
+            let overlap_count = snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| session_id_set.contains(id))
+                .count();
+            if overlap_count == 0 {
+                continue;
+            }
+
+            let heat_24h = snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| {
+                    metadata
+                        .get(*id)
+                        .and_then(|m| m.get("ts"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                        .unwrap_or(false)
+                })
+                .count();
+
+            let mut kind_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for id in snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| session_id_set.contains(id))
+            {
+                if let Some(rec) = records.iter().find(|r| &r.id == id) {
+                    *kind_counts.entry(rec.kind.clone()).or_insert(0) += 1;
+                }
+            }
+            let hottest_kind = kind_counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(k, _)| k);
+
+            links.push(BasinLink {
+                basin_id: snapshot.id.clone(),
+                members_in_session: overlap_count,
+                total_members: snapshot.fragment_ids.len(),
+                heat_24h,
+                hottest_kind,
+            });
+        }
+        drop(metadata);
+        links.sort_by(|a, b| {
+            b.members_in_session
+                .cmp(&a.members_in_session)
+                .then_with(|| b.heat_24h.cmp(&a.heat_24h))
+        });
+        links
+    };
 
     phases.sort_by(|a, b| {
         a.start_ts
@@ -1387,6 +1477,7 @@ pub async fn session_trajectory(
             memory_candidates,
             risk_flags,
         },
+        basin_links,
     }))
 }
 

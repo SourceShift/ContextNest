@@ -660,6 +660,97 @@ async fn trajectory_endpoint_groups_records_phases_and_promotion_queue() {
     assert_eq!(body["cost_profile"]["trajectory_records"].as_u64(), Some(4));
     assert_eq!(body["cost_profile"]["prompt_directives"].as_u64(), Some(1));
     assert_eq!(body["cost_profile"]["memory_candidates"].as_u64(), Some(1));
+
+    // `basin_links` must be present as an array — the field shape is a
+    // hard contract for the dashboard's basin badge. Content correctness
+    // (member counts, heat, hottest kind) is asserted in the dedicated
+    // test that explicitly drains the consolidation queue; the mock-mode
+    // test substrate populates basins inline so we can't reliably assert
+    // emptiness here without coupling to that mock-only behaviour.
+    assert!(
+        body["basin_links"].is_array(),
+        "basin_links must be present as an array, got: {:?}",
+        body["basin_links"]
+    );
+}
+
+/// `basin_links` populates with substrate geometry once the consolidation
+/// worker crystallises basins for the session's fragments. The test forces
+/// consolidation via `drain_for_test` so we can assert the populated shape
+/// rather than only the cold-substrate empty case.
+#[tokio::test]
+async fn trajectory_endpoint_exposes_basin_links_post_consolidation() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+    let sid = "cc-basin-links";
+
+    // Three semantically similar fragments under one session. With the
+    // canonical pipeline draining synchronously they should land in the
+    // same basin (or at most a handful of basins) — enough to populate
+    // basin_links.
+    for (i, ts) in [
+        "2026-05-27T09:00:00Z",
+        "2026-05-27T09:05:00Z",
+        "2026-05-27T09:10:00Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        store(
+            &server,
+            sid,
+            &format!("trajectory verification probe #{i}"),
+            json!({
+                "kind": "verification",
+                "src_session": sid,
+                "ts": ts,
+                "status": "passed",
+            }),
+        )
+        .await;
+    }
+
+    drain_for_test(&services, &services.consolidation_queue, 3).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let basin_links = body["basin_links"].as_array().expect("basin_links present");
+    assert!(
+        !basin_links.is_empty(),
+        "expected at least one basin_link after draining consolidation queue"
+    );
+
+    let total_members_in_session: u64 = basin_links
+        .iter()
+        .map(|l| l["members_in_session"].as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        total_members_in_session >= 3,
+        "expected basin coverage of all 3 stored fragments, got {total_members_in_session}"
+    );
+
+    let first = &basin_links[0];
+    assert!(first["basin_id"].is_string(), "basin_id must be a string");
+    assert!(
+        first["total_members"].as_u64().unwrap_or(0) >= 1,
+        "total_members must be at least 1 when a basin overlaps the session"
+    );
+    assert_eq!(
+        first["hottest_kind"].as_str(),
+        Some("verification"),
+        "all stored fragments were verification kind"
+    );
 }
 
 /// Prompt preview is a deterministic, no-LLM capsule preview over the
