@@ -11,6 +11,7 @@ type NavKey =
   | 'sessions'
   | 'search'
   | 'phases'
+  | 'trajectories'
   | 'features'
   | 'field'
   | 'tools'
@@ -23,6 +24,7 @@ type NavItem = {
     | '/sessions'
     | '/search'
     | '/phases'
+    | '/trajectories'
     | '/features'
     | '/field'
     | '/tools'
@@ -50,6 +52,14 @@ export function Sidebar() {
   // endpoint hasn't returned yet we just omit the badge rather than
   // flashing a 0; once it lands the badge appears.
   const phasesCount = stats.data?.by_kind.goal_phase;
+  const trajectoryCount =
+    (stats.data?.by_kind.decision_made ?? 0) +
+    (stats.data?.by_kind.failure ?? 0) +
+    (stats.data?.by_kind.verification ?? 0) +
+    (stats.data?.by_kind.prompt_directive ?? 0) +
+    (stats.data?.by_kind.assumption ?? 0) +
+    (stats.data?.by_kind.memory_candidate ?? 0) +
+    (stats.data?.by_kind.risk_flag ?? 0);
   const urgent = inbox.data.some((i) => i.urgency === 'now');
 
   const nav: NavItem[] = [
@@ -84,6 +94,14 @@ export function Sidebar() {
       icon: <Icon.Layers className="nav-icon" />,
       kbd: 'g p',
       count: phasesCount,
+    },
+    {
+      k: 'trajectories',
+      to: '/trajectories',
+      label: 'Trajectories',
+      icon: <Icon.Hash className="nav-icon" />,
+      kbd: 'g j',
+      count: trajectoryCount || undefined,
     },
     {
       k: 'features',

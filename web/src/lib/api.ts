@@ -5,10 +5,12 @@ import type {
   FragmentsResponse,
   HealthResponse,
   InboxResponse,
+  PromptPreviewResponse,
   RetrieveResponse,
   SessionListResponse,
   StatsResponse,
   StatusResponse,
+  TrajectoryResponse,
 } from './types';
 
 const SUBSTRATE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:28080';
@@ -66,6 +68,18 @@ export const api = {
     }),
 
   sessions: () => request<SessionListResponse>('/api/v1/sessions', { method: 'GET' }),
+
+  sessionTrajectory: (sessionId: string) =>
+    request<TrajectoryResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/trajectory`,
+      { method: 'GET' },
+    ),
+
+  sessionPromptPreview: (sessionId: string) =>
+    request<PromptPreviewResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt-preview`,
+      { method: 'GET' },
+    ),
 
   inbox: () => request<InboxResponse>('/api/v1/inbox', { method: 'GET' }),
 

@@ -1467,6 +1467,165 @@ body {
   font-family: var(--font-mono);
 }
 
+.trajectory-cost {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+}
+.trajectory-cost span,
+.risk-chip,
+.scope-chip,
+.empty-inline {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+.trajectory-cost b {
+  color: var(--ink);
+  font-weight: 500;
+}
+.trajectory-records {
+  margin-top: 12px;
+  border-top: 1px dashed var(--border-subtle);
+}
+.trajectory-row.compact {
+  grid-template-columns: 1fr 68px;
+  gap: 10px;
+}
+.trajectory-row.compact .text {
+  font-size: 12px;
+}
+.risk-chip,
+.scope-chip {
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-dim);
+}
+.prompt-preview {
+  display: grid;
+  gap: 10px;
+}
+.prompt-section {
+  border-bottom: 1px dashed var(--border-subtle);
+  padding-bottom: 8px;
+}
+.prompt-section:last-child {
+  border-bottom: 0;
+}
+.prompt-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 12.5px;
+  color: var(--ink);
+  font-weight: 500;
+}
+.prompt-section-head .ct {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.empty-inline {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+}
+
+.trajectory-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.trajectory-metric {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  border-radius: var(--r-card);
+  padding: 12px 14px;
+}
+.trajectory-metric span {
+  display: block;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.trajectory-metric b {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 500;
+}
+.trajectory-metric.warn b {
+  color: var(--urg-soon);
+}
+.trajectory-session-list {
+  display: grid;
+  gap: 10px;
+}
+.trajectory-session-card {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  border-radius: var(--r-card);
+  padding: 14px 16px;
+}
+.trajectory-session-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.trajectory-session-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.trajectory-session-sub {
+  color: var(--ink-muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  margin-top: 7px;
+}
+.trajectory-session-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+}
+.trajectory-session-stats span {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+.trajectory-session-stats b {
+  color: var(--ink);
+  font-weight: 500;
+}
+.trajectory-kind-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
 .todo-status {
   display: inline-block;
   padding: 1px 6px;
