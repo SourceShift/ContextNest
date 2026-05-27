@@ -22,6 +22,21 @@ use tracing::warn;
 
 use crate::services::ContextNestServices;
 
+const TRAJECTORY_KINDS: &[&str] = &[
+    "read_context",
+    "verification",
+    "evidence_ref",
+    "decision_made",
+    "failure",
+    "prompt_directive",
+    "assumption",
+    "artifact",
+    "memory_candidate",
+    "risk_flag",
+];
+
+const PROMOTION_KINDS: &[&str] = &["memory_candidate", "prompt_directive", "risk_flag"];
+
 // =============================================================================
 // Response shapes
 // =============================================================================
@@ -1156,6 +1171,395 @@ pub async fn session_summary(
     }))
 }
 
+// =============================================================================
+// `GET /api/v1/sessions/:id/trajectory`
+//
+// Session-level trajectory surface for the dashboard. This is deliberately
+// aggregation-only: no LLM, no writes, no promotion side effects. It turns the
+// per-turn z-insight trajectory records into a chronological stream plus phase
+// buckets and a review queue for candidate long-term memory.
+// =============================================================================
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TrajectoryRecord {
+    pub id: String,
+    pub kind: String,
+    pub content: String,
+    pub ts: Option<String>,
+    pub phase_idx: Option<usize>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrajectoryPhase {
+    pub idx: usize,
+    pub goal: String,
+    pub start_ts: Option<String>,
+    pub end_ts: Option<String>,
+    pub counts: std::collections::HashMap<String, usize>,
+    pub decisions: Vec<TrajectoryRecord>,
+    pub failures: Vec<TrajectoryRecord>,
+    pub verifications: Vec<TrajectoryRecord>,
+    pub risks: Vec<TrajectoryRecord>,
+    pub prompt_directives: Vec<TrajectoryRecord>,
+    pub assumptions: Vec<TrajectoryRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrajectoryCostProfile {
+    pub trajectory_records: usize,
+    pub turns_estimate: usize,
+    pub records_per_turn: f32,
+    pub prompt_directives: usize,
+    pub memory_candidates: usize,
+    pub risk_flags: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TrajectoryResponse {
+    pub session_id: String,
+    pub trajectory_count: usize,
+    pub phases: Vec<TrajectoryPhase>,
+    pub records: Vec<TrajectoryRecord>,
+    pub promotion_queue: Vec<TrajectoryRecord>,
+    pub cost_profile: TrajectoryCostProfile,
+}
+
+#[derive(Debug, Clone)]
+struct PhaseWindow {
+    idx: usize,
+    goal: String,
+    start_ts: Option<String>,
+    end_ts: Option<String>,
+}
+
+pub async fn session_trajectory(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<TrajectoryResponse>, StatusCode> {
+    let active_ids = services.session_index.list_active(&session_id).await;
+    if active_ids.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    let mut phases: Vec<PhaseWindow> = Vec::new();
+    let mut records: Vec<TrajectoryRecord> = Vec::new();
+    let mut state_turns = 0usize;
+
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
+            continue;
+        };
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let text = texts.get(frag_id).cloned().unwrap_or_default();
+
+        if kind == "state" {
+            state_turns += 1;
+        }
+
+        if kind == "goal_phase" {
+            phases.push(PhaseWindow {
+                idx: phases.len(),
+                goal: text,
+                start_ts: meta
+                    .get("start_ts")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| ts.clone()),
+                end_ts: meta
+                    .get("end_ts")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| ts.clone()),
+            });
+            continue;
+        }
+
+        if TRAJECTORY_KINDS.contains(&kind) {
+            records.push(TrajectoryRecord {
+                id: frag_id.clone(),
+                kind: kind.to_string(),
+                content: text,
+                ts,
+                phase_idx: None,
+                metadata: Value::Object(meta.clone().into_iter().collect()),
+            });
+        }
+    }
+    drop(texts);
+    drop(metadata);
+
+    phases.sort_by(|a, b| {
+        a.start_ts
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.start_ts.as_deref().unwrap_or(""))
+            .then_with(|| a.goal.cmp(&b.goal))
+    });
+    for (idx, phase) in phases.iter_mut().enumerate() {
+        phase.idx = idx;
+    }
+
+    for rec in &mut records {
+        rec.phase_idx = assign_phase(rec.ts.as_deref(), &phases);
+    }
+    records.sort_by(|a, b| {
+        a.ts.as_deref()
+            .unwrap_or("")
+            .cmp(b.ts.as_deref().unwrap_or(""))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.content.cmp(&b.content))
+    });
+
+    let mut phase_views: Vec<TrajectoryPhase> = phases
+        .iter()
+        .map(|p| TrajectoryPhase {
+            idx: p.idx,
+            goal: p.goal.clone(),
+            start_ts: p.start_ts.clone(),
+            end_ts: p.end_ts.clone(),
+            counts: std::collections::HashMap::new(),
+            decisions: Vec::new(),
+            failures: Vec::new(),
+            verifications: Vec::new(),
+            risks: Vec::new(),
+            prompt_directives: Vec::new(),
+            assumptions: Vec::new(),
+        })
+        .collect();
+
+    for rec in &records {
+        let Some(idx) = rec.phase_idx else {
+            continue;
+        };
+        let Some(phase) = phase_views.get_mut(idx) else {
+            continue;
+        };
+        *phase.counts.entry(rec.kind.clone()).or_insert(0) += 1;
+        match rec.kind.as_str() {
+            "decision_made" => push_limited(&mut phase.decisions, rec.clone(), 3),
+            "failure" => push_limited(&mut phase.failures, rec.clone(), 3),
+            "verification" => push_limited(&mut phase.verifications, rec.clone(), 3),
+            "risk_flag" => push_limited(&mut phase.risks, rec.clone(), 3),
+            "prompt_directive" => push_limited(&mut phase.prompt_directives, rec.clone(), 2),
+            "assumption" => push_limited(&mut phase.assumptions, rec.clone(), 2),
+            _ => {}
+        }
+    }
+
+    let promotion_queue: Vec<TrajectoryRecord> = records
+        .iter()
+        .filter(|r| PROMOTION_KINDS.contains(&r.kind.as_str()))
+        .cloned()
+        .collect();
+
+    let prompt_directives = records
+        .iter()
+        .filter(|r| r.kind == "prompt_directive")
+        .count();
+    let memory_candidates = records
+        .iter()
+        .filter(|r| r.kind == "memory_candidate")
+        .count();
+    let risk_flags = records.iter().filter(|r| r.kind == "risk_flag").count();
+    let turns_estimate = state_turns.max(1);
+    let records_per_turn = records.len() as f32 / turns_estimate as f32;
+    let trajectory_count = records.len();
+
+    Ok(Json(TrajectoryResponse {
+        session_id,
+        trajectory_count,
+        phases: phase_views,
+        records,
+        promotion_queue,
+        cost_profile: TrajectoryCostProfile {
+            trajectory_records: trajectory_count,
+            turns_estimate,
+            records_per_turn,
+            prompt_directives,
+            memory_candidates,
+            risk_flags,
+        },
+    }))
+}
+
+// =============================================================================
+// `GET /api/v1/sessions/:id/prompt-preview`
+//
+// Deterministic "what would ContextNest inject?" preview. This is intentionally
+// conservative and only surfaces trajectory kinds that are directly useful in a
+// future prompt capsule.
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct PromptPreviewSection {
+    pub key: String,
+    pub title: String,
+    pub kind: String,
+    pub items: Vec<TrajectoryRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptPreviewResponse {
+    pub session_id: String,
+    pub sections: Vec<PromptPreviewSection>,
+    pub item_count: usize,
+}
+
+pub async fn session_prompt_preview(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<PromptPreviewResponse>, StatusCode> {
+    let active_ids = services.session_index.list_active(&session_id).await;
+    if active_ids.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+    let mut by_kind: std::collections::HashMap<String, Vec<TrajectoryRecord>> =
+        std::collections::HashMap::new();
+
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
+            continue;
+        };
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(
+            kind,
+            "decision_made"
+                | "verification"
+                | "failure"
+                | "risk_flag"
+                | "prompt_directive"
+                | "assumption"
+                | "memory_candidate"
+        ) {
+            continue;
+        }
+        if kind == "verification"
+            && matches!(meta.get("status").and_then(|v| v.as_str()), Some("not_run"))
+        {
+            continue;
+        }
+        let text = texts.get(frag_id).cloned().unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let rec = TrajectoryRecord {
+            id: frag_id.clone(),
+            kind: kind.to_string(),
+            content: text,
+            ts: meta
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            phase_idx: None,
+            metadata: Value::Object(meta.clone().into_iter().collect()),
+        };
+        by_kind.entry(kind.to_string()).or_default().push(rec);
+    }
+    drop(texts);
+    drop(metadata);
+
+    for records in by_kind.values_mut() {
+        records.sort_by(|a, b| {
+            b.ts.as_deref()
+                .unwrap_or("")
+                .cmp(a.ts.as_deref().unwrap_or(""))
+                .then_with(|| a.content.cmp(&b.content))
+        });
+    }
+
+    let specs = [
+        (
+            "decisions",
+            "Relevant prior decisions",
+            "decision_made",
+            5usize,
+        ),
+        (
+            "verified",
+            "Verified workflows and checks",
+            "verification",
+            5usize,
+        ),
+        ("failures", "Known failure patterns", "failure", 5usize),
+        ("risks", "Active risk flags", "risk_flag", 5usize),
+        (
+            "directives",
+            "Candidate prompt directives",
+            "prompt_directive",
+            5usize,
+        ),
+        (
+            "assumptions",
+            "Assumptions to revalidate",
+            "assumption",
+            3usize,
+        ),
+        (
+            "candidates",
+            "Memory candidates pending review",
+            "memory_candidate",
+            5usize,
+        ),
+    ];
+
+    let mut sections = Vec::new();
+    let mut item_count = 0usize;
+    for (key, title, kind, limit) in specs {
+        let items: Vec<TrajectoryRecord> = by_kind
+            .remove(kind)
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .collect();
+        item_count += items.len();
+        sections.push(PromptPreviewSection {
+            key: key.to_string(),
+            title: title.to_string(),
+            kind: kind.to_string(),
+            items,
+        });
+    }
+
+    Ok(Json(PromptPreviewResponse {
+        session_id,
+        sections,
+        item_count,
+    }))
+}
+
+fn assign_phase(ts: Option<&str>, phases: &[PhaseWindow]) -> Option<usize> {
+    let ts = ts?;
+    for phase in phases {
+        let starts_before = phase.start_ts.as_deref().map(|s| s <= ts).unwrap_or(true);
+        let ends_after = phase.end_ts.as_deref().map(|e| ts <= e).unwrap_or(true);
+        if starts_before && ends_after {
+            return Some(phase.idx);
+        }
+    }
+    phases
+        .iter()
+        .filter(|p| p.start_ts.as_deref().map(|s| s <= ts).unwrap_or(false))
+        .max_by(|a, b| a.start_ts.cmp(&b.start_ts))
+        .map(|p| p.idx)
+}
+
+fn push_limited<T>(items: &mut Vec<T>, item: T, limit: usize) {
+    if items.len() < limit {
+        items.push(item);
+    }
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
@@ -1168,5 +1572,10 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
             get(top_feature_for_session),
         )
         .route("/api/v1/sessions/:id/summary", get(session_summary))
+        .route("/api/v1/sessions/:id/trajectory", get(session_trajectory))
+        .route(
+            "/api/v1/sessions/:id/prompt-preview",
+            get(session_prompt_preview),
+        )
         .route("/api/v1/features", get(list_features))
 }

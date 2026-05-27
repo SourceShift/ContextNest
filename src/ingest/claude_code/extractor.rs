@@ -72,6 +72,32 @@ pub enum MemoryKind {
     /// metadata from CN instead of trusting their own local insight
     /// store.
     Domain,
+    /// One item from `z-insight.read_context[]`: files/docs/transcripts the
+    /// assistant inspected before deciding. Complements `FilesTouched`, which
+    /// records mutations only.
+    ReadContext,
+    /// One item from `z-insight.verification[]`: command/manual/dry-run
+    /// evidence and pass/fail/block status.
+    Verification,
+    /// One structured pointer from `z-insight.evidence_refs[]`.
+    EvidenceRef,
+    /// One settled decision from `z-insight.decisions[]`. Distinct from
+    /// `Decision`, which means "awaiting the user's decision".
+    DecisionMade,
+    /// One error/recovery pattern from `z-insight.failures[]`.
+    Failure,
+    /// One compact instruction candidate from
+    /// `z-insight.prompt_directives[]`.
+    PromptDirective,
+    /// One possibly-stale premise from `z-insight.assumptions[]`.
+    Assumption,
+    /// One non-feature artifact from `z-insight.artifacts[]`.
+    Artifact,
+    /// One candidate for later promotion into durable preference/rule/gotcha
+    /// memory from `z-insight.memory_candidates[]`.
+    MemoryCandidate,
+    /// One high-consequence risk constraint from `z-insight.risk_flags[]`.
+    RiskFlag,
 }
 
 impl MemoryKind {
@@ -92,6 +118,16 @@ impl MemoryKind {
             Self::FilesTouched => "files_touched",
             Self::Feature => "feature",
             Self::Domain => "domain",
+            Self::ReadContext => "read_context",
+            Self::Verification => "verification",
+            Self::EvidenceRef => "evidence_ref",
+            Self::DecisionMade => "decision_made",
+            Self::Failure => "failure",
+            Self::PromptDirective => "prompt_directive",
+            Self::Assumption => "assumption",
+            Self::Artifact => "artifact",
+            Self::MemoryCandidate => "memory_candidate",
+            Self::RiskFlag => "risk_flag",
         }
     }
 
@@ -123,6 +159,35 @@ impl MemoryKind {
             // record per session, used as the primary axis by the
             // z-dashboard categorizer. Same tier as SessionTitle/GoalPhase.
             Self::Domain => 0.85,
+            // Context that grounded a turn matters, but it is not itself
+            // an instruction. Keep below learnings and touched files.
+            Self::ReadContext => 0.65,
+            // Verification is operationally important. Failed/blocked cases
+            // get tuned per-record below; this default covers passed checks.
+            Self::Verification => 0.75,
+            // Evidence refs are mostly metadata anchors. They should be
+            // retained, but rarely outrank the memory they support.
+            Self::EvidenceRef => 0.60,
+            // Settled decisions should outrank ordinary facts so future
+            // prompts do not reopen already-resolved architecture choices.
+            Self::DecisionMade => 0.90,
+            // Failure/recovery traces are high-signal for trajectory
+            // analysis and anti-pattern extraction.
+            Self::Failure => 0.85,
+            // Prompt directives are candidate L3 prompt memory.
+            Self::PromptDirective => 0.95,
+            // Assumptions are useful but intentionally lower confidence and
+            // should usually be revalidated.
+            Self::Assumption => 0.55,
+            // Artifacts are durable outputs, but less important than shipped
+            // features.
+            Self::Artifact => 0.70,
+            // Promotion candidates sit between facts and directives until
+            // confirmed by repetition or user approval.
+            Self::MemoryCandidate => 0.80,
+            // Risk flags are high-consequence constraints for future prompt
+            // capsules.
+            Self::RiskFlag => 0.90,
         }
     }
 }
@@ -649,6 +714,117 @@ fn extract_block_memories(
         }
     }
 
+    extract_structured_array(
+        block,
+        "read_context",
+        MemoryKind::ReadContext,
+        &["salient", "reason", "path"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "verification",
+        MemoryKind::Verification,
+        &["summary", "command"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "evidence_refs",
+        MemoryKind::EvidenceRef,
+        &["claim", "ref"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "decisions",
+        MemoryKind::DecisionMade,
+        &["decision", "text"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "failures",
+        MemoryKind::Failure,
+        &["symptom", "root_cause", "recovery"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "prompt_directives",
+        MemoryKind::PromptDirective,
+        &["directive", "trigger"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "assumptions",
+        MemoryKind::Assumption,
+        &["assumption", "basis"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "artifacts",
+        MemoryKind::Artifact,
+        &["path", "purpose"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "memory_candidates",
+        MemoryKind::MemoryCandidate,
+        &["text"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+    extract_structured_array(
+        block,
+        "risk_flags",
+        MemoryKind::RiskFlag,
+        &["risk", "mitigation"],
+        ts,
+        session_uuid,
+        project_cwd,
+        cn_session_id,
+        out,
+    );
+
     // epic_files lands as metadata on the state record above when present,
     // but we also store it as a list under the block-level metadata of any
     // record that came from this block. Keep it simple: stash on the most
@@ -662,6 +838,88 @@ fn extract_block_memories(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_structured_array(
+    block: &Value,
+    field: &str,
+    kind: MemoryKind,
+    text_keys: &[&str],
+    ts: Option<&str>,
+    session_uuid: &str,
+    project_cwd: &str,
+    cn_session_id: &str,
+    out: &mut Vec<MemoryRecord>,
+) {
+    let Some(items) = block.get(field).and_then(Value::as_array) else {
+        return;
+    };
+
+    for item in items {
+        let Some(text) = structured_item_text(item, text_keys) else {
+            continue;
+        };
+        let mut rec = MemoryRecord::new(kind, text, cn_session_id.to_string());
+        rec.importance = structured_item_importance(kind, item);
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, ts);
+        rec = copy_structured_item_metadata(rec, item);
+        rec = rec.with_meta("zinsight_field", Value::String(field.to_string()));
+        out.push(rec);
+    }
+}
+
+fn structured_item_text(item: &Value, text_keys: &[&str]) -> Option<String> {
+    if let Some(s) = item.as_str() {
+        let trimmed = s.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    let obj = item.as_object()?;
+    for key in text_keys {
+        if let Some(value) = obj.get(*key).and_then(Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn structured_item_importance(kind: MemoryKind, item: &Value) -> f32 {
+    match kind {
+        MemoryKind::Verification => match item.get("status").and_then(Value::as_str) {
+            Some("failed") | Some("blocked") => 0.85,
+            Some("not_run") => 0.70,
+            _ => kind.default_importance(),
+        },
+        MemoryKind::RiskFlag => match item.get("severity").and_then(Value::as_str) {
+            Some("critical") | Some("high") => 0.95,
+            Some("low") => 0.80,
+            _ => kind.default_importance(),
+        },
+        MemoryKind::PromptDirective => match item.get("confidence").and_then(Value::as_str) {
+            Some("low") => 0.80,
+            Some("medium") => 0.90,
+            _ => kind.default_importance(),
+        },
+        _ => kind.default_importance(),
+    }
+}
+
+fn copy_structured_item_metadata(mut rec: MemoryRecord, item: &Value) -> MemoryRecord {
+    let Some(obj) = item.as_object() else {
+        return rec;
+    };
+    for (key, value) in obj {
+        if value.is_null() {
+            continue;
+        }
+        let meta_key = if key == "kind" { "item_kind" } else { key };
+        rec.metadata.insert(meta_key.to_string(), value.clone());
+    }
+    rec
 }
 
 #[derive(Debug)]
@@ -966,6 +1224,135 @@ mod tests {
                 Some(&Value::String("sess-1-very-long-uuid".to_string()))
             );
         }
+    }
+
+    #[test]
+    fn extracts_trajectory_signal_arrays_from_zinsight() {
+        let z_block = r#"<z-insight>
+{
+  "domain":"backend",
+  "goal":"Improve Claude ingest trajectory memory",
+  "current_state":"Implementing optional signal arrays",
+  "read_context":[
+    {
+      "path":"docs/z-insight-schema.md",
+      "kind":"doc",
+      "reason":"Understand current schema",
+      "salient":"Existing parser already accepts unknown fields",
+      "refs":["docs/z-insight-schema.md:70"]
+    }
+  ],
+  "verification":[
+    {
+      "kind":"dry_run",
+      "command":"cargo run -- ingest claude-code --dry-run",
+      "status":"passed",
+      "summary":"Dry-run extracted 86 memories",
+      "counts":{"memories":86,"failures":0}
+    },
+    {
+      "kind":"curl",
+      "command":"curl http://localhost:28080/api/v1/sessions/x/summary",
+      "status":"failed",
+      "summary":"Server stopped accepting connections"
+    }
+  ],
+  "evidence_refs":[
+    {"kind":"file","ref":"src/ingest/claude_code/extractor.rs:214","claim":"Extractor walks assistant turns"}
+  ],
+  "decisions":[
+    {"decision":"Use optional z-insight arrays first","made_by":"assistant","scope":"project"}
+  ],
+  "failures":[
+    {"symptom":"summary curl failed","root_cause":"server unavailable","recovery":"retry after substrate restart","status":"open"}
+  ],
+  "prompt_directives":[
+    {"trigger":"When changing ingest schema","directive":"Run dry-run ingest before storage changes","scope":"project","confidence":"high"}
+  ],
+  "assumptions":[
+    {"assumption":"CLI success should be rechecked through API","basis":"HTTP summary failed later","valid_until":"next runtime check"}
+  ],
+  "artifacts":[
+    {"kind":"doc","path":"docs/roadmap/v0.4-z-insight-trajectory-signals.md","purpose":"Store implementation plan","status":"created"}
+  ],
+  "memory_candidates":[
+    {"kind":"workflow","text":"For ContextNest ingest work, run dry-run ingest before changing extractor schema","scope":"project","confidence":"medium"}
+  ],
+  "risk_flags":[
+    {"risk":"Live WAL migration can rewrite user data","severity":"high","mitigation":"Require backup before rewrite","scope":"project"}
+  ]
+}
+</z-insight>"#;
+
+        let events = vec![ev_assistant_with_text(z_block, "t1")];
+        let recs = extract_memories(&events, "sess-trajectory", "/work");
+
+        for kind in [
+            MemoryKind::ReadContext,
+            MemoryKind::EvidenceRef,
+            MemoryKind::DecisionMade,
+            MemoryKind::Failure,
+            MemoryKind::PromptDirective,
+            MemoryKind::Assumption,
+            MemoryKind::Artifact,
+            MemoryKind::MemoryCandidate,
+            MemoryKind::RiskFlag,
+        ] {
+            assert!(
+                recs.iter().any(|r| r.kind == kind),
+                "expected {:?} memory",
+                kind
+            );
+        }
+
+        let verifications: Vec<_> = recs
+            .iter()
+            .filter(|r| r.kind == MemoryKind::Verification)
+            .collect();
+        assert_eq!(verifications.len(), 2);
+        assert!(verifications.iter().any(|r| {
+            r.text == "Dry-run extracted 86 memories"
+                && r.metadata.get("status").and_then(Value::as_str) == Some("passed")
+                && r.importance == 0.75
+        }));
+        assert!(verifications.iter().any(|r| {
+            r.text == "Server stopped accepting connections"
+                && r.metadata.get("status").and_then(Value::as_str) == Some("failed")
+                && r.importance == 0.85
+        }));
+
+        let read_context = recs
+            .iter()
+            .find(|r| r.kind == MemoryKind::ReadContext)
+            .expect("read_context memory");
+        assert_eq!(
+            read_context.metadata.get("kind").and_then(Value::as_str),
+            Some("read_context")
+        );
+        assert_eq!(
+            read_context
+                .metadata
+                .get("item_kind")
+                .and_then(Value::as_str),
+            Some("doc")
+        );
+        assert_eq!(
+            read_context
+                .metadata
+                .get("zinsight_field")
+                .and_then(Value::as_str),
+            Some("read_context")
+        );
+
+        let risk = recs
+            .iter()
+            .find(|r| r.kind == MemoryKind::RiskFlag)
+            .expect("risk flag memory");
+        assert_eq!(risk.importance, 0.95);
+        assert_eq!(
+            risk.metadata.get("severity").and_then(Value::as_str),
+            Some("high")
+        );
     }
 
     #[test]

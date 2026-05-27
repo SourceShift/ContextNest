@@ -583,3 +583,135 @@ async fn summary_unknown_session_returns_404() {
         .await;
     assert_eq!(res.status_code(), 404, "unknown session must 404");
 }
+
+/// Trajectory endpoint groups the new z-insight memory kinds into a
+/// chronological stream, phase summaries, promotion queue, and cost profile.
+#[tokio::test]
+async fn trajectory_endpoint_groups_records_phases_and_promotion_queue() {
+    let server = make_server().await;
+    let sid = "cc-trajectory-ui";
+
+    store(
+        &server,
+        sid,
+        "Implement trajectory UI",
+        json!({
+            "kind": "goal_phase",
+            "src_session": sid,
+            "ts": "2026-05-27T09:00:00Z",
+            "start_ts": "2026-05-27T09:00:00Z",
+            "end_ts": "2026-05-27T10:00:00Z"
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Current state turn marker",
+        json!({"kind": "state", "src_session": sid, "ts": "2026-05-27T09:05:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Use sparse gated emission",
+        json!({"kind": "decision_made", "src_session": sid, "ts": "2026-05-27T09:10:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Dry-run emitted all trajectory kinds",
+        json!({"kind": "verification", "src_session": sid, "ts": "2026-05-27T09:20:00Z", "status": "passed"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Promote sparse emission after repetition",
+        json!({"kind": "memory_candidate", "src_session": sid, "ts": "2026-05-27T09:30:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Do not over-emit prompt memory",
+        json!({"kind": "prompt_directive", "src_session": sid, "ts": "2026-05-27T09:40:00Z"}),
+    )
+    .await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    assert_eq!(body["session_id"], sid);
+    assert_eq!(body["trajectory_count"], 4);
+    assert_eq!(body["records"].as_array().unwrap().len(), 4);
+    assert_eq!(body["phases"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["phases"][0]["counts"]["decision_made"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(body["promotion_queue"].as_array().unwrap().len(), 2);
+    assert_eq!(body["cost_profile"]["trajectory_records"].as_u64(), Some(4));
+    assert_eq!(body["cost_profile"]["prompt_directives"].as_u64(), Some(1));
+    assert_eq!(body["cost_profile"]["memory_candidates"].as_u64(), Some(1));
+}
+
+/// Prompt preview is a deterministic, no-LLM capsule preview over the
+/// trajectory kinds a future prompt compiler would care about.
+#[tokio::test]
+async fn prompt_preview_endpoint_returns_capsule_sections() {
+    let server = make_server().await;
+    let sid = "cc-prompt-preview";
+
+    store(
+        &server,
+        sid,
+        "Keep trajectory fields sparse",
+        json!({"kind": "decision_made", "src_session": sid, "ts": "2026-05-27T09:00:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Dry-run passed",
+        json!({"kind": "verification", "src_session": sid, "ts": "2026-05-27T09:10:00Z", "status": "passed"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Skipped check should not enter preview",
+        json!({"kind": "verification", "src_session": sid, "ts": "2026-05-27T09:11:00Z", "status": "not_run"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Emit trajectory arrays only when gates are crossed",
+        json!({"kind": "prompt_directive", "src_session": sid, "ts": "2026-05-27T09:20:00Z"}),
+    )
+    .await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/prompt-preview"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    assert_eq!(body["session_id"], sid);
+    assert_eq!(body["item_count"], 3);
+    let sections = body["sections"].as_array().unwrap();
+    assert_eq!(sections.len(), 7);
+    assert_eq!(sections[0]["key"], "decisions");
+    assert_eq!(sections[0]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(sections[1]["key"], "verified");
+    assert_eq!(sections[1]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(sections[4]["key"], "directives");
+    assert_eq!(sections[4]["items"].as_array().unwrap().len(), 1);
+}
