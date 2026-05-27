@@ -14,6 +14,7 @@ pub mod consolidation;
 pub mod context;
 pub mod embedding;
 pub mod embedding_providers;
+pub mod fragment_id;
 pub mod graph;
 pub mod graph_enhanced;
 pub mod llm;

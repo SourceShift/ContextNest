@@ -49,10 +49,49 @@ async function fetchKind(
       top_k: 50,
       metadata_filter: filter,
     });
-    return res.hits;
+    return normalizeHits(res.hits);
   } catch {
     return [];
   }
+}
+
+function normalizeHits(hits: RetrieveHit[]): RetrieveHit[] {
+  const byKey = new Map<string, RetrieveHit>();
+  for (const hit of hits) {
+    const key = logicalHitKey(hit);
+    const current = byKey.get(key);
+    if (!current || compareByTimestampDesc(hit, current) < 0) {
+      byKey.set(key, hit);
+    }
+  }
+  return [...byKey.values()].sort(compareByTimestampDesc);
+}
+
+function logicalHitKey(hit: RetrieveHit): string {
+  const kind = typeof hit.metadata.kind === 'string' ? hit.metadata.kind : '';
+  const source = typeof hit.metadata.source === 'string' ? hit.metadata.source : '';
+  const srcSession =
+    typeof hit.metadata.src_session === 'string'
+      ? hit.metadata.src_session
+      : hit.session_id ?? '';
+  const taskId = typeof hit.metadata.task_id === 'string' ? hit.metadata.task_id : '';
+  const text = hit.content.trim().replace(/\s+/g, ' ');
+  return [kind, source, srcSession, taskId, text].join('\u001f');
+}
+
+function compareByTimestampDesc(a: RetrieveHit, b: RetrieveHit): number {
+  const at = timestampMillis(a);
+  const bt = timestampMillis(b);
+  if (at !== bt) return bt - at;
+  if (a.similarity !== b.similarity) return b.similarity - a.similarity;
+  if (a.importance !== b.importance) return b.importance - a.importance;
+  return a.id.localeCompare(b.id);
+}
+
+function timestampMillis(hit: RetrieveHit): number {
+  const ts = typeof hit.metadata.ts === 'string' ? hit.metadata.ts : '';
+  const parsed = Date.parse(ts);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
 }
 
 export function useSessionDetail(sessionId: string) {
