@@ -61,11 +61,11 @@ worktree has its own `target/` (first build is cold) but `~/.contextnest/wal.jso
 is **shared** — back it up before any WAL-schema change. The Bash tool's
 cwd resets between calls; `cd` into the worktree in every invocation.
 
-**Merging to `main` is PR-only.** Direct push to `main`, `gh pr merge`, and
-even local `git fetch origin main` followed by merge are permission-denied
-by design. Workflow: `gh pr create --base main --head <branch> --body-file
-<path>` → CI runs → **human clicks merge in the GitHub UI**. Don't retry
-the denied commands.
+**Merging to `main` is PR-only.** Direct push to `main` and local
+`git fetch origin main` followed by merge are permission-denied by design.
+Workflow: `gh pr create --base main --head <branch> --body-file <path>`
+→ CI runs → merge via the GitHub UI **or** `gh pr merge <N> --squash
+--delete-branch` once CI is green. Don't retry denied direct-push commands.
 
 ## Architecture map
 
