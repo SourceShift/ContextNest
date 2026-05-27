@@ -12,7 +12,17 @@ export type MemoryKind =
   | 'blocker'
   | 'state'
   | 'current_task'
-  | 'summary';
+  | 'summary'
+  | 'read_context'
+  | 'verification'
+  | 'evidence_ref'
+  | 'decision_made'
+  | 'failure'
+  | 'prompt_directive'
+  | 'assumption'
+  | 'artifact'
+  | 'memory_candidate'
+  | 'risk_flag';
 
 export type FragmentMetadata = {
   kind?: MemoryKind | string;
@@ -142,4 +152,58 @@ export type FeaturesResponse = {
   layer: string | null;
   count: number;
   features: FeatureEntry[];
+};
+
+export type TrajectoryRecord = {
+  id: string;
+  kind: string;
+  content: string;
+  ts: string | null;
+  phase_idx: number | null;
+  metadata: FragmentMetadata;
+};
+
+export type TrajectoryPhase = {
+  idx: number;
+  goal: string;
+  start_ts: string | null;
+  end_ts: string | null;
+  counts: Record<string, number>;
+  decisions: TrajectoryRecord[];
+  failures: TrajectoryRecord[];
+  verifications: TrajectoryRecord[];
+  risks: TrajectoryRecord[];
+  prompt_directives: TrajectoryRecord[];
+  assumptions: TrajectoryRecord[];
+};
+
+export type TrajectoryCostProfile = {
+  trajectory_records: number;
+  turns_estimate: number;
+  records_per_turn: number;
+  prompt_directives: number;
+  memory_candidates: number;
+  risk_flags: number;
+};
+
+export type TrajectoryResponse = {
+  session_id: string;
+  trajectory_count: number;
+  phases: TrajectoryPhase[];
+  records: TrajectoryRecord[];
+  promotion_queue: TrajectoryRecord[];
+  cost_profile: TrajectoryCostProfile;
+};
+
+export type PromptPreviewSection = {
+  key: string;
+  title: string;
+  kind: string;
+  items: TrajectoryRecord[];
+};
+
+export type PromptPreviewResponse = {
+  session_id: string;
+  sections: PromptPreviewSection[];
+  item_count: number;
 };

@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 
 import { api } from '@/lib/api';
-import type { RetrieveHit } from '@/lib/types';
+import type { PromptPreviewResponse, RetrieveHit, TrajectoryResponse } from '@/lib/types';
 
 /**
  * Per-session detail view: fans out one `/api/v1/tools/retrieve` call
@@ -34,6 +34,8 @@ export type SessionDetail = {
   decisions: RetrieveHit[];
   blockers: RetrieveHit[];
   userActions: RetrieveHit[];
+  trajectory: TrajectoryResponse | null;
+  promptPreview: PromptPreviewResponse | null;
 };
 
 async function fetchKind(
@@ -49,55 +51,26 @@ async function fetchKind(
       top_k: 50,
       metadata_filter: filter,
     });
-    return normalizeHits(res.hits);
+    return res.hits;
   } catch {
     return [];
   }
 }
 
-function normalizeHits(hits: RetrieveHit[]): RetrieveHit[] {
-  const byKey = new Map<string, RetrieveHit>();
-  for (const hit of hits) {
-    const key = logicalHitKey(hit);
-    const current = byKey.get(key);
-    if (!current || compareByTimestampDesc(hit, current) < 0) {
-      byKey.set(key, hit);
-    }
+async function fetchTrajectory(sessionId: string): Promise<TrajectoryResponse | null> {
+  try {
+    return await api.sessionTrajectory(sessionId);
+  } catch {
+    return null;
   }
-  return [...byKey.values()].sort(compareByTimestampDesc);
 }
 
-function logicalHitKey(hit: RetrieveHit): string {
-  const kind = typeof hit.metadata.kind === 'string' ? hit.metadata.kind : '';
-  const source = typeof hit.metadata.source === 'string' ? hit.metadata.source : '';
-  const srcSession =
-    typeof hit.metadata.src_session === 'string'
-      ? hit.metadata.src_session
-      : hit.session_id ?? '';
-  const taskId = typeof hit.metadata.task_id === 'string' ? hit.metadata.task_id : '';
-  const ts =
-    source === 'TaskCompleted'
-      ? ''
-      : typeof hit.metadata.ts === 'string'
-        ? hit.metadata.ts
-        : '';
-  const text = hit.content.trim().replace(/\s+/g, ' ');
-  return [kind, source, srcSession, taskId, ts, text].join('\u001f');
-}
-
-function compareByTimestampDesc(a: RetrieveHit, b: RetrieveHit): number {
-  const at = timestampMillis(a);
-  const bt = timestampMillis(b);
-  if (at !== bt) return bt - at;
-  if (a.similarity !== b.similarity) return b.similarity - a.similarity;
-  if (a.importance !== b.importance) return b.importance - a.importance;
-  return a.id.localeCompare(b.id);
-}
-
-function timestampMillis(hit: RetrieveHit): number {
-  const ts = typeof hit.metadata.ts === 'string' ? hit.metadata.ts : '';
-  const parsed = Date.parse(ts);
-  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+async function fetchPromptPreview(sessionId: string): Promise<PromptPreviewResponse | null> {
+  try {
+    return await api.sessionPromptPreview(sessionId);
+  } catch {
+    return null;
+  }
 }
 
 export function useSessionDetail(sessionId: string) {
@@ -115,6 +88,8 @@ export function useSessionDetail(sessionId: string) {
         decisions,
         blockers,
         userActions,
+        trajectory,
+        promptPreview,
       ] = await Promise.all([
         fetchKind(sessionId, 'goal_phase'),
         fetchKind(sessionId, 'accomplishment'),
@@ -123,6 +98,8 @@ export function useSessionDetail(sessionId: string) {
         fetchKind(sessionId, 'decision'),
         fetchKind(sessionId, 'blocker'),
         fetchKind(sessionId, 'user_action'),
+        fetchTrajectory(sessionId),
+        fetchPromptPreview(sessionId),
       ]);
       return {
         sessionId,
@@ -133,6 +110,8 @@ export function useSessionDetail(sessionId: string) {
         decisions,
         blockers,
         userActions,
+        trajectory,
+        promptPreview,
       };
     },
   });

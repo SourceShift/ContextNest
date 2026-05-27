@@ -6,7 +6,7 @@ import { useInbox } from '@/hooks/useInbox';
 import { useSessions } from '@/hooks/useSessions';
 import { useSessionDetail, shortStamp } from '@/hooks/useSessionDetail';
 import { agoFrom } from '@/lib/relative-time';
-import type { RetrieveHit, SessionListItem } from '@/lib/types';
+import type { RetrieveHit, SessionListItem, TrajectoryRecord } from '@/lib/types';
 
 export const Route = createFileRoute('/sessions/$id')({
   component: SessionDetailPage,
@@ -20,7 +20,10 @@ type SectionKey =
   | 'todos'
   | 'decisions'
   | 'blockers'
-  | 'user_actions';
+  | 'user_actions'
+  | 'trajectory'
+  | 'prompt_preview'
+  | 'promotion_queue';
 
 function basename(p: string | null | undefined): string {
   if (!p) return '?';
@@ -30,6 +33,11 @@ function basename(p: string | null | undefined): string {
 
 function metaString(hit: RetrieveHit, key: string): string | undefined {
   const v = hit.metadata[key];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function recMetaString(rec: TrajectoryRecord, key: string): string | undefined {
+  const v = rec.metadata[key];
   return typeof v === 'string' ? v : undefined;
 }
 
@@ -64,6 +72,9 @@ function SessionDetailPage() {
     decisions: false,
     blockers: false,
     user_actions: false,
+    trajectory: true,
+    prompt_preview: true,
+    promotion_queue: false,
   });
   const toggle = (k: SectionKey) => setOpen((o) => ({ ...o, [k]: !o[k] }));
 
@@ -86,6 +97,8 @@ function SessionDetailPage() {
 
   const project = basename(session?.project_cwd);
   const lastActivity = session?.last_ts ? agoFrom(session.last_ts) : '—';
+  const trajectory = d?.trajectory;
+  const promptPreview = d?.promptPreview;
 
   return (
     <div>
@@ -122,10 +135,10 @@ function SessionDetailPage() {
           loading={isLoading}
         />
         <Stat
-          label="decisions"
-          v={d?.decisions.length ?? 0}
+          label="trajectory"
+          v={trajectory?.trajectory_count ?? 0}
           loading={isLoading}
-          flag={(d?.decisions.length ?? 0) > 5 ? 'warn' : undefined}
+          flag={(trajectory?.cost_profile.records_per_turn ?? 0) > 2 ? 'warn' : undefined}
         />
       </div>
 
@@ -223,6 +236,120 @@ function SessionDetailPage() {
               </div>
             ))}
           </div>
+        )}
+      </Section>
+
+      <Section
+        open={open.trajectory}
+        toggle={() => toggle('trajectory')}
+        name="Trajectory"
+        hint="phases, decisions, failures, verification"
+        count={trajectory?.trajectory_count ?? 0}
+        loading={isLoading}
+      >
+        {!trajectory || trajectory.trajectory_count === 0 ? (
+          <Empty msg="No sparse trajectory records captured yet." />
+        ) : (
+          <div>
+            <div className="trajectory-cost">
+              <span>
+                <b>{trajectory.cost_profile.records_per_turn.toFixed(2)}</b> records / turn
+              </span>
+              <span>
+                <b>{trajectory.cost_profile.turns_estimate}</b> turns estimated
+              </span>
+              <span>
+                <b>{trajectory.cost_profile.prompt_directives}</b> directives
+              </span>
+              <span>
+                <b>{trajectory.cost_profile.risk_flags}</b> risk flags
+              </span>
+            </div>
+            <div className="timeline" style={{ marginTop: 12 }}>
+              {trajectory.phases.length === 0 ? (
+                trajectory.records.slice(0, 30).map((r) => (
+                  <TrajectoryRow key={r.id} record={r} />
+                ))
+              ) : (
+                trajectory.phases.map((phase) => {
+                  const records = trajectory.records.filter((r) => r.phase_idx === phase.idx);
+                  return (
+                    <div className="timeline-item" key={`${phase.idx}-${phase.goal}`}>
+                      <div className="timeline-time">
+                        {shortStamp(phase.start_ts ?? undefined)}
+                        {phase.end_ts && <> · {shortStamp(phase.end_ts)}</>}
+                      </div>
+                      <div className="phase-card">
+                        <div className="h">
+                          <div style={{ flex: 1 }}>
+                            <div className="title">{phase.goal}</div>
+                            <div className="meta">
+                              {Object.entries(phase.counts).map(([kind, count]) => (
+                                <span key={kind}>
+                                  <b>{count}</b> {kind.replace('_', ' ')}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                        {records.length > 0 && (
+                          <div className="trajectory-records">
+                            {records.slice(0, 10).map((r) => (
+                              <TrajectoryRow key={r.id} record={r} compact />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+      </Section>
+
+      <Section
+        open={open.prompt_preview}
+        toggle={() => toggle('prompt_preview')}
+        name="Prompt preview"
+        hint="deterministic capsule"
+        count={promptPreview?.item_count ?? 0}
+        loading={isLoading}
+      >
+        {!promptPreview || promptPreview.item_count === 0 ? (
+          <Empty msg="No prompt capsule material yet. Sparse capture is working when this stays empty for low-signal turns." />
+        ) : (
+          <div className="prompt-preview">
+            {promptPreview.sections.map((section) => (
+              <div className="prompt-section" key={section.key}>
+                <div className="prompt-section-head">
+                  <span>{section.title}</span>
+                  <span className="ct">{section.items.length}</span>
+                </div>
+                {section.items.length === 0 ? (
+                  <div className="empty-inline">empty</div>
+                ) : (
+                  section.items.map((r) => <TrajectoryRow key={r.id} record={r} />)
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <Section
+        open={open.promotion_queue}
+        toggle={() => toggle('promotion_queue')}
+        name="Promotion queue"
+        hint="review before long-term memory"
+        count={trajectory?.promotion_queue.length ?? 0}
+        loading={isLoading}
+      >
+        {!trajectory || trajectory.promotion_queue.length === 0 ? (
+          <Empty msg="No repeated or high-consequence candidates ready for promotion." />
+        ) : (
+          trajectory.promotion_queue.map((r) => <TrajectoryRow key={r.id} record={r} />)
         )}
       </Section>
 
@@ -368,6 +495,33 @@ function SessionDetailPage() {
           })
         )}
       </Section>
+    </div>
+  );
+}
+
+function TrajectoryRow({
+  record,
+  compact = false,
+}: {
+  record: TrajectoryRecord;
+  compact?: boolean;
+}) {
+  const status = recMetaString(record, 'status');
+  const severity = recMetaString(record, 'severity');
+  const scope = recMetaString(record, 'scope');
+  return (
+    <div className={`frag-row trajectory-row${compact ? ' compact' : ''}`}>
+      <div className="text">
+        <span className={`kind-badge ${record.kind}`}>{record.kind.replace('_', ' ')}</span>
+        {status && <span className={`todo-status ${status}`}>{status.replace('_', ' ')}</span>}
+        {severity && <span className="risk-chip">{severity}</span>}
+        {scope && <span className="scope-chip">{scope}</span>}
+        <span style={{ marginLeft: 8 }}>{record.content}</span>
+        {recMetaString(record, 'evidence') && (
+          <div className="sub">{recMetaString(record, 'evidence')}</div>
+        )}
+      </div>
+      <div className="stamp">{shortStamp(record.ts ?? undefined)}</div>
     </div>
   );
 }
