@@ -516,8 +516,8 @@ function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
                   {primaryBasin.members_in_session}/{primaryBasin.total_members}
                 </span>
                 {primaryBasin.heat_24h > 0 && (
-                  <span className="basin-heat" title={`${primaryBasin.heat_24h} writes in 24h`}>
-                    🔥{primaryBasin.heat_24h}
+                  <span className="basin-heat" title={`${primaryBasin.heat_24h} writes in last 24h`}>
+                    24h:{primaryBasin.heat_24h}
                   </span>
                 )}
                 {basinLinks.length > 1 && (
