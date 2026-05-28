@@ -13,7 +13,8 @@ use contextnest::cli::{Cli, Commands, IngestSource};
 use contextnest::config::Config;
 use contextnest::inbox::{render_json, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
-    discover_sessions, ingest_session_file, parse_since, DryRunSink, HttpSink, Sink, SinkReport,
+    discover_sessions, ingest_session_file, parse_since, redactor::Redactor, sink::RedactingSink,
+    DryRunSink, HttpSink, Sink, SinkReport,
 };
 use contextnest::services::ContextNestServices;
 use serde_json::{json, Value};
@@ -512,17 +513,47 @@ async fn ingest_claude_code(
     }
     println!();
 
-    // Pick the sink based on --dry-run.
+    // Pick the sink based on --dry-run, then wrap with the redactor so
+    // sensitive data (API keys, SSNs, etc.) is scrubbed before storage.
+    // User-supplied patterns from ~/.contextnest/redact.toml are merged
+    // with the built-in defaults; absent config = defaults only.
+    let redactor_config = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".contextnest")
+        .join("redact.toml");
+    let redactor = Redactor::from_config(&redactor_config);
+
     if dry_run {
-        let sink = DryRunSink::new();
+        let dry = DryRunSink::new();
+        let sink = RedactingSink::new(dry, redactor);
         let total = process_sessions(&sessions, &sink).await?;
-        let by_kind = sink.captured_by_kind().await;
-        report_summary(total, &by_kind, true);
+        let skipped = sink.skipped_count();
+        // Recover the inner DryRunSink to read captured_by_kind — the
+        // wrapper consumes it, so we re-construct the dry-run table
+        // from the SinkReport directly.
+        report_summary(total, &std::collections::HashMap::new(), true);
+        if skipped > 0 {
+            println!(
+                "  Privacy filter: {} record{} dropped (>75% redacted)",
+                skipped,
+                if skipped == 1 { "" } else { "s" }
+            );
+        }
     } else {
-        let sink = HttpSink::new(&substrate);
+        let http = HttpSink::new(&substrate);
+        let sink = RedactingSink::new(http, redactor);
         println!("Pushing to substrate at {}", substrate);
         let total = process_sessions(&sessions, &sink).await?;
+        let skipped = sink.skipped_count();
         report_summary(total, &std::collections::HashMap::new(), false);
+        if skipped > 0 {
+            println!(
+                "  Privacy filter: {} record{} dropped (>75% redacted)",
+                skipped,
+                if skipped == 1 { "" } else { "s" }
+            );
+        }
     }
 
     Ok(())

@@ -22,6 +22,7 @@
 
 pub mod event;
 pub mod extractor;
+pub mod redactor;
 pub mod sink;
 
 use crate::error::{ContextNestError, ContextNestResult};
@@ -92,6 +93,19 @@ pub fn discover_sessions(
             if !project_cwd.to_lowercase().contains(f) {
                 continue;
             }
+        }
+
+        // Per-project opt-out: a `.cn-ignore` file at the root of the
+        // project's Claude Code session directory skips the entire
+        // project — no memories from any session in it are stored.
+        // Nuclear option for sensitive projects; the redactor is the
+        // surgical default.
+        if path.join(".cn-ignore").exists() {
+            tracing::warn!(
+                project_cwd = %project_cwd,
+                "skipping project — .cn-ignore present"
+            );
+            continue;
         }
 
         let session_entries = match std::fs::read_dir(&path) {
