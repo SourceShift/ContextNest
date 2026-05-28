@@ -655,6 +655,22 @@ impl AttractorBasinManager {
     /// Find nearest basin to a position
 
     pub async fn find_nearest_basin(&self, position: &[f32]) -> ContextNestResult<Option<String>> {
+        Ok(self
+            .find_nearest_basin_with_distance(position)
+            .await
+            .map(|(id, _)| id))
+    }
+
+    /// Find the nearest basin AND return its euclidean distance to the
+    /// position. Lets callers (notably `process_memories` Step 1) gate
+    /// "attach to existing" vs "create new" on a configurable threshold —
+    /// the original `find_nearest_basin` discarded the distance, which is
+    /// exactly why every fragment became its own basin (`avg_mass == 1.0`)
+    /// in the live substrate.
+    pub async fn find_nearest_basin_with_distance(
+        &self,
+        position: &[f32],
+    ) -> Option<(String, f32)> {
         let basins = self.basins.read().await;
 
         let mut nearest_id = None;
@@ -668,7 +684,7 @@ impl AttractorBasinManager {
             }
         }
 
-        Ok(nearest_id)
+        nearest_id.map(|id| (id, min_distance))
     }
 
     /// Converge a position to the nearest attractor basin

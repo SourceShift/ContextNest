@@ -50,6 +50,15 @@ pub struct MemoryAttractorConfig {
     pub enable_parallel_processing: bool,
     /// Cache size for reconstructed memories
     pub reconstruction_cache_size: usize,
+    /// Maximum euclidean distance (in embedding space) at which an incoming
+    /// fragment will attach to an *existing* basin rather than seeding a new
+    /// one. Lower = stricter clustering, more singletons; higher = looser
+    /// clustering, denser basins. The default (0.4) is calibrated for
+    /// normalized 768-d embeddings where cosine similarity ~0.92 corresponds
+    /// to euclidean distance ~0.4. Set to `0.0` to restore pre-fix
+    /// "always-create-new-basin" behaviour. Env override:
+    /// `CONTEXTNEST_BASIN_ATTACH_THRESHOLD`.
+    pub basin_attach_threshold: f32,
 }
 
 impl Default for MemoryAttractorConfig {
@@ -64,8 +73,19 @@ impl Default for MemoryAttractorConfig {
             enable_ai_gap_filling: true,
             enable_parallel_processing: true,
             reconstruction_cache_size: 10000,
+            basin_attach_threshold: default_basin_attach_threshold(),
         }
     }
+}
+
+/// Read `CONTEXTNEST_BASIN_ATTACH_THRESHOLD` if set and finite-positive,
+/// otherwise fall back to 0.4 (calibrated for normalized 768-d embeddings).
+fn default_basin_attach_threshold() -> f32 {
+    std::env::var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.4)
 }
 
 /// Memory fragment for reconstruction
