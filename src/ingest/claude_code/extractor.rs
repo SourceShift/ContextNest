@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use super::event::{extract_zinsight_blocks, RawEvent};
+use crate::error::ContextNestResult;
+use crate::services::embedding::EmbeddingService;
 
 /// What kind of memory a record represents. Becomes
 /// `metadata["kind"]` on the stored memory.
@@ -976,6 +978,187 @@ pub(crate) fn cluster_goal_phases(goals: &[(String, Option<String>)]) -> Vec<Goa
     clusters
 }
 
+/// Cosine threshold for merging consecutive `goal_phase` records by
+/// embedding similarity. Calibrated for normalized 768-d embeddings —
+/// 0.85 catches "same intent, different wording" without collapsing
+/// genuine intent pivots (see `E-embedding-clustering.md` analysis).
+pub(crate) const EMBEDDING_CLUSTER_COSINE_THRESHOLD: f32 = 0.85;
+
+/// Re-cluster consecutive `goal_phase` records by embedding cosine
+/// similarity. Walks the existing record list in order; when two
+/// consecutive `goal_phase` entries' embeddings clear
+/// [`EMBEDDING_CLUSTER_COSINE_THRESHOLD`] they collapse into one —
+/// representative text becomes the longer of the two, `start_ts` /
+/// `end_ts` cover the union, and `turn_span` accumulates.
+///
+/// Non-goal_phase records pass through unchanged. When the embedder
+/// fails on any text, that record is treated as "not similar to its
+/// neighbour" — degraded mode falls back to the existing
+/// token-overlap result from [`cluster_goal_phases`].
+///
+/// Why post-processing instead of inline in [`extract_memories`]:
+/// extract_memories is synchronous and used by tests with no
+/// EmbeddingService in scope. Doing the embedding pass here keeps
+/// extract_memories simple and lets callers (CLI batch, cc-hooks
+/// receiver) opt in based on whether they have an embedder available.
+pub async fn refine_goal_phases_by_embedding(
+    records: Vec<MemoryRecord>,
+    embedder: &EmbeddingService,
+) -> ContextNestResult<Vec<MemoryRecord>> {
+    let mut goal_idxs: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == MemoryKind::GoalPhase)
+        .map(|(i, _)| i)
+        .collect();
+    if goal_idxs.len() < 2 {
+        return Ok(records);
+    }
+
+    // Sort goal indexes by start_ts so consecutive comparisons reflect
+    // session-time order, not extractor emission order (mostly the
+    // same, but defensive against future emit-order changes).
+    goal_idxs.sort_by(|&a, &b| {
+        let ta = records[a]
+            .metadata
+            .get("start_ts")
+            .or_else(|| records[a].metadata.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tb = records[b]
+            .metadata
+            .get("start_ts")
+            .or_else(|| records[b].metadata.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        ta.cmp(tb)
+    });
+
+    // Embed each goal_phase's text once. Failure on any single
+    // embedding falls back to "no merge for that pair" — we want this
+    // refinement to be additive, never to drop records.
+    let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(goal_idxs.len());
+    for &idx in &goal_idxs {
+        let embedded = embedder.generate_embedding(&records[idx].text).await.ok();
+        embeddings.push(embedded);
+    }
+
+    // Walk consecutive pairs in start_ts order. For each adjacent
+    // (i, i+1) whose cosine clears the threshold, record a merge
+    // intent. After the pass, materialise the merges in one rebuild.
+    let mut merge_target: Vec<usize> = (0..goal_idxs.len()).collect();
+    for w in 0..goal_idxs.len().saturating_sub(1) {
+        let (Some(a), Some(b)) = (&embeddings[w], &embeddings[w + 1]) else {
+            continue;
+        };
+        if cosine(a, b) >= EMBEDDING_CLUSTER_COSINE_THRESHOLD {
+            merge_target[w + 1] = merge_target[w];
+        }
+    }
+
+    // Build the new record list: pass non-goal records through; merge
+    // goal records per merge_target.
+    let mut out: Vec<MemoryRecord> = Vec::with_capacity(records.len());
+    let mut by_root: HashMap<usize, MemoryRecord> = HashMap::new();
+    let mut root_order: Vec<usize> = Vec::new();
+    let goal_set: HashSet<usize> = goal_idxs.iter().copied().collect();
+
+    for (i, rec) in records.into_iter().enumerate() {
+        if !goal_set.contains(&i) {
+            out.push(rec);
+            continue;
+        }
+        let pos = goal_idxs.iter().position(|&g| g == i).unwrap();
+        let root_pos = merge_target[pos];
+        let root_idx = goal_idxs[root_pos];
+        match by_root.get_mut(&root_idx) {
+            None => {
+                by_root.insert(root_idx, rec);
+                root_order.push(root_idx);
+            }
+            Some(existing) => {
+                merge_into(existing, rec);
+            }
+        }
+    }
+    for root_idx in root_order {
+        if let Some(rec) = by_root.remove(&root_idx) {
+            out.push(rec);
+        }
+    }
+    Ok(out)
+}
+
+fn merge_into(target: &mut MemoryRecord, other: MemoryRecord) {
+    // Longer text wins as representative (carries more detail).
+    if other.text.len() > target.text.len() {
+        target.text = other.text;
+    }
+    // start_ts = earlier; end_ts = later.
+    if let (Some(other_start), target_start) = (
+        other.metadata.get("start_ts").and_then(|v| v.as_str()),
+        target
+            .metadata
+            .get("start_ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ) {
+        if target_start.is_empty() || other_start < target_start {
+            target.metadata.insert(
+                "start_ts".to_string(),
+                Value::String(other_start.to_string()),
+            );
+        }
+    }
+    if let (Some(other_end), target_end) = (
+        other.metadata.get("end_ts").and_then(|v| v.as_str()),
+        target
+            .metadata
+            .get("end_ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    ) {
+        if target_end.is_empty() || other_end > target_end {
+            target
+                .metadata
+                .insert("end_ts".to_string(), Value::String(other_end.to_string()));
+        }
+    }
+    // Sum turn_span counts.
+    let target_turns = target
+        .metadata
+        .get("turn_span")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let other_turns = other
+        .metadata
+        .get("turn_span")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    target.metadata.insert(
+        "turn_span".to_string(),
+        Value::Number(serde_json::Number::from(target_turns + other_turns)),
+    );
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 /// Token-overlap similarity in [0.0, 1.0]. Lowercases both strings, strips
 /// a short stop-word list, then computes |intersect| / |smaller|.
 fn token_overlap_pct(a: &str, b: &str) -> f64 {
@@ -1379,5 +1562,122 @@ mod tests {
         assert!(!recs.is_empty());
         // CN session id mirrors the raw uuid byte-for-byte (no prefix).
         assert_eq!(recs[0].session_id_cn, "abc");
+    }
+
+    fn goal_phase_record(text: &str, ts: &str) -> MemoryRecord {
+        let mut rec =
+            MemoryRecord::new(MemoryKind::GoalPhase, text.to_string(), "sess".to_string());
+        rec.metadata
+            .insert("start_ts".to_string(), Value::String(ts.to_string()));
+        rec.metadata
+            .insert("end_ts".to_string(), Value::String(ts.to_string()));
+        rec.metadata.insert(
+            "turn_span".to_string(),
+            Value::Number(serde_json::Number::from(1u64)),
+        );
+        rec
+    }
+
+    /// With the deterministic mock embedder, identical input yields
+    /// identical embeddings → cosine 1.0 → merge. Two GoalPhase records
+    /// with the same text collapse to one with summed turn_span.
+    #[tokio::test]
+    async fn refine_merges_identical_goal_texts() {
+        use crate::config::EmbeddingServicesConfig;
+        use crate::services::embedding::EmbeddingService;
+        let emb = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("mock embedder builds");
+        let records = vec![
+            goal_phase_record("Implement feature X", "2026-05-28T09:00:00Z"),
+            goal_phase_record("Implement feature X", "2026-05-28T09:10:00Z"),
+        ];
+        let refined = refine_goal_phases_by_embedding(records, &emb)
+            .await
+            .unwrap();
+        let goals: Vec<_> = refined
+            .iter()
+            .filter(|r| r.kind == MemoryKind::GoalPhase)
+            .collect();
+        assert_eq!(
+            goals.len(),
+            1,
+            "identical-text goals must merge; got {} goals",
+            goals.len()
+        );
+        let span = goals[0]
+            .metadata
+            .get("turn_span")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(span, 2, "merged turn_span should sum, got {}", span);
+        let start = goals[0]
+            .metadata
+            .get("start_ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let end = goals[0]
+            .metadata
+            .get("end_ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(start, "2026-05-28T09:00:00Z", "earliest start_ts wins");
+        assert_eq!(end, "2026-05-28T09:10:00Z", "latest end_ts wins");
+    }
+
+    /// With a single GoalPhase the function is a no-op (no pair to
+    /// compare). Verifies the early-return path.
+    #[tokio::test]
+    async fn refine_single_goal_is_noop() {
+        use crate::config::EmbeddingServicesConfig;
+        use crate::services::embedding::EmbeddingService;
+        let emb = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("mock embedder builds");
+        let records = vec![goal_phase_record("Single goal", "2026-05-28T09:00:00Z")];
+        let refined = refine_goal_phases_by_embedding(records, &emb)
+            .await
+            .unwrap();
+        assert_eq!(refined.len(), 1);
+        assert_eq!(refined[0].kind, MemoryKind::GoalPhase);
+    }
+
+    /// Non-goal records (learnings, todos, etc.) pass through unchanged
+    /// regardless of clustering — refinement only touches GoalPhase.
+    #[tokio::test]
+    async fn refine_preserves_non_goal_records() {
+        use crate::config::EmbeddingServicesConfig;
+        use crate::services::embedding::EmbeddingService;
+        let emb = EmbeddingService::new(EmbeddingServicesConfig::default())
+            .expect("mock embedder builds");
+        let mut learn = MemoryRecord::new(
+            MemoryKind::Learning,
+            "Learned something".to_string(),
+            "sess".to_string(),
+        );
+        learn.metadata.insert(
+            "ts".to_string(),
+            Value::String("2026-05-28T09:05:00Z".into()),
+        );
+        let records = vec![
+            goal_phase_record("Goal A", "2026-05-28T09:00:00Z"),
+            learn,
+            goal_phase_record("Goal A", "2026-05-28T09:10:00Z"),
+        ];
+        let refined = refine_goal_phases_by_embedding(records, &emb)
+            .await
+            .unwrap();
+        let learnings = refined
+            .iter()
+            .filter(|r| r.kind == MemoryKind::Learning)
+            .count();
+        assert_eq!(learnings, 1, "Learning record must pass through");
+    }
+
+    #[test]
+    fn cosine_handles_degenerate_inputs() {
+        assert_eq!(cosine(&[], &[]), 0.0);
+        assert_eq!(cosine(&[1.0, 2.0], &[1.0]), 0.0, "mismatched length → 0");
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0, "zero vector → 0");
+        let v = vec![1.0, 0.0, 0.0];
+        assert!((cosine(&v, &v) - 1.0).abs() < 1e-6, "self-cosine ≈ 1");
     }
 }

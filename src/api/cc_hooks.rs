@@ -350,8 +350,24 @@ async fn tail_and_ingest(
         .or(metadata.cwd.as_deref())
         .unwrap_or("");
 
-    let records = extract_memories(&events, session_uuid, project_cwd);
+    let mut records = extract_memories(&events, session_uuid, project_cwd);
+    // Refine goal_phase clustering using embedding cosine similarity —
+    // catches "same intent, different wording" goal pairs that token
+    // overlap misses. Failure-tolerant: any embedding error degrades
+    // gracefully to the token-overlap result already in `records`.
     if !records.is_empty() {
+        match crate::ingest::claude_code::extractor::refine_goal_phases_by_embedding(
+            records.clone(),
+            &services.embedding,
+        )
+        .await
+        {
+            Ok(refined) => records = refined,
+            Err(e) => tracing::warn!(
+                error = %e,
+                "goal_phase embedding refinement failed; keeping token-overlap result"
+            ),
+        }
         let sink = ServicesSink::new(services.clone());
         sink.store_batch(&records)
             .await
