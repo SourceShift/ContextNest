@@ -751,6 +751,100 @@ async fn trajectory_endpoint_exposes_basin_links_post_consolidation() {
         Some("verification"),
         "all stored fragments were verification kind"
     );
+
+    // resonant_basins must be present as an array. With only one session's
+    // fragments stored, there are no foreign basins to resonate with —
+    // expected empty. Content correctness with cross-session resonance is
+    // tested in `trajectory_endpoint_exposes_resonant_basins_across_sessions`.
+    assert!(
+        body["resonant_basins"].is_array(),
+        "resonant_basins must be present as an array, got: {:?}",
+        body["resonant_basins"]
+    );
+}
+
+/// `resonant_basins` populates when a session's fragments share connection
+/// graph edges with fragments owned by OTHER sessions. The neighbor's basin
+/// must be different from the session's own basins (no self-resonance), and
+/// `sessions_touching` counts distinct foreign session ids.
+#[tokio::test]
+async fn trajectory_endpoint_exposes_resonant_basins_across_sessions() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+
+    // Force singleton-per-fragment so we can construct deterministic
+    // cross-session connection edges via the connection_network's
+    // auto-linking on add_node. (With basin clustering enabled, the
+    // mock embedder may merge near-duplicates and obscure the test signal.)
+    std::env::set_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD", "0.0");
+
+    let session_a = "cc-resonance-a";
+    let session_b = "cc-resonance-b";
+    let session_c = "cc-resonance-c";
+
+    // Three sessions storing slight variations on the same theme — the
+    // mock embedder's deterministic + similarity-aware auto-linking in
+    // ConnectionNetwork::add_node ties them via edges even when basins
+    // don't merge.
+    for sid in [session_a, session_b, session_c] {
+        store(
+            &server,
+            sid,
+            &format!("trajectory verification probe {sid}"),
+            json!({
+                "kind": "verification",
+                "src_session": sid,
+                "ts": "2026-05-28T09:00:00Z",
+                "status": "passed",
+            }),
+        )
+        .await;
+    }
+    drain_for_test(&services, &services.consolidation_queue, 3).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{session_a}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let resonant = body["resonant_basins"]
+        .as_array()
+        .expect("resonant_basins present");
+
+    // Contract: each entry must have basin_id (string), coherence (number),
+    // sessions_touching (number), edge_count (number). And resonant basins
+    // must not appear in basin_links (no self-resonance).
+    let own_basins: std::collections::HashSet<String> = body["basin_links"]
+        .as_array()
+        .expect("basin_links present")
+        .iter()
+        .filter_map(|b| b["basin_id"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    for entry in resonant {
+        assert!(entry["basin_id"].is_string(), "basin_id must be string");
+        assert!(entry["coherence"].is_number(), "coherence must be number");
+        assert!(
+            entry["sessions_touching"].is_number(),
+            "sessions_touching must be number"
+        );
+        assert!(entry["edge_count"].is_number(), "edge_count must be number");
+        let bid = entry["basin_id"].as_str().unwrap();
+        assert!(
+            !own_basins.contains(bid),
+            "resonant basin {bid} must not also be in basin_links (no self-resonance)"
+        );
+    }
+
+    std::env::remove_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD");
 }
 
 /// Prompt preview is a deterministic, no-LLM capsule preview over the

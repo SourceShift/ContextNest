@@ -1229,6 +1229,24 @@ pub struct BasinLink {
     pub hottest_kind: Option<String>,
 }
 
+/// Basins that are NOT in this session but are connected to the session's
+/// own basins via the learned connection graph. This is the "resonance"
+/// signal — emergent patterns across multiple weakly-related basins that
+/// would never come back from a flat similarity query (§5 of
+/// `docs/architecture.md`).
+///
+/// `coherence` is the mean edge weight from session-fragments to neighbors
+/// in this basin. `sessions_touching` counts distinct sessions that own
+/// the neighbor fragments — surfaces the "seen together" UI ("this
+/// debugging session resonates with 3 prior sessions about WAL safety").
+#[derive(Debug, Serialize)]
+pub struct ResonantBasin {
+    pub basin_id: String,
+    pub edge_count: usize,
+    pub coherence: f32,
+    pub sessions_touching: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TrajectoryResponse {
     pub session_id: String,
@@ -1242,6 +1260,12 @@ pub struct TrajectoryResponse {
     /// the session's fragments into basins yet (cold-substrate / pre-Phase-3
     /// state, see `docs/architecture-honest.md`).
     pub basin_links: Vec<BasinLink>,
+    /// External basins connected to this session's basins via the learned
+    /// connection graph, ranked by `coherence × sessions_touching` desc.
+    /// Capped at the top 5 to keep response payload bounded. Empty when
+    /// the session has no own basins (cold substrate) or when no neighbors
+    /// land in foreign basins (isolated session).
+    pub resonant_basins: Vec<ResonantBasin>,
 }
 
 #[derive(Debug, Clone)]
@@ -1386,6 +1410,88 @@ pub async fn session_trajectory(
         links
     };
 
+    // Resonance — basins connected to ours via the learned-graph that
+    // are NOT ours, ranked by mean edge weight × distinct foreign
+    // sessions. The fragment→basin and fragment→session reverse maps
+    // are built once; the loop is O(active_ids × avg_neighbors).
+    let resonant_basins: Vec<ResonantBasin> = if basin_links.is_empty() {
+        Vec::new()
+    } else {
+        let mut fragment_to_basin: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(
+                basin_snapshots.iter().map(|s| s.fragment_ids.len()).sum(),
+            );
+        for snapshot in &basin_snapshots {
+            for fid in &snapshot.fragment_ids {
+                fragment_to_basin.insert(fid.clone(), snapshot.id.clone());
+            }
+        }
+        let fragment_to_session = services.session_index.active_fragments_session_map().await;
+        let own_basin_ids: std::collections::HashSet<&String> =
+            basin_links.iter().map(|b| &b.basin_id).collect();
+        let own_fragment_ids: std::collections::HashSet<&String> = active_ids.iter().collect();
+
+        struct ResonanceAccum {
+            total_weight: f32,
+            edge_count: usize,
+            sessions: std::collections::HashSet<String>,
+        }
+        let mut by_basin: std::collections::HashMap<String, ResonanceAccum> =
+            std::collections::HashMap::new();
+
+        for fid in active_ids.iter() {
+            let neighbors = services.attractor_manager.list_neighbors(fid).await;
+            for (neighbor_id, weight) in neighbors {
+                if own_fragment_ids.contains(&neighbor_id) {
+                    continue;
+                }
+                let Some(neighbor_basin) = fragment_to_basin.get(&neighbor_id) else {
+                    continue;
+                };
+                if own_basin_ids.contains(neighbor_basin) {
+                    continue;
+                }
+                let entry =
+                    by_basin
+                        .entry(neighbor_basin.clone())
+                        .or_insert_with(|| ResonanceAccum {
+                            total_weight: 0.0,
+                            edge_count: 0,
+                            sessions: std::collections::HashSet::new(),
+                        });
+                entry.total_weight += weight;
+                entry.edge_count += 1;
+                if let Some(session) = fragment_to_session.get(&neighbor_id) {
+                    entry.sessions.insert(session.clone());
+                }
+            }
+        }
+
+        let mut basins: Vec<ResonantBasin> = by_basin
+            .into_iter()
+            .map(|(basin_id, accum)| ResonantBasin {
+                basin_id,
+                edge_count: accum.edge_count,
+                coherence: if accum.edge_count > 0 {
+                    accum.total_weight / accum.edge_count as f32
+                } else {
+                    0.0
+                },
+                sessions_touching: accum.sessions.len(),
+            })
+            .collect();
+        basins.sort_by(|a, b| {
+            let a_score = a.coherence * a.sessions_touching.max(1) as f32;
+            let b_score = b.coherence * b.sessions_touching.max(1) as f32;
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.edge_count.cmp(&a.edge_count))
+        });
+        basins.truncate(5);
+        basins
+    };
+
     phases.sort_by(|a, b| {
         a.start_ts
             .as_deref()
@@ -1478,6 +1584,7 @@ pub async fn session_trajectory(
             risk_flags,
         },
         basin_links,
+        resonant_basins,
     }))
 }
 
