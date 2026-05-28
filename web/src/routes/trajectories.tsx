@@ -20,7 +20,7 @@ type TrajectorySession = {
 };
 
 type TrajectoryFilter = 'all' | 'promotion' | 'risks' | 'directives';
-type SortMode = 'priority' | 'newest' | 'oldest' | 'records' | 'promotions' | 'risks';
+type SortMode = 'priority' | 'newest' | 'oldest' | 'records' | 'promotions' | 'risks' | 'heat';
 type DateRange = 'all' | '1h' | '24h' | '7d' | '30d';
 type Chip = { k: string; v: string };
 const CHIP_KEYS = ['project', 'session', 'kind'] as const;
@@ -52,6 +52,7 @@ const SORT_LABELS: Record<SortMode, string> = {
   records: 'record count',
   promotions: 'promotion queue',
   risks: 'risk flags',
+  heat: 'basin heat (24h)',
 };
 const DATE_LABELS: Record<DateRange, string> = {
   all: 'any time',
@@ -417,10 +418,28 @@ function compareTrajectoryRows(a: TrajectorySession, b: TrajectorySession, sortM
       return bp - ap || defaultPriorityCompare(a, b);
     case 'risks':
       return br - ar || defaultPriorityCompare(a, b);
+    case 'heat':
+      return sessionHeat(b) - sessionHeat(a) || defaultPriorityCompare(a, b);
     case 'priority':
     default:
       return defaultPriorityCompare(a, b);
   }
+}
+
+/**
+ * Maximum 24h-heat across the session's basins. Drives the heat-weighted
+ * tiebreaker in `defaultPriorityCompare` — a 2-day-old session sitting in
+ * a hot basin (cluster lit up 20× since) deserves more prominence than a
+ * 5-minute-old idle session whose basin nobody touched. Returns 0 when
+ * the session has no basin overlap (cold substrate / pre-consolidation).
+ */
+function sessionHeat(row: TrajectorySession): number {
+  const links = row.trajectory.basin_links ?? [];
+  let max = 0;
+  for (const link of links) {
+    if (link.heat_24h > max) max = link.heat_24h;
+  }
+  return max;
 }
 
 function defaultPriorityCompare(a: TrajectorySession, b: TrajectorySession) {
@@ -428,9 +447,16 @@ function defaultPriorityCompare(a: TrajectorySession, b: TrajectorySession) {
   const bp = b.trajectory.promotion_queue.length;
   const ar = a.trajectory.cost_profile.risk_flags;
   const br = b.trajectory.cost_profile.risk_flags;
+  // Risks first, then promotions, then BASIN HEAT (substrate-signal
+  // tiebreaker), then volume, then recency. Heat sits between promotion
+  // count and trajectory volume because a hot basin is a stronger
+  // "should look at this" signal than "this session generated a lot of
+  // records", but weaker than "this session contains explicit promotion
+  // candidates or risks".
   return (
-    bp - ap ||
     br - ar ||
+    bp - ap ||
+    sessionHeat(b) - sessionHeat(a) ||
     b.trajectory.trajectory_count - a.trajectory.trajectory_count ||
     b.lastActivity - a.lastActivity
   );
@@ -780,7 +806,7 @@ function SortMenu({ value, onChange }: { value: SortMode; onChange: (v: SortMode
       icon={<Icon.Clock className="ic" />}
       label="sort"
       value={value}
-      options={['priority', 'newest', 'oldest', 'records', 'promotions', 'risks'] as const}
+      options={['priority', 'heat', 'newest', 'oldest', 'records', 'promotions', 'risks'] as const}
       optionLabel={(v) => SORT_LABELS[v]}
       onChange={onChange}
       title="Sort order"
