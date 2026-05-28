@@ -24,8 +24,14 @@
 //! substrate page reads this every few seconds to render the
 //! consolidation progress band.
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
-use serde::Serialize;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::services::ContextNestServices;
 
@@ -274,6 +280,61 @@ pub async fn get_substrate_health(
     }))
 }
 
+/// Admin endpoint that collapses near-duplicate basins via
+/// [`crate::memory::attractors::memory_attractor_manager::MemoryAttractorManager::merge_nearby_basins`].
+/// Designed to clean up degenerate substrates produced by the pre-fix
+/// `process_memories` Step 1 (every fragment seeded its own basin).
+///
+/// `distance_threshold` is passed straight to `should_merge_with`:
+/// `distance < merged_radius * threshold` is the merge predicate. The
+/// default (1.0) means "merge basins whose centers are closer than their
+/// combined radius" — a conservative pass that catches obvious singletons
+/// without collapsing semantically-distinct clusters. Operators tuning
+/// against the substrate should run with a small threshold first and
+/// inspect `basins_merged` before raising it.
+///
+/// O(N²) runtime — at 100K basins expect several minutes of wall clock.
+#[derive(Debug, Deserialize)]
+pub struct MergeBasinsQuery {
+    #[serde(default = "default_merge_threshold")]
+    pub distance_threshold: f32,
+}
+
+fn default_merge_threshold() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Serialize)]
+pub struct MergeBasinsResponse {
+    pub basins_merged: usize,
+    pub basins_remaining: usize,
+    pub elapsed_ms: u64,
+    pub distance_threshold: f32,
+}
+
+pub async fn admin_merge_nearby_basins(
+    State(services): State<ContextNestServices>,
+    Query(query): Query<MergeBasinsQuery>,
+) -> Result<Json<MergeBasinsResponse>, StatusCode> {
+    let start = std::time::Instant::now();
+    let basins_merged = services
+        .attractor_manager
+        .merge_nearby_basins(query.distance_threshold)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let basins_remaining = services
+        .attractor_manager
+        .list_basin_snapshots()
+        .await
+        .len();
+    Ok(Json(MergeBasinsResponse {
+        basins_merged,
+        basins_remaining,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        distance_threshold: query.distance_threshold,
+    }))
+}
+
 pub fn create_substrate_router() -> Router<ContextNestServices> {
     Router::new()
         .route(
@@ -281,4 +342,8 @@ pub fn create_substrate_router() -> Router<ContextNestServices> {
             get(get_consolidation_status),
         )
         .route("/api/v1/substrate/health", get(get_substrate_health))
+        .route(
+            "/api/v1/admin/merge-nearby-basins",
+            post(admin_merge_nearby_basins),
+        )
 }

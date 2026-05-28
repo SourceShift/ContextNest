@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock as AsyncRwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Main memory attractor system manager
@@ -284,11 +285,50 @@ impl MemoryAttractorManager {
             quality_metrics: ProcessingQualityMetrics::default(),
         };
 
-        // Step 1: Create attractor basins if enabled
+        // Step 1: Attach to nearest basin within threshold, otherwise create
+        // a new one. Before this fix, every fragment unconditionally seeded a
+        // new basin — the live substrate degenerated to ~one-basin-per-
+        // fragment (`avg_mass == 1.0`) and the connection-graph blew up at
+        // O(N) edges per insert because singletons share no semantic mass.
+        // Threshold (`basin_attach_threshold`, env-overridable) is calibrated
+        // for normalized 768-d embeddings; set to 0.0 to restore old behaviour.
         if request.options.enable_attractor_creation {
+            let attach_threshold = self.config.basin_attach_threshold;
             for fragment in &request.fragments {
-                if let Ok(basin_id) = self.create_attractor_basin_from_fragment(fragment).await {
-                    result.created_basins.push(basin_id);
+                let nearest = self
+                    .basin_manager
+                    .find_nearest_basin_with_distance(&fragment.content)
+                    .await;
+                match nearest {
+                    Some((basin_id, distance))
+                        if attach_threshold > 0.0 && distance <= attach_threshold =>
+                    {
+                        // Reinforce existing basin instead of fragmenting the
+                        // field. Failure here is logged-and-skipped so a single
+                        // bad fragment can't deadlock the whole batch.
+                        if let Err(e) = self
+                            .basin_manager
+                            .add_fragment_to_basin(&basin_id, fragment.id.clone())
+                            .await
+                        {
+                            warn!(
+                                fragment_id = %fragment.id,
+                                basin = %basin_id,
+                                distance,
+                                error = %e,
+                                "failed to attach fragment to nearest basin"
+                            );
+                            continue;
+                        }
+                        result.created_basins.push(basin_id);
+                    }
+                    _ => {
+                        if let Ok(basin_id) =
+                            self.create_attractor_basin_from_fragment(fragment).await
+                        {
+                            result.created_basins.push(basin_id);
+                        }
+                    }
                 }
             }
         }
@@ -474,6 +514,17 @@ impl MemoryAttractorManager {
     /// results with learned-graph siblings of the top hit.
     pub async fn list_neighbors(&self, node_id: &str) -> Vec<(String, f32)> {
         self.connection_network.neighbors_of(node_id).await
+    }
+
+    /// Collapse nearby basins. Public-passthrough for the admin cleanup
+    /// endpoint that fixes degenerate substrates (every fragment its own
+    /// basin) produced by pre-fix process_memories. O(N²) over the basin
+    /// set — runtime grows quadratically with basin count. Forwards to
+    /// [`crate::memory::attractors::attractor_basin::AttractorBasinManager::merge_nearby_basins`].
+    pub async fn merge_nearby_basins(&self, distance_threshold: f32) -> ContextNestResult<usize> {
+        self.basin_manager
+            .merge_nearby_basins(distance_threshold)
+            .await
     }
 
     /// Snapshot of the connection network's graph metrics
