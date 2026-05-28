@@ -761,6 +761,117 @@ async fn trajectory_endpoint_exposes_basin_links_post_consolidation() {
         "resonant_basins must be present as an array, got: {:?}",
         body["resonant_basins"]
     );
+
+    // promotion_clusters present as array (structural contract). Content
+    // (clusters of memory_candidate/prompt_directive/risk_flag candidates
+    // grouped by basin) is asserted in
+    // `trajectory_endpoint_promotion_clusters_group_candidates_by_basin`.
+    assert!(
+        body["promotion_clusters"].is_array(),
+        "promotion_clusters must be present as an array, got: {:?}",
+        body["promotion_clusters"]
+    );
+}
+
+/// `promotion_clusters` groups the flat promotion queue by basin. With
+/// the consolidation worker drained and singleton-mode forced (so each
+/// candidate lands in its own basin), every cluster has one candidate
+/// and the count of clusters equals the count of distinct promotion
+/// records.
+#[tokio::test]
+async fn trajectory_endpoint_promotion_clusters_group_candidates_by_basin() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+
+    // Force singleton mode so each promotion candidate has its own basin
+    // and the clustering output is deterministic — three promotion-kind
+    // fragments must produce three single-candidate clusters.
+    std::env::set_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD", "0.0");
+
+    let sid = "cc-promo-clusters";
+    store(
+        &server,
+        sid,
+        "Goal phase for cluster test",
+        json!({
+            "kind": "goal_phase",
+            "src_session": sid,
+            "ts": "2026-05-28T09:00:00Z",
+            "start_ts": "2026-05-28T09:00:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Promote sparse emission rule",
+        json!({"kind": "memory_candidate", "src_session": sid, "ts": "2026-05-28T09:05:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Inject WAL-safety directive on schema migration",
+        json!({"kind": "prompt_directive", "src_session": sid, "ts": "2026-05-28T09:10:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Live WAL migration can lose data",
+        json!({"kind": "risk_flag", "src_session": sid, "ts": "2026-05-28T09:15:00Z"}),
+    )
+    .await;
+
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let promotion_queue = body["promotion_queue"]
+        .as_array()
+        .expect("promotion_queue present");
+    assert_eq!(
+        promotion_queue.len(),
+        3,
+        "expected 3 promotion-kind records (memory_candidate, prompt_directive, risk_flag)"
+    );
+
+    let clusters = body["promotion_clusters"]
+        .as_array()
+        .expect("promotion_clusters present");
+    let total_in_clusters: usize = clusters
+        .iter()
+        .map(|c| c["candidates"].as_array().map(|a| a.len()).unwrap_or(0))
+        .sum();
+    assert_eq!(
+        total_in_clusters, 3,
+        "every promotion candidate must end up in exactly one cluster; got {total_in_clusters} across {} clusters",
+        clusters.len()
+    );
+
+    // Coherence sums to 1.0 (within float epsilon) when every candidate
+    // has a basin assignment — each share is fraction-of-clustered.
+    let coherence_sum: f32 = clusters
+        .iter()
+        .map(|c| c["coherence"].as_f64().unwrap_or(0.0) as f32)
+        .sum();
+    assert!(
+        (coherence_sum - 1.0).abs() < 1e-3,
+        "coherence shares should sum to ~1.0, got {coherence_sum}"
+    );
+
+    std::env::remove_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD");
 }
 
 /// `resonant_basins` populates when a session's fragments share connection
