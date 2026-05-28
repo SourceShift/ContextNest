@@ -20,7 +20,7 @@ type TrajectorySession = {
 };
 
 type TrajectoryFilter = 'all' | 'promotion' | 'risks' | 'directives';
-type SortMode = 'priority' | 'newest' | 'oldest' | 'records' | 'promotions' | 'risks';
+type SortMode = 'priority' | 'newest' | 'oldest' | 'records' | 'promotions' | 'risks' | 'heat';
 type DateRange = 'all' | '1h' | '24h' | '7d' | '30d';
 type Chip = { k: string; v: string };
 const CHIP_KEYS = ['project', 'session', 'kind'] as const;
@@ -52,6 +52,7 @@ const SORT_LABELS: Record<SortMode, string> = {
   records: 'record count',
   promotions: 'promotion queue',
   risks: 'risk flags',
+  heat: 'basin heat (24h)',
 };
 const DATE_LABELS: Record<DateRange, string> = {
   all: 'any time',
@@ -417,10 +418,28 @@ function compareTrajectoryRows(a: TrajectorySession, b: TrajectorySession, sortM
       return bp - ap || defaultPriorityCompare(a, b);
     case 'risks':
       return br - ar || defaultPriorityCompare(a, b);
+    case 'heat':
+      return sessionHeat(b) - sessionHeat(a) || defaultPriorityCompare(a, b);
     case 'priority':
     default:
       return defaultPriorityCompare(a, b);
   }
+}
+
+/**
+ * Maximum 24h-heat across the session's basins. Drives the heat-weighted
+ * tiebreaker in `defaultPriorityCompare` — a 2-day-old session sitting in
+ * a hot basin (cluster lit up 20× since) deserves more prominence than a
+ * 5-minute-old idle session whose basin nobody touched. Returns 0 when
+ * the session has no basin overlap (cold substrate / pre-consolidation).
+ */
+function sessionHeat(row: TrajectorySession): number {
+  const links = row.trajectory.basin_links ?? [];
+  let max = 0;
+  for (const link of links) {
+    if (link.heat_24h > max) max = link.heat_24h;
+  }
+  return max;
 }
 
 function defaultPriorityCompare(a: TrajectorySession, b: TrajectorySession) {
@@ -428,9 +447,16 @@ function defaultPriorityCompare(a: TrajectorySession, b: TrajectorySession) {
   const bp = b.trajectory.promotion_queue.length;
   const ar = a.trajectory.cost_profile.risk_flags;
   const br = b.trajectory.cost_profile.risk_flags;
+  // Risks first, then promotions, then BASIN HEAT (substrate-signal
+  // tiebreaker), then volume, then recency. Heat sits between promotion
+  // count and trajectory volume because a hot basin is a stronger
+  // "should look at this" signal than "this session generated a lot of
+  // records", but weaker than "this session contains explicit promotion
+  // candidates or risks".
   return (
-    bp - ap ||
     br - ar ||
+    bp - ap ||
+    sessionHeat(b) - sessionHeat(a) ||
     b.trajectory.trajectory_count - a.trajectory.trajectory_count ||
     b.lastActivity - a.lastActivity
   );
@@ -445,8 +471,16 @@ function Metric({ label, value, warn }: { label: string; value: number; warn?: b
   );
 }
 
+function shortBasinId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 6)}…${id.slice(-3)}` : id;
+}
+
 function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
   const counts = row.trajectory.cost_profile;
+  const basinLinks = row.trajectory.basin_links ?? [];
+  const resonantBasins = row.trajectory.resonant_basins ?? [];
+  const promotionClusters = row.trajectory.promotion_clusters ?? [];
+  const primaryBasin = basinLinks[0];
   const topKinds = Object.entries(row.session.by_kind)
     .filter(([kind]) =>
       [
@@ -469,6 +503,28 @@ function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
           <div className="trajectory-session-title">
             <SessionPill id={row.session.id} />
             <ProjBadge p={row.project} />
+            {primaryBasin && (
+              <span
+                className={`basin-badge${primaryBasin.heat_24h > 0 ? ' hot' : ''}`}
+                title={`Basin ${primaryBasin.basin_id}\n${primaryBasin.members_in_session}/${primaryBasin.total_members} fragments from this session\n${primaryBasin.heat_24h} fragments written in last 24h${
+                  primaryBasin.hottest_kind ? `\nhottest kind: ${primaryBasin.hottest_kind}` : ''
+                }${basinLinks.length > 1 ? `\n+${basinLinks.length - 1} more basin${basinLinks.length === 2 ? '' : 's'}` : ''}`}
+              >
+                <span className="basin-glyph">●</span>
+                <span className="mono">{shortBasinId(primaryBasin.basin_id)}</span>
+                <span className="basin-mass">
+                  {primaryBasin.members_in_session}/{primaryBasin.total_members}
+                </span>
+                {primaryBasin.heat_24h > 0 && (
+                  <span className="basin-heat" title={`${primaryBasin.heat_24h} writes in last 24h`}>
+                    24h:{primaryBasin.heat_24h}
+                  </span>
+                )}
+                {basinLinks.length > 1 && (
+                  <span className="basin-more">+{basinLinks.length - 1}</span>
+                )}
+              </span>
+            )}
             <span className="mono dim">
               {row.session.last_ts ? agoFrom(row.session.last_ts) : '—'}
             </span>
@@ -507,6 +563,49 @@ function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
               {kind.replace('_', ' ')} · {count}
             </span>
           ))}
+        </div>
+      )}
+
+      {resonantBasins.length > 0 && (
+        <div
+          className="trajectory-resonance-strip"
+          title="Basins connected to this session's basins via the learned graph. Hover for details."
+        >
+          <span className="resonance-label mono">resonates with</span>
+          {resonantBasins.slice(0, 3).map((rb) => (
+            <span
+              key={rb.basin_id}
+              className="resonance-chip"
+              title={`Basin ${rb.basin_id}\ncoherence ${rb.coherence.toFixed(2)} · ${rb.sessions_touching} session${rb.sessions_touching === 1 ? '' : 's'} · ${rb.edge_count} edge${rb.edge_count === 1 ? '' : 's'}`}
+            >
+              <span className="mono">{shortBasinId(rb.basin_id)}</span>
+              <span className="resonance-coherence">{rb.coherence.toFixed(2)}</span>
+              <span className="resonance-sessions">×{rb.sessions_touching}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {promotionClusters.length > 0 && (
+        <div
+          className="trajectory-promotion-clusters"
+          title="Promotion candidates grouped by basin. Coherent clusters (1 basin / many candidates) signal earned promotion."
+        >
+          <span className="promotion-label mono">promo clusters</span>
+          {promotionClusters.slice(0, 3).map((pc) => (
+            <span
+              key={pc.basin_id}
+              className={`promotion-cluster${pc.coherence > 0.5 ? ' coherent' : ''}`}
+              title={`Basin ${pc.basin_id}\n${pc.candidates.length} candidate${pc.candidates.length === 1 ? '' : 's'} · coherence ${pc.coherence.toFixed(2)}`}
+            >
+              <span className="mono">{shortBasinId(pc.basin_id)}</span>
+              <span className="cluster-count">{pc.candidates.length}</span>
+              <span className="cluster-coherence">{(pc.coherence * 100).toFixed(0)}%</span>
+            </span>
+          ))}
+          {promotionClusters.length > 3 && (
+            <span className="promotion-more mono dim">+{promotionClusters.length - 3}</span>
+          )}
         </div>
       )}
     </div>
@@ -707,7 +806,7 @@ function SortMenu({ value, onChange }: { value: SortMode; onChange: (v: SortMode
       icon={<Icon.Clock className="ic" />}
       label="sort"
       value={value}
-      options={['priority', 'newest', 'oldest', 'records', 'promotions', 'risks'] as const}
+      options={['priority', 'heat', 'newest', 'oldest', 'records', 'promotions', 'risks'] as const}
       optionLabel={(v) => SORT_LABELS[v]}
       onChange={onChange}
       title="Sort order"

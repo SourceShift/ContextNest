@@ -186,6 +186,27 @@ export type TrajectoryCostProfile = {
   risk_flags: number;
 };
 
+export type BasinLink = {
+  basin_id: string;
+  members_in_session: number;
+  total_members: number;
+  heat_24h: number;
+  hottest_kind: string | null;
+};
+
+export type ResonantBasin = {
+  basin_id: string;
+  edge_count: number;
+  coherence: number;
+  sessions_touching: number;
+};
+
+export type PromotionCluster = {
+  basin_id: string;
+  candidates: TrajectoryRecord[];
+  coherence: number;
+};
+
 export type TrajectoryResponse = {
   session_id: string;
   trajectory_count: number;
@@ -193,6 +214,9 @@ export type TrajectoryResponse = {
   records: TrajectoryRecord[];
   promotion_queue: TrajectoryRecord[];
   cost_profile: TrajectoryCostProfile;
+  basin_links: BasinLink[];
+  resonant_basins: ResonantBasin[];
+  promotion_clusters: PromotionCluster[];
 };
 
 export type PromptPreviewSection = {

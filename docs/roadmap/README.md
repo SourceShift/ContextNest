@@ -16,6 +16,10 @@ referenced epic spec is approved and tracked through CHANGELOG.
   Transcript-derived proposal for richer `z-insight` fields that let
   ContextNest build evidence-linked prompt capsules from long-term Claude
   trajectories.
+- [**v0.5-trajectory-substrate-aware-cards.md**](v0.5-trajectory-substrate-aware-cards.md)
+  Four trajectory-card upgrades (basin badge, resonance strip, promotion
+  clusters, heat-weighted sort) each grounded in a named substrate
+  primitive from `docs/architecture.md`.
 
 ## Future placeholders
 

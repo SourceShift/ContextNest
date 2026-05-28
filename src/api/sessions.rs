@@ -1215,6 +1215,50 @@ pub struct TrajectoryCostProfile {
     pub risk_flags: usize,
 }
 
+/// One row of session-to-basin overlap. Emitted on the trajectory response so
+/// the dashboard can surface the substrate's clustering judgement without
+/// re-querying `/field/basins`. `members_in_session` answers "how many of THIS
+/// session's fragments did the substrate cluster into this basin"; `heat_24h`
+/// answers "is this basin alive right now" (write-time, basin-wide).
+#[derive(Debug, Serialize)]
+pub struct BasinLink {
+    pub basin_id: String,
+    pub members_in_session: usize,
+    pub total_members: usize,
+    pub heat_24h: usize,
+    pub hottest_kind: Option<String>,
+}
+
+/// Basins that are NOT in this session but are connected to the session's
+/// own basins via the learned connection graph. This is the "resonance"
+/// signal — emergent patterns across multiple weakly-related basins that
+/// would never come back from a flat similarity query (§5 of
+/// `docs/architecture.md`).
+///
+/// `coherence` is the mean edge weight from session-fragments to neighbors
+/// in this basin. `sessions_touching` counts distinct sessions that own
+/// the neighbor fragments — surfaces the "seen together" UI ("this
+/// debugging session resonates with 3 prior sessions about WAL safety").
+#[derive(Debug, Serialize)]
+pub struct ResonantBasin {
+    pub basin_id: String,
+    pub edge_count: usize,
+    pub coherence: f32,
+    pub sessions_touching: usize,
+}
+
+/// Promotion-queue candidates clustered by the basin they live in. Lets the
+/// dashboard surface "earned promotion" — three candidates from three
+/// sessions resonating into one basin is a strong signal vs. nine
+/// candidates spread across nine basins (noise). `coherence` here is the
+/// share of the promotion queue concentrated in this basin (0.0–1.0).
+#[derive(Debug, Serialize)]
+pub struct PromotionCluster {
+    pub basin_id: String,
+    pub candidates: Vec<TrajectoryRecord>,
+    pub coherence: f32,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TrajectoryResponse {
     pub session_id: String,
@@ -1223,6 +1267,22 @@ pub struct TrajectoryResponse {
     pub records: Vec<TrajectoryRecord>,
     pub promotion_queue: Vec<TrajectoryRecord>,
     pub cost_profile: TrajectoryCostProfile,
+    /// Basins this session's fragments live in, ranked by `members_in_session`
+    /// desc. Empty when the consolidation worker hasn't crystallised any of
+    /// the session's fragments into basins yet (cold-substrate / pre-Phase-3
+    /// state, see `docs/architecture-honest.md`).
+    pub basin_links: Vec<BasinLink>,
+    /// External basins connected to this session's basins via the learned
+    /// connection graph, ranked by `coherence × sessions_touching` desc.
+    /// Capped at the top 5 to keep response payload bounded. Empty when
+    /// the session has no own basins (cold substrate) or when no neighbors
+    /// land in foreign basins (isolated session).
+    pub resonant_basins: Vec<ResonantBasin>,
+    /// `promotion_queue` grouped by the basin each candidate lives in.
+    /// Candidates without a basin assignment are omitted (legacy data
+    /// stored before consolidation; the flat `promotion_queue` still
+    /// surfaces them). Sorted by `candidates.len()` desc.
+    pub promotion_clusters: Vec<PromotionCluster>,
 }
 
 #[derive(Debug, Clone)]
@@ -1296,6 +1356,159 @@ pub async fn session_trajectory(
     drop(texts);
     drop(metadata);
 
+    // Basin overlap — answers "which substrate-clustered groups does this
+    // session's content live in?" Geometry comes from the manager; per-fragment
+    // ts (write-time) gives the heat signal. Holding the metadata read guard
+    // through the synchronous loop is intentional — never await inside.
+    let basin_snapshots = services.attractor_manager.list_basin_snapshots().await;
+    let basin_links: Vec<BasinLink> = if basin_snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let session_id_set: std::collections::HashSet<&String> = active_ids.iter().collect();
+        let metadata = services.fragment_metadata.read().await;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+
+        let mut links: Vec<BasinLink> = Vec::new();
+        for snapshot in &basin_snapshots {
+            let overlap_count = snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| session_id_set.contains(id))
+                .count();
+            if overlap_count == 0 {
+                continue;
+            }
+
+            let heat_24h = snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| {
+                    metadata
+                        .get(*id)
+                        .and_then(|m| m.get("ts"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                        .unwrap_or(false)
+                })
+                .count();
+
+            let mut kind_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for id in snapshot
+                .fragment_ids
+                .iter()
+                .filter(|id| session_id_set.contains(id))
+            {
+                if let Some(rec) = records.iter().find(|r| &r.id == id) {
+                    *kind_counts.entry(rec.kind.clone()).or_insert(0) += 1;
+                }
+            }
+            let hottest_kind = kind_counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(k, _)| k);
+
+            links.push(BasinLink {
+                basin_id: snapshot.id.clone(),
+                members_in_session: overlap_count,
+                total_members: snapshot.fragment_ids.len(),
+                heat_24h,
+                hottest_kind,
+            });
+        }
+        drop(metadata);
+        links.sort_by(|a, b| {
+            b.members_in_session
+                .cmp(&a.members_in_session)
+                .then_with(|| b.heat_24h.cmp(&a.heat_24h))
+        });
+        links
+    };
+
+    // Resonance — basins connected to ours via the learned-graph that
+    // are NOT ours, ranked by mean edge weight × distinct foreign
+    // sessions. The fragment→basin and fragment→session reverse maps
+    // are built once; the loop is O(active_ids × avg_neighbors).
+    let resonant_basins: Vec<ResonantBasin> = if basin_links.is_empty() {
+        Vec::new()
+    } else {
+        let mut fragment_to_basin: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(
+                basin_snapshots.iter().map(|s| s.fragment_ids.len()).sum(),
+            );
+        for snapshot in &basin_snapshots {
+            for fid in &snapshot.fragment_ids {
+                fragment_to_basin.insert(fid.clone(), snapshot.id.clone());
+            }
+        }
+        let fragment_to_session = services.session_index.active_fragments_session_map().await;
+        let own_basin_ids: std::collections::HashSet<&String> =
+            basin_links.iter().map(|b| &b.basin_id).collect();
+        let own_fragment_ids: std::collections::HashSet<&String> = active_ids.iter().collect();
+
+        struct ResonanceAccum {
+            total_weight: f32,
+            edge_count: usize,
+            sessions: std::collections::HashSet<String>,
+        }
+        let mut by_basin: std::collections::HashMap<String, ResonanceAccum> =
+            std::collections::HashMap::new();
+
+        for fid in active_ids.iter() {
+            let neighbors = services.attractor_manager.list_neighbors(fid).await;
+            for (neighbor_id, weight) in neighbors {
+                if own_fragment_ids.contains(&neighbor_id) {
+                    continue;
+                }
+                let Some(neighbor_basin) = fragment_to_basin.get(&neighbor_id) else {
+                    continue;
+                };
+                if own_basin_ids.contains(neighbor_basin) {
+                    continue;
+                }
+                let entry =
+                    by_basin
+                        .entry(neighbor_basin.clone())
+                        .or_insert_with(|| ResonanceAccum {
+                            total_weight: 0.0,
+                            edge_count: 0,
+                            sessions: std::collections::HashSet::new(),
+                        });
+                entry.total_weight += weight;
+                entry.edge_count += 1;
+                if let Some(session) = fragment_to_session.get(&neighbor_id) {
+                    entry.sessions.insert(session.clone());
+                }
+            }
+        }
+
+        let mut basins: Vec<ResonantBasin> = by_basin
+            .into_iter()
+            .map(|(basin_id, accum)| ResonantBasin {
+                basin_id,
+                edge_count: accum.edge_count,
+                coherence: if accum.edge_count > 0 {
+                    accum.total_weight / accum.edge_count as f32
+                } else {
+                    0.0
+                },
+                sessions_touching: accum.sessions.len(),
+            })
+            .collect();
+        basins.sort_by(|a, b| {
+            let a_score = a.coherence * a.sessions_touching.max(1) as f32;
+            let b_score = b.coherence * b.sessions_touching.max(1) as f32;
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.edge_count.cmp(&a.edge_count))
+        });
+        basins.truncate(5);
+        basins
+    };
+
     phases.sort_by(|a, b| {
         a.start_ts
             .as_deref()
@@ -1360,6 +1573,56 @@ pub async fn session_trajectory(
         .cloned()
         .collect();
 
+    // Cluster the flat promotion queue by basin so the dashboard can
+    // surface "earned promotion" (multiple candidates resonating into one
+    // basin) vs. one-off candidates. Rebuilds fragment_to_basin from
+    // basin_snapshots — small dup with the resonance block, accepted for
+    // commit atomicity; a follow-up refactor can hoist it once.
+    let promotion_clusters: Vec<PromotionCluster> =
+        if promotion_queue.is_empty() || basin_snapshots.is_empty() {
+            Vec::new()
+        } else {
+            let mut fragment_to_basin: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::with_capacity(
+                    basin_snapshots.iter().map(|s| s.fragment_ids.len()).sum(),
+                );
+            for snapshot in &basin_snapshots {
+                for fid in &snapshot.fragment_ids {
+                    fragment_to_basin.insert(fid.as_str(), snapshot.id.as_str());
+                }
+            }
+
+            let mut by_basin: std::collections::HashMap<String, Vec<TrajectoryRecord>> =
+                std::collections::HashMap::new();
+            for rec in &promotion_queue {
+                if let Some(basin_id) = fragment_to_basin.get(rec.id.as_str()) {
+                    by_basin
+                        .entry((*basin_id).to_string())
+                        .or_default()
+                        .push(rec.clone());
+                }
+            }
+
+            let clustered_total: usize = by_basin.values().map(|v| v.len()).sum();
+            let mut clusters: Vec<PromotionCluster> = by_basin
+                .into_iter()
+                .map(|(basin_id, candidates)| {
+                    let coherence = if clustered_total > 0 {
+                        candidates.len() as f32 / clustered_total as f32
+                    } else {
+                        0.0
+                    };
+                    PromotionCluster {
+                        basin_id,
+                        candidates,
+                        coherence,
+                    }
+                })
+                .collect();
+            clusters.sort_by(|a, b| b.candidates.len().cmp(&a.candidates.len()));
+            clusters
+        };
+
     let prompt_directives = records
         .iter()
         .filter(|r| r.kind == "prompt_directive")
@@ -1387,6 +1650,9 @@ pub async fn session_trajectory(
             memory_candidates,
             risk_flags,
         },
+        basin_links,
+        resonant_basins,
+        promotion_clusters,
     }))
 }
 

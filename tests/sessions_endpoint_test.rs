@@ -660,6 +660,302 @@ async fn trajectory_endpoint_groups_records_phases_and_promotion_queue() {
     assert_eq!(body["cost_profile"]["trajectory_records"].as_u64(), Some(4));
     assert_eq!(body["cost_profile"]["prompt_directives"].as_u64(), Some(1));
     assert_eq!(body["cost_profile"]["memory_candidates"].as_u64(), Some(1));
+
+    // `basin_links` must be present as an array — the field shape is a
+    // hard contract for the dashboard's basin badge. Content correctness
+    // (member counts, heat, hottest kind) is asserted in the dedicated
+    // test that explicitly drains the consolidation queue; the mock-mode
+    // test substrate populates basins inline so we can't reliably assert
+    // emptiness here without coupling to that mock-only behaviour.
+    assert!(
+        body["basin_links"].is_array(),
+        "basin_links must be present as an array, got: {:?}",
+        body["basin_links"]
+    );
+}
+
+/// `basin_links` populates with substrate geometry once the consolidation
+/// worker crystallises basins for the session's fragments. The test forces
+/// consolidation via `drain_for_test` so we can assert the populated shape
+/// rather than only the cold-substrate empty case.
+#[tokio::test]
+async fn trajectory_endpoint_exposes_basin_links_post_consolidation() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+    let sid = "cc-basin-links";
+
+    // Three semantically similar fragments under one session. With the
+    // canonical pipeline draining synchronously they should land in the
+    // same basin (or at most a handful of basins) — enough to populate
+    // basin_links.
+    for (i, ts) in [
+        "2026-05-27T09:00:00Z",
+        "2026-05-27T09:05:00Z",
+        "2026-05-27T09:10:00Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        store(
+            &server,
+            sid,
+            &format!("trajectory verification probe #{i}"),
+            json!({
+                "kind": "verification",
+                "src_session": sid,
+                "ts": ts,
+                "status": "passed",
+            }),
+        )
+        .await;
+    }
+
+    drain_for_test(&services, &services.consolidation_queue, 3).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let basin_links = body["basin_links"].as_array().expect("basin_links present");
+    assert!(
+        !basin_links.is_empty(),
+        "expected at least one basin_link after draining consolidation queue"
+    );
+
+    let total_members_in_session: u64 = basin_links
+        .iter()
+        .map(|l| l["members_in_session"].as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        total_members_in_session >= 3,
+        "expected basin coverage of all 3 stored fragments, got {total_members_in_session}"
+    );
+
+    let first = &basin_links[0];
+    assert!(first["basin_id"].is_string(), "basin_id must be a string");
+    assert!(
+        first["total_members"].as_u64().unwrap_or(0) >= 1,
+        "total_members must be at least 1 when a basin overlaps the session"
+    );
+    assert_eq!(
+        first["hottest_kind"].as_str(),
+        Some("verification"),
+        "all stored fragments were verification kind"
+    );
+
+    // resonant_basins must be present as an array. With only one session's
+    // fragments stored, there are no foreign basins to resonate with —
+    // expected empty. Content correctness with cross-session resonance is
+    // tested in `trajectory_endpoint_exposes_resonant_basins_across_sessions`.
+    assert!(
+        body["resonant_basins"].is_array(),
+        "resonant_basins must be present as an array, got: {:?}",
+        body["resonant_basins"]
+    );
+
+    // promotion_clusters present as array (structural contract). Content
+    // (clusters of memory_candidate/prompt_directive/risk_flag candidates
+    // grouped by basin) is asserted in
+    // `trajectory_endpoint_promotion_clusters_group_candidates_by_basin`.
+    assert!(
+        body["promotion_clusters"].is_array(),
+        "promotion_clusters must be present as an array, got: {:?}",
+        body["promotion_clusters"]
+    );
+}
+
+/// `promotion_clusters` groups the flat promotion queue by basin. With
+/// the consolidation worker drained and singleton-mode forced (so each
+/// candidate lands in its own basin), every cluster has one candidate
+/// and the count of clusters equals the count of distinct promotion
+/// records.
+#[tokio::test]
+async fn trajectory_endpoint_promotion_clusters_group_candidates_by_basin() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+
+    // Force singleton mode so each promotion candidate has its own basin
+    // and the clustering output is deterministic — three promotion-kind
+    // fragments must produce three single-candidate clusters.
+    std::env::set_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD", "0.0");
+
+    let sid = "cc-promo-clusters";
+    store(
+        &server,
+        sid,
+        "Goal phase for cluster test",
+        json!({
+            "kind": "goal_phase",
+            "src_session": sid,
+            "ts": "2026-05-28T09:00:00Z",
+            "start_ts": "2026-05-28T09:00:00Z",
+        }),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Promote sparse emission rule",
+        json!({"kind": "memory_candidate", "src_session": sid, "ts": "2026-05-28T09:05:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Inject WAL-safety directive on schema migration",
+        json!({"kind": "prompt_directive", "src_session": sid, "ts": "2026-05-28T09:10:00Z"}),
+    )
+    .await;
+    store(
+        &server,
+        sid,
+        "Live WAL migration can lose data",
+        json!({"kind": "risk_flag", "src_session": sid, "ts": "2026-05-28T09:15:00Z"}),
+    )
+    .await;
+
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{sid}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let promotion_queue = body["promotion_queue"]
+        .as_array()
+        .expect("promotion_queue present");
+    assert_eq!(
+        promotion_queue.len(),
+        3,
+        "expected 3 promotion-kind records (memory_candidate, prompt_directive, risk_flag)"
+    );
+
+    let clusters = body["promotion_clusters"]
+        .as_array()
+        .expect("promotion_clusters present");
+    let total_in_clusters: usize = clusters
+        .iter()
+        .map(|c| c["candidates"].as_array().map(|a| a.len()).unwrap_or(0))
+        .sum();
+    assert_eq!(
+        total_in_clusters, 3,
+        "every promotion candidate must end up in exactly one cluster; got {total_in_clusters} across {} clusters",
+        clusters.len()
+    );
+
+    // Coherence sums to 1.0 (within float epsilon) when every candidate
+    // has a basin assignment — each share is fraction-of-clustered.
+    let coherence_sum: f32 = clusters
+        .iter()
+        .map(|c| c["coherence"].as_f64().unwrap_or(0.0) as f32)
+        .sum();
+    assert!(
+        (coherence_sum - 1.0).abs() < 1e-3,
+        "coherence shares should sum to ~1.0, got {coherence_sum}"
+    );
+
+    std::env::remove_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD");
+}
+
+/// `resonant_basins` populates when a session's fragments share connection
+/// graph edges with fragments owned by OTHER sessions. The neighbor's basin
+/// must be different from the session's own basins (no self-resonance), and
+/// `sessions_touching` counts distinct foreign session ids.
+#[tokio::test]
+async fn trajectory_endpoint_exposes_resonant_basins_across_sessions() {
+    use contextnest::services::consolidation::drain_for_test;
+
+    let services = ContextNestServices::new_default()
+        .await
+        .expect("default services should init in mock mode");
+    let app = contextnest::api::create_simple_app(services.clone())
+        .await
+        .expect("app should build");
+    let server = TestServer::new(app).expect("test server should start");
+
+    // Force singleton-per-fragment so we can construct deterministic
+    // cross-session connection edges via the connection_network's
+    // auto-linking on add_node. (With basin clustering enabled, the
+    // mock embedder may merge near-duplicates and obscure the test signal.)
+    std::env::set_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD", "0.0");
+
+    let session_a = "cc-resonance-a";
+    let session_b = "cc-resonance-b";
+    let session_c = "cc-resonance-c";
+
+    // Three sessions storing slight variations on the same theme — the
+    // mock embedder's deterministic + similarity-aware auto-linking in
+    // ConnectionNetwork::add_node ties them via edges even when basins
+    // don't merge.
+    for sid in [session_a, session_b, session_c] {
+        store(
+            &server,
+            sid,
+            &format!("trajectory verification probe {sid}"),
+            json!({
+                "kind": "verification",
+                "src_session": sid,
+                "ts": "2026-05-28T09:00:00Z",
+                "status": "passed",
+            }),
+        )
+        .await;
+    }
+    drain_for_test(&services, &services.consolidation_queue, 3).await;
+
+    let res = server
+        .get(&format!("/api/v1/sessions/{session_a}/trajectory"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let resonant = body["resonant_basins"]
+        .as_array()
+        .expect("resonant_basins present");
+
+    // Contract: each entry must have basin_id (string), coherence (number),
+    // sessions_touching (number), edge_count (number). And resonant basins
+    // must not appear in basin_links (no self-resonance).
+    let own_basins: std::collections::HashSet<String> = body["basin_links"]
+        .as_array()
+        .expect("basin_links present")
+        .iter()
+        .filter_map(|b| b["basin_id"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    for entry in resonant {
+        assert!(entry["basin_id"].is_string(), "basin_id must be string");
+        assert!(entry["coherence"].is_number(), "coherence must be number");
+        assert!(
+            entry["sessions_touching"].is_number(),
+            "sessions_touching must be number"
+        );
+        assert!(entry["edge_count"].is_number(), "edge_count must be number");
+        let bid = entry["basin_id"].as_str().unwrap();
+        assert!(
+            !own_basins.contains(bid),
+            "resonant basin {bid} must not also be in basin_links (no self-resonance)"
+        );
+    }
+
+    std::env::remove_var("CONTEXTNEST_BASIN_ATTACH_THRESHOLD");
 }
 
 /// Prompt preview is a deterministic, no-LLM capsule preview over the
