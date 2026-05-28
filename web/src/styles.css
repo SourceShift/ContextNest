@@ -1626,6 +1626,117 @@ body {
   margin-top: 12px;
 }
 
+/* ----------------------------------------------------------------------
+ * Substrate-aware trajectory card surfaces
+ * (basin badge, resonance strip, promotion clusters)
+ * ---------------------------------------------------------------------- */
+
+.basin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  color: var(--ink-muted);
+  cursor: help;
+  white-space: nowrap;
+  transition: background-color 120ms ease;
+}
+.basin-badge:hover {
+  background: var(--surface-2);
+}
+.basin-badge.hot {
+  border-color: var(--urg-soon, #d97706);
+  color: var(--ink);
+}
+.basin-glyph {
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 1;
+}
+.basin-mass {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+}
+.basin-heat {
+  font-size: 10px;
+  color: var(--urg-soon, #d97706);
+}
+.basin-more {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  padding-left: 2px;
+  border-left: 1px solid var(--border);
+}
+
+.trajectory-resonance-strip,
+.trajectory-promotion-clusters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.resonance-label,
+.promotion-label {
+  font-size: 10px;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-right: 2px;
+}
+
+.resonance-chip,
+.promotion-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  color: var(--ink-muted);
+  cursor: help;
+}
+
+.resonance-coherence,
+.cluster-coherence {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+}
+.resonance-sessions,
+.cluster-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink);
+  background: var(--surface-2);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.promotion-cluster.coherent {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+.promotion-cluster.coherent .cluster-coherence {
+  color: var(--accent);
+}
+
+.promotion-more {
+  font-size: 10px;
+  padding-left: 4px;
+}
+
 .todo-status {
   display: inline-block;
   padding: 1px 6px;

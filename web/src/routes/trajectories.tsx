@@ -445,8 +445,16 @@ function Metric({ label, value, warn }: { label: string; value: number; warn?: b
   );
 }
 
+function shortBasinId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 6)}…${id.slice(-3)}` : id;
+}
+
 function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
   const counts = row.trajectory.cost_profile;
+  const basinLinks = row.trajectory.basin_links ?? [];
+  const resonantBasins = row.trajectory.resonant_basins ?? [];
+  const promotionClusters = row.trajectory.promotion_clusters ?? [];
+  const primaryBasin = basinLinks[0];
   const topKinds = Object.entries(row.session.by_kind)
     .filter(([kind]) =>
       [
@@ -469,6 +477,28 @@ function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
           <div className="trajectory-session-title">
             <SessionPill id={row.session.id} />
             <ProjBadge p={row.project} />
+            {primaryBasin && (
+              <span
+                className={`basin-badge${primaryBasin.heat_24h > 0 ? ' hot' : ''}`}
+                title={`Basin ${primaryBasin.basin_id}\n${primaryBasin.members_in_session}/${primaryBasin.total_members} fragments from this session\n${primaryBasin.heat_24h} fragments written in last 24h${
+                  primaryBasin.hottest_kind ? `\nhottest kind: ${primaryBasin.hottest_kind}` : ''
+                }${basinLinks.length > 1 ? `\n+${basinLinks.length - 1} more basin${basinLinks.length === 2 ? '' : 's'}` : ''}`}
+              >
+                <span className="basin-glyph">●</span>
+                <span className="mono">{shortBasinId(primaryBasin.basin_id)}</span>
+                <span className="basin-mass">
+                  {primaryBasin.members_in_session}/{primaryBasin.total_members}
+                </span>
+                {primaryBasin.heat_24h > 0 && (
+                  <span className="basin-heat" title={`${primaryBasin.heat_24h} writes in 24h`}>
+                    🔥{primaryBasin.heat_24h}
+                  </span>
+                )}
+                {basinLinks.length > 1 && (
+                  <span className="basin-more">+{basinLinks.length - 1}</span>
+                )}
+              </span>
+            )}
             <span className="mono dim">
               {row.session.last_ts ? agoFrom(row.session.last_ts) : '—'}
             </span>
@@ -507,6 +537,49 @@ function TrajectorySessionCard({ row }: { row: TrajectorySession }) {
               {kind.replace('_', ' ')} · {count}
             </span>
           ))}
+        </div>
+      )}
+
+      {resonantBasins.length > 0 && (
+        <div
+          className="trajectory-resonance-strip"
+          title="Basins connected to this session's basins via the learned graph. Hover for details."
+        >
+          <span className="resonance-label mono">resonates with</span>
+          {resonantBasins.slice(0, 3).map((rb) => (
+            <span
+              key={rb.basin_id}
+              className="resonance-chip"
+              title={`Basin ${rb.basin_id}\ncoherence ${rb.coherence.toFixed(2)} · ${rb.sessions_touching} session${rb.sessions_touching === 1 ? '' : 's'} · ${rb.edge_count} edge${rb.edge_count === 1 ? '' : 's'}`}
+            >
+              <span className="mono">{shortBasinId(rb.basin_id)}</span>
+              <span className="resonance-coherence">{rb.coherence.toFixed(2)}</span>
+              <span className="resonance-sessions">×{rb.sessions_touching}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {promotionClusters.length > 0 && (
+        <div
+          className="trajectory-promotion-clusters"
+          title="Promotion candidates grouped by basin. Coherent clusters (1 basin / many candidates) signal earned promotion."
+        >
+          <span className="promotion-label mono">promo clusters</span>
+          {promotionClusters.slice(0, 3).map((pc) => (
+            <span
+              key={pc.basin_id}
+              className={`promotion-cluster${pc.coherence > 0.5 ? ' coherent' : ''}`}
+              title={`Basin ${pc.basin_id}\n${pc.candidates.length} candidate${pc.candidates.length === 1 ? '' : 's'} · coherence ${pc.coherence.toFixed(2)}`}
+            >
+              <span className="mono">{shortBasinId(pc.basin_id)}</span>
+              <span className="cluster-count">{pc.candidates.length}</span>
+              <span className="cluster-coherence">{(pc.coherence * 100).toFixed(0)}%</span>
+            </span>
+          ))}
+          {promotionClusters.length > 3 && (
+            <span className="promotion-more mono dim">+{promotionClusters.length - 3}</span>
+          )}
         </div>
       )}
     </div>
