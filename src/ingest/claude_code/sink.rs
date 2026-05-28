@@ -415,3 +415,70 @@ mod tests {
         assert_eq!(s.sent_count(), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// RedactingSink — composable wrapper that runs the redactor before storing
+// ---------------------------------------------------------------------------
+
+/// Wraps any [`Sink`] with a [`crate::ingest::claude_code::redactor::Redactor`]
+/// pass that scrubs sensitive data from `record.text` before delegating to
+/// the inner sink. Memories that come back >75% redacted are dropped with a
+/// `warn!` log rather than stored as gibberish.
+///
+/// Why a wrapper instead of a per-sink concern: both `HttpSink` (CLI batch
+/// ingest) and `ServicesSink` (live cc-hooks) want the same redaction
+/// policy, and the redactor is stateless. Composing it once means the
+/// underlying sinks stay focused on their transport, and operators can
+/// opt out by skipping the wrap.
+pub struct RedactingSink<S: Sink> {
+    inner: S,
+    redactor: crate::ingest::claude_code::redactor::Redactor,
+    /// Count of records dropped because the redacted text was <25% of
+    /// the original — exposed via [`Self::skipped_count`] for the CLI
+    /// summary so operators can see the privacy filter at work.
+    skipped: AtomicUsize,
+}
+
+impl<S: Sink> RedactingSink<S> {
+    pub fn new(inner: S, redactor: crate::ingest::claude_code::redactor::Redactor) -> Self {
+        Self {
+            inner,
+            redactor,
+            skipped: AtomicUsize::new(0),
+        }
+    }
+
+    /// Count of records dropped because they were mostly redacted.
+    /// Monotonic since construction.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl<S: Sink> Sink for RedactingSink<S> {
+    async fn store(&self, record: &MemoryRecord) -> ContextNestResult<()> {
+        let result = self.redactor.redact(&record.text);
+        if result.mostly_redacted() {
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind = record.kind.as_str(),
+                session = %record.session_id_cn,
+                original_len = result.original_len,
+                redacted_len = result.redacted_len,
+                "skipping memory: >75% redacted, no signal left"
+            );
+            return Ok(());
+        }
+        if result.num_redactions == 0 {
+            return self.inner.store(record).await;
+        }
+        let mut record = record.clone();
+        record.text = result.text;
+        record.metadata.insert(
+            "redaction_count".to_string(),
+            serde_json::Value::Number(result.num_redactions.into()),
+        );
+        self.inner.store(&record).await
+    }
+}

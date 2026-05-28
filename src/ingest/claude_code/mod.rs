@@ -22,6 +22,7 @@
 
 pub mod event;
 pub mod extractor;
+pub mod redactor;
 pub mod sink;
 
 use crate::error::{ContextNestError, ContextNestResult};
@@ -94,6 +95,19 @@ pub fn discover_sessions(
             }
         }
 
+        // Per-project opt-out: a `.cn-ignore` file at the root of the
+        // project's Claude Code session directory skips the entire
+        // project — no memories from any session in it are stored.
+        // Nuclear option for sensitive projects; the redactor is the
+        // surgical default.
+        if path.join(".cn-ignore").exists() {
+            tracing::warn!(
+                project_cwd = %project_cwd,
+                "skipping project — .cn-ignore present"
+            );
+            continue;
+        }
+
         let session_entries = match std::fs::read_dir(&path) {
             Ok(e) => e,
             Err(_) => continue,
@@ -149,10 +163,31 @@ pub fn discover_sessions(
 
 /// Read one `.jsonl`, extract memories, push them via the given sink.
 ///
+/// Equivalent to [`ingest_session_file_with_embedder`] with no embedder —
+/// goal_phase clustering falls back to token-overlap, which is the
+/// existing Phase 1 behaviour.
+///
 /// Returns a [`SinkReport`] with success/fail counts + a per-kind tally.
 pub async fn ingest_session_file<S: Sink + ?Sized>(
     session: &DiscoveredSession,
     sink: &S,
+) -> ContextNestResult<SinkReport> {
+    ingest_session_file_with_embedder(session, sink, None).await
+}
+
+/// Like [`ingest_session_file`], but optionally refines goal_phase
+/// clustering using embedding cosine similarity (Phase 2 of the
+/// E-embedding-clustering epic). When `embedder` is `None`, the
+/// extractor's built-in token-overlap clustering is the final answer.
+///
+/// Refinement is a post-processing pass over the extractor's output —
+/// it never drops records and falls back to "no merge" on any per-text
+/// embedding failure. Cost per session: ~30 embeddings × $0.00002 each
+/// at OpenAI prices = $0.0006/session. Negligible.
+pub async fn ingest_session_file_with_embedder<S: Sink + ?Sized>(
+    session: &DiscoveredSession,
+    sink: &S,
+    embedder: Option<&crate::services::embedding::EmbeddingService>,
 ) -> ContextNestResult<SinkReport> {
     let (events, metadata) = parse_session_file(&session.jsonl_path)?;
 
@@ -167,7 +202,10 @@ pub async fn ingest_session_file<S: Sink + ?Sized>(
         metadata.cwd.as_deref().unwrap_or("")
     };
 
-    let records = extract_memories(&events, session_uuid, project_cwd);
+    let mut records = extract_memories(&events, session_uuid, project_cwd);
+    if let Some(emb) = embedder {
+        records = extractor::refine_goal_phases_by_embedding(records, emb).await?;
+    }
     sink.store_batch(&records).await
 }
 
