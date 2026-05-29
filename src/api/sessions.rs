@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::services::ContextNestServices;
 
-const TRAJECTORY_KINDS: &[&str] = &[
+pub(crate) const TRAJECTORY_KINDS: &[&str] = &[
     "read_context",
     "verification",
     "evidence_ref",
@@ -491,7 +491,7 @@ pub struct FeaturesResponse {
 /// Parse a duration suffix (`5m`, `2h`, `24h`, `7d`, `30d`) into a
 /// chrono::Duration. Returns `None` on parse failure so the caller
 /// falls back to its default.
-fn parse_since(s: &str) -> Option<chrono::Duration> {
+pub(crate) fn parse_since(s: &str) -> Option<chrono::Duration> {
     let s = s.trim();
     if s.len() < 2 {
         return None;

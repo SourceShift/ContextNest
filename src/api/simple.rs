@@ -8,6 +8,7 @@ use tracing::info;
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::field;
 use crate::api::inbox;
+use crate::api::prompt_context;
 use crate::api::services::ServiceContainer;
 use crate::api::sessions;
 use crate::api::stats;
@@ -36,6 +37,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     let stats_router = stats::create_stats_router();
     let substrate_router = substrate::create_substrate_router();
     let field_router = field::create_field_router();
+    let prompt_context_router = prompt_context::create_prompt_context_router();
     let session_tracker = Arc::new(SessionTracker::new());
 
     // Defence-in-depth sweeper: re-tail every tracked session's
@@ -60,6 +62,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .merge(stats_router)
         .merge(substrate_router)
         .merge(field_router)
+        .merge(prompt_context_router)
         .layer(Extension(session_tracker))
         .with_state(services);
 
