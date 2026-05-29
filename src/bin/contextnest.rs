@@ -9,7 +9,7 @@
 
 use clap::Parser;
 use contextnest::api::create_app;
-use contextnest::cli::{Cli, Commands, IngestSource};
+use contextnest::cli::{Cli, Commands, IngestSource, McpCommands};
 use contextnest::config::Config;
 use contextnest::inbox::{render_json, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
@@ -28,7 +28,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    // `mcp serve` owns stdout as the JSON-RPC channel — logs MUST go to
+    // stderr or they corrupt the protocol stream the host agent reads.
+    let mcp_mode = matches!(cli.command, Commands::Mcp { .. });
+    init_logging(cli.verbose, mcp_mode);
     if let Err(e) = run_command(cli).await {
         eprintln!("Error: {}", e);
         process::exit(1);
@@ -46,6 +49,21 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             json,
         } => inbox(project, urgency, substrate, session_id, json).await,
+        Commands::Mcp { action } => mcp(action).await,
+    }
+}
+
+/// Dispatch the `mcp` subcommand. Resolves the substrate base URL from the
+/// `--url` flag, then `$CONTEXTNEST_URL`, then the localhost default, and
+/// runs the stdio server until the host agent closes stdin.
+async fn mcp(action: McpCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        McpCommands::Serve { url } => {
+            let base = url
+                .or_else(|| std::env::var("CONTEXTNEST_URL").ok())
+                .unwrap_or_else(|| "http://localhost:8080".to_string());
+            contextnest::mcp::McpServer::new(base).serve_stdio().await
+        }
     }
 }
 
@@ -856,20 +874,33 @@ mod render_hook_command_tests {
     }
 }
 
-fn init_logging(verbose: bool) {
+fn init_logging(verbose: bool, log_to_stderr: bool) {
     let default_filter = if verbose {
         "contextnest=debug,tower_http=debug"
     } else {
         "contextnest=info,tower_http=info"
     };
 
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .with(tracing_subscriber::fmt::layer().with_target(false))
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+
+    // In MCP stdio mode stdout is reserved for the JSON-RPC stream, so the
+    // fmt layer must write to stderr; otherwise keep the default stdout.
+    if log_to_stderr {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_writer(std::io::stderr),
+            )
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .try_init();
+    }
 }
 
 /// Resolve the WAL path from `CONTEXTNEST_WAL_PATH` or the default
