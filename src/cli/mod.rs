@@ -80,6 +80,36 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Run the Model Context Protocol server so MCP-speaking agents
+    /// (Claude Code, Cursor, Zed, ...) can call ContextNest's memory
+    /// tools natively instead of shelling out to `curl`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCommands,
+    },
+}
+
+/// MCP server modes. v0.x ships only the stdio transport (the standard
+/// MCP subprocess transport invoked by the host agent).
+#[derive(Subcommand)]
+pub enum McpCommands {
+    /// Serve MCP tools over stdio. The host agent spawns this as a
+    /// subprocess and speaks newline-delimited JSON-RPC 2.0 over
+    /// stdin/stdout.
+    ///
+    /// Example `~/.claude/settings.json` `mcpServers` entry:
+    ///   "contextnest": {
+    ///     "command": "contextnest",
+    ///     "args": ["mcp", "serve"],
+    ///     "env": { "CONTEXTNEST_URL": "http://localhost:28080" }
+    ///   }
+    Serve {
+        /// Substrate base URL. Falls back to `$CONTEXTNEST_URL`, then
+        /// `http://localhost:8080`.
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 /// Sources the ingester can pull from. v0.2 phase 1 ships only the Claude

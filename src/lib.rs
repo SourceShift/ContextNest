@@ -31,6 +31,7 @@ pub mod domains;
 pub mod error;
 pub mod inbox; // Cross-session attention surface — what the user is waiting on.
 pub mod ingest; // Adapters that pull external session data (Claude Code, ...) into the substrate.
+pub mod mcp; // Model Context Protocol server (stdio) wrapping the memory tools.
 pub mod memory; // Canonical attractor-based memory sub-engines.
 pub mod models;
 pub mod patterns;
