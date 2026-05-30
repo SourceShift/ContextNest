@@ -199,13 +199,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_phase1_and_phase2_tools() {
+    async fn tools_list_returns_all_phase_tools() {
         let resp = server()
             .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .await
             .expect("respond");
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 9, "3 Phase-1 + 6 Phase-2 = 9 tools");
+        assert_eq!(tools, 12, "3 Phase-1 + 6 Phase-2 + 3 Phase-3 = 12 tools");
     }
 
     #[tokio::test]

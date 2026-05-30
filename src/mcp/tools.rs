@@ -9,6 +9,12 @@
 //! so an MCP-speaking agent can ask "what's open / what shipped / which
 //! trajectory atoms exist?" natively, without shelling out to `curl`.
 //!
+//! Phase 3 (search + drill-in): `cn_attention`, `cn_session_get`,
+//! `cn_session_find` close the spec's tool list now that the underlying
+//! HTTP endpoints exist (PRs #75 + #76). Together they answer "what
+//! sessions need attention right now / give me one session's full
+//! record / find me the session where I worked on X".
+//!
 //! Each handler validates required arguments locally (returning a JSON-RPC
 //! `INVALID_PARAMS` error before any network call), forwards the rest
 //! verbatim, and pretty-prints the substrate's JSON response as MCP text
@@ -44,6 +50,10 @@ pub fn list_tools() -> Value {
             inbox_def(),
             features_def(),
             prompt_context_atoms_def(),
+            // Phase 3 — attention + drill-in + search.
+            attention_def(),
+            session_get_def(),
+            session_find_def(),
         ]
     })
 }
@@ -191,6 +201,61 @@ fn prompt_context_atoms_def() -> Value {
     })
 }
 
+fn attention_def() -> Value {
+    json!({
+        "name": "cn_attention",
+        "description": "Return sessions that need user attention RIGHT NOW — sessions \
+    carrying open todos, user_action items, or decisions awaiting input — ranked by \
+    recency of their attention-eligible work. Per-session preview shows up to 5 items. \
+    Use this as the first call of a session: 'what's blocked across all my projects?'",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "since": { "type": "string", "description": "Age window (default 30d)." },
+                "limit": { "type": "integer", "description": "Max sessions returned (default 20, cap 200)." }
+            }
+        }
+    })
+}
+
+fn session_get_def() -> Value {
+    json!({
+        "name": "cn_session_get",
+        "description": "Return one session's full grouped detail — every fragment the \
+    session produced, grouped by kind in actionable-first order (user_action → todo → \
+    decision → trajectory atoms → narrative). Use after `cn_attention` or \
+    `cn_session_find` surfaces a candidate session you want to inspect end to end.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID (src_session)." }
+            },
+            "required": ["session_id"]
+        }
+    })
+}
+
+fn session_find_def() -> Value {
+    json!({
+        "name": "cn_session_find",
+        "description": "Natural-language session search. Embeds the query, cosine-scores \
+    every session's goal_phase + session_title fragments (the kinds that name a session's \
+    intent), returns the top sessions ranked by max similarity. Use when you remember \
+    WHAT you worked on but not WHEN.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural-language query (required)." },
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "since": { "type": "string", "description": "Age window (default 90d)." },
+                "limit": { "type": "integer", "description": "Max sessions returned (default 10, cap 50)." }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
 /// Dispatch a `tools/call` to the matching handler.
 pub async fn call_tool(
     http: &Client,
@@ -210,6 +275,10 @@ pub async fn call_tool(
         "cn_inbox" => call_inbox(http, base_url).await,
         "cn_features" => call_features(http, base_url, args).await,
         "cn_prompt_context_atoms" => call_prompt_context_atoms(http, base_url, args).await,
+        // Phase 3.
+        "cn_attention" => call_attention(http, base_url, args).await,
+        "cn_session_get" => call_session_get(http, base_url, args).await,
+        "cn_session_find" => call_session_find(http, base_url, args).await,
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
 }
@@ -275,6 +344,24 @@ async fn call_prompt_context_atoms(
 ) -> Result<String, ToolError> {
     let q = collect_query(&args, &["kind", "project", "session_id", "since", "limit"]);
     get(http, base, "/api/v1/prompt-context/atoms", &q).await
+}
+
+async fn call_attention(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    let q = collect_query(&args, &["project", "since", "limit"]);
+    get(http, base, "/api/v1/sessions/attention", &q).await
+}
+
+async fn call_session_get(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    let session_id = require_str(&args, "session_id", "cn_session_get")?;
+    let path = format!("/api/v1/sessions/{}", urlencode(&session_id));
+    get(http, base, &path, &[]).await
+}
+
+async fn call_session_find(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    let query = require_str(&args, "query", "cn_session_find")?;
+    let mut body = json!({ "query": query });
+    forward(&mut body, &args, &["project", "since", "limit"]);
+    post(http, base, "/api/v1/sessions/find", body).await
 }
 
 /// Encode a path segment so a stray `/` or `?` in a `session_id` can't
@@ -386,10 +473,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_tools_advertises_all_phase1_and_phase2_tools() {
+    fn list_tools_advertises_all_phase_tools() {
         let listed = list_tools();
         let tools = listed["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 9, "3 Phase-1 + 6 Phase-2 = 9 tools");
+        assert_eq!(
+            tools.len(),
+            12,
+            "3 Phase-1 + 6 Phase-2 + 3 Phase-3 = 12 tools"
+        );
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         for expected in [
             "cn_store",
@@ -401,6 +492,9 @@ mod tests {
             "cn_inbox",
             "cn_features",
             "cn_prompt_context_atoms",
+            "cn_attention",
+            "cn_session_get",
+            "cn_session_find",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -545,6 +639,40 @@ mod tests {
         )
         .await
         .expect_err("network must fail at 127.0.0.1:1");
+        assert!(matches!(err, ToolError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn session_get_without_session_id_is_bad_arguments() {
+        let http = Client::new();
+        let err = call_tool(&http, "http://127.0.0.1:1", "cn_session_get", json!({}))
+            .await
+            .expect_err("missing session_id must fail before any network call");
+        assert!(matches!(err, ToolError::BadArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn session_find_without_query_is_bad_arguments() {
+        let http = Client::new();
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_session_find",
+            json!({ "limit": 5 }),
+        )
+        .await
+        .expect_err("missing query must fail before any network call");
+        assert!(matches!(err, ToolError::BadArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn attention_takes_only_optional_args() {
+        // No required args; with no args it dispatches and only fails at the
+        // network step, proving the no-required path is wired.
+        let http = Client::new();
+        let err = call_tool(&http, "http://127.0.0.1:1", "cn_attention", json!({}))
+            .await
+            .expect_err("network must fail at 127.0.0.1:1");
         assert!(matches!(err, ToolError::Upstream(_)));
     }
 }
