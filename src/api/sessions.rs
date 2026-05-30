@@ -16,10 +16,11 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::api::inbox::is_inbox_eligible;
 use crate::services::ContextNestServices;
 
 pub(crate) const TRAJECTORY_KINDS: &[&str] = &[
@@ -1826,11 +1827,356 @@ fn push_limited<T>(items: &mut Vec<T>, item: T, limit: usize) {
     }
 }
 
+// =============================================================================
+// `GET /api/v1/sessions/attention`
+//
+// Cross-session attention queue grouped by session. Walks `fragment_metadata`,
+// keeps fragments where `is_inbox_eligible(meta)` (user_action, todo with
+// task_status != completed, decision with awaiting_decision == true), groups
+// by `src_session`, ranks sessions by max ts desc. Filterable by
+// `?project=<substring>&since=<duration>&limit=<n>`.
+//
+// Distinct from `/api/v1/inbox`: inbox returns a flat per-fragment list
+// across the substrate; this returns a per-session aggregate so a dashboard
+// can render "sessions with open work" without a second roll-up pass.
+// Eligibility is shared with the inbox via `is_inbox_eligible`, so the two
+// views never drift on what counts as attention.
+// =============================================================================
+
+const ATTENTION_DEFAULT_LIMIT: usize = 20;
+const ATTENTION_MAX_LIMIT: usize = 200;
+const ATTENTION_DEFAULT_SINCE: &str = "30d";
+const ATTENTION_ITEMS_PER_SESSION: usize = 5;
+
+#[derive(Debug, Deserialize)]
+pub struct AttentionQuery {
+    pub project: Option<String>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionItem {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub ts: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionSession {
+    pub session_id: String,
+    pub project_cwd: Option<String>,
+    pub last_ts: Option<String>,
+    pub attention_count: usize,
+    pub by_kind: std::collections::HashMap<String, usize>,
+    /// Newest-first; capped at `ATTENTION_ITEMS_PER_SESSION` so dashboards
+    /// get a representative preview without paying for the full list. Call
+    /// `GET /api/v1/sessions/:id` for the complete grouped view.
+    pub items: Vec<AttentionItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionResponse {
+    pub since: String,
+    pub project: Option<String>,
+    pub count: usize,
+    pub sessions: Vec<AttentionSession>,
+}
+
+pub async fn list_attention(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<AttentionQuery>,
+) -> Result<Json<AttentionResponse>, StatusCode> {
+    let since_raw = q.since.as_deref().unwrap_or(ATTENTION_DEFAULT_SINCE);
+    let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::days(30));
+    let cutoff = chrono::Utc::now() - dur;
+    let limit = q
+        .limit
+        .unwrap_or(ATTENTION_DEFAULT_LIMIT)
+        .min(ATTENTION_MAX_LIMIT);
+    let project = q.project.clone();
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    let mut by_session: std::collections::HashMap<String, AttentionSession> =
+        std::collections::HashMap::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        if !is_inbox_eligible(meta) {
+            continue;
+        }
+        let ts_str = meta.get("ts").and_then(|v| v.as_str());
+        if let Some(ts) = ts_str {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if parsed.with_timezone(&chrono::Utc) < cutoff {
+                    continue;
+                }
+            }
+        }
+        let session_id = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if session_id.is_empty() {
+            continue;
+        }
+        let project_cwd = meta
+            .get("project_cwd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(want) = project.as_deref() {
+            match project_cwd.as_deref() {
+                Some(p) if p.contains(want) => {}
+                _ => continue,
+            }
+        }
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let entry = by_session
+            .entry(session_id.clone())
+            .or_insert_with(|| AttentionSession {
+                session_id: session_id.clone(),
+                project_cwd: project_cwd.clone(),
+                last_ts: None,
+                attention_count: 0,
+                by_kind: std::collections::HashMap::new(),
+                items: Vec::new(),
+            });
+        entry.attention_count += 1;
+        *entry.by_kind.entry(kind.clone()).or_insert(0) += 1;
+        if let Some(ts) = ts_str {
+            if entry.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
+                entry.last_ts = Some(ts.to_string());
+            }
+        }
+        entry.items.push(AttentionItem {
+            id: frag_id.clone(),
+            kind,
+            text: texts.get(frag_id).cloned().unwrap_or_default(),
+            ts: ts_str.map(|s| s.to_string()),
+            metadata: Value::Object(meta.clone().into_iter().collect()),
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    let mut sessions: Vec<AttentionSession> = by_session.into_values().collect();
+    // Per-session: newest items first, then truncate to the preview cap.
+    for s in &mut sessions {
+        s.items.sort_by(|a, b| {
+            b.ts.as_deref()
+                .unwrap_or("")
+                .cmp(a.ts.as_deref().unwrap_or(""))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        s.items.truncate(ATTENTION_ITEMS_PER_SESSION);
+    }
+    // Cross-session: newest activity first, deterministic tiebreak on id.
+    sessions.sort_by(|a, b| {
+        b.last_ts
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.last_ts.as_deref().unwrap_or(""))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    sessions.truncate(limit);
+
+    Ok(Json(AttentionResponse {
+        since: since_raw.to_string(),
+        project,
+        count: sessions.len(),
+        sessions,
+    }))
+}
+
+// =============================================================================
+// `GET /api/v1/sessions/:id` — full session detail.
+//
+// Returns every fragment owned by the session grouped by kind, with the
+// actionable kinds listed first so a dashboard can render the "still open"
+// part of the session at the top. Distinct from `/sessions/:id/summary`
+// (top_jobs / facts / tasks digest) and `/sessions/:id/trajectory`
+// (phase-windowed trajectory atoms): this is the raw grouped view, useful
+// when an agent or operator wants every record the session produced.
+// =============================================================================
+
+/// Stable ordering of kinds in the response. Actionable kinds first, then
+/// trajectory signals (the L1 prompt-context atoms), then narrative kinds.
+/// Anything not listed lands at the end in lexicographic order so the
+/// response remains deterministic even when new kinds appear.
+const DETAIL_KIND_PRIORITY: &[&str] = &[
+    // Actionable — same set as `is_inbox_eligible` plus `blocker` (which the
+    // extractor doesn't currently emit but is reserved by spec).
+    "user_action",
+    "todo",
+    "blocker",
+    "decision",
+    // Trajectory — atoms that prompt-context Phase 1a indexes.
+    "decision_made",
+    "failure",
+    "risk_flag",
+    "verification",
+    "evidence_ref",
+    "read_context",
+    "prompt_directive",
+    "assumption",
+    "artifact",
+    "memory_candidate",
+    // Narrative.
+    "session_title",
+    "goal_phase",
+    "current_task",
+    "accomplishment",
+    "learning",
+    "feature",
+    "state",
+    "summary",
+    "domain",
+    "files_touched",
+    "initial_prompt_window",
+];
+
+#[derive(Debug, Serialize)]
+pub struct DetailItem {
+    pub id: String,
+    pub text: String,
+    pub ts: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DetailGroup {
+    pub kind: String,
+    pub items: Vec<DetailItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionDetailResponse {
+    pub session_id: String,
+    pub project_cwd: Option<String>,
+    pub last_ts: Option<String>,
+    pub total_fragments: usize,
+    pub by_kind: std::collections::HashMap<String, usize>,
+    pub groups: Vec<DetailGroup>,
+}
+
+pub async fn session_detail(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionDetailResponse>, StatusCode> {
+    let active_ids = services.session_index.list_active(&session_id).await;
+    if active_ids.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    let mut grouped: std::collections::HashMap<String, Vec<DetailItem>> =
+        std::collections::HashMap::new();
+    let mut by_kind: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut last_ts: Option<String> = None;
+    let mut project_cwd: Option<String> = None;
+
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
+            continue;
+        };
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(ref t) = ts {
+            if last_ts
+                .as_deref()
+                .map(|cur| t.as_str() > cur)
+                .unwrap_or(true)
+            {
+                last_ts = Some(t.clone());
+            }
+        }
+        if project_cwd.is_none() {
+            project_cwd = meta
+                .get("project_cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+        *by_kind.entry(kind.clone()).or_insert(0) += 1;
+        grouped.entry(kind).or_default().push(DetailItem {
+            id: frag_id.clone(),
+            text: texts.get(frag_id).cloned().unwrap_or_default(),
+            ts,
+            metadata: Value::Object(meta.clone().into_iter().collect()),
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Within each group: newest first; deterministic tiebreak on id.
+    for items in grouped.values_mut() {
+        items.sort_by(|a, b| {
+            b.ts.as_deref()
+                .unwrap_or("")
+                .cmp(a.ts.as_deref().unwrap_or(""))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    // Emit groups in priority order; any unknown kinds at the end in
+    // lexicographic order. A kind with zero items is omitted entirely.
+    let mut groups: Vec<DetailGroup> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for &kind in DETAIL_KIND_PRIORITY {
+        if let Some(items) = grouped.remove(kind) {
+            seen.insert(kind);
+            groups.push(DetailGroup {
+                kind: kind.to_string(),
+                items,
+            });
+        }
+    }
+    let mut leftover_keys: Vec<String> = grouped.keys().cloned().collect();
+    leftover_keys.sort();
+    for kind in leftover_keys {
+        if let Some(items) = grouped.remove(&kind) {
+            groups.push(DetailGroup { kind, items });
+        }
+    }
+    let _ = seen; // future: detect orphan kinds
+
+    Ok(Json(SessionDetailResponse {
+        session_id,
+        project_cwd,
+        last_ts,
+        total_fragments: active_ids.len(),
+        by_kind,
+        groups,
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
+///
+/// Route ordering matters: Axum's matchit gives static segments priority over
+/// `:id` parameters, so `/sessions/attention`, `/sessions/by-file`, and
+/// `/sessions/by-feature` all resolve correctly even though they sit next to
+/// `/sessions/:id`.
 pub fn create_sessions_router() -> Router<ContextNestServices> {
     Router::new()
         .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/sessions/attention", get(list_attention))
         .route("/api/v1/sessions/by-file", get(sessions_by_file))
         .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
         .route(
@@ -1843,5 +2189,222 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
             "/api/v1/sessions/:id/prompt-preview",
             get(session_prompt_preview),
         )
+        .route("/api/v1/sessions/:id", get(session_detail))
         .route("/api/v1/features", get(list_features))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Seed fragment_texts + fragment_metadata + session_index for a
+    /// canned cross-session corpus shared by the attention / detail tests.
+    /// - S1: one pending todo, one user_action, one completed todo (drop),
+    ///       all recent.
+    /// - S2: one pending todo, old enough to fall outside default since.
+    /// - S3: one pending todo + one goal_phase (non-attention), recent,
+    ///       different project.
+    async fn seed_attention_corpus(services: &ContextNestServices) {
+        let now = chrono::Utc::now();
+        let recent = now.to_rfc3339();
+        let old = (now - chrono::Duration::days(120)).to_rfc3339();
+
+        let mut texts = services.fragment_texts.write().await;
+        let mut meta = services.fragment_metadata.write().await;
+
+        let put = |texts: &mut std::collections::HashMap<String, String>,
+                   meta: &mut std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Value>,
+        >,
+                   id: &str,
+                   text: &str,
+                   kv: &[(&str, Value)]| {
+            texts.insert(id.to_string(), text.to_string());
+            let m: std::collections::HashMap<String, Value> =
+                kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            meta.insert(id.to_string(), m);
+        };
+
+        put(
+            &mut texts,
+            &mut meta,
+            "f1",
+            "pending todo in S1 alpha",
+            &[
+                ("kind", json!("todo")),
+                ("task_status", json!("pending")),
+                ("ts", json!(recent)),
+                ("src_session", json!("S1")),
+                ("project_cwd", json!("/repo/alpha")),
+            ],
+        );
+        put(
+            &mut texts,
+            &mut meta,
+            "f2",
+            "user action in S1",
+            &[
+                ("kind", json!("user_action")),
+                ("ts", json!(recent)),
+                ("src_session", json!("S1")),
+                ("project_cwd", json!("/repo/alpha")),
+            ],
+        );
+        put(
+            &mut texts,
+            &mut meta,
+            "f3",
+            "completed todo in S1 (must be excluded)",
+            &[
+                ("kind", json!("todo")),
+                ("task_status", json!("completed")),
+                ("ts", json!(recent)),
+                ("src_session", json!("S1")),
+                ("project_cwd", json!("/repo/alpha")),
+            ],
+        );
+        put(
+            &mut texts,
+            &mut meta,
+            "f4",
+            "old pending todo in S2 (since cutoff drops it)",
+            &[
+                ("kind", json!("todo")),
+                ("task_status", json!("pending")),
+                ("ts", json!(old)),
+                ("src_session", json!("S2")),
+                ("project_cwd", json!("/repo/beta")),
+            ],
+        );
+        put(
+            &mut texts,
+            &mut meta,
+            "f5",
+            "pending todo in S3 gamma",
+            &[
+                ("kind", json!("todo")),
+                ("task_status", json!("pending")),
+                ("ts", json!(recent)),
+                ("src_session", json!("S3")),
+                ("project_cwd", json!("/repo/gamma")),
+            ],
+        );
+        put(
+            &mut texts,
+            &mut meta,
+            "f6",
+            "goal_phase in S3 (non-attention)",
+            &[
+                ("kind", json!("goal_phase")),
+                ("ts", json!(recent)),
+                ("src_session", json!("S3")),
+                ("project_cwd", json!("/repo/gamma")),
+            ],
+        );
+        drop(meta);
+        drop(texts);
+
+        // Wire the session_index so /sessions/:id can resolve S1.
+        services.session_index.add("S1", "f1").await;
+        services.session_index.add("S1", "f2").await;
+        services.session_index.add("S1", "f3").await;
+        services.session_index.add("S3", "f5").await;
+        services.session_index.add("S3", "f6").await;
+    }
+
+    #[tokio::test]
+    async fn attention_groups_eligible_kinds_by_session() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_attention_corpus(&services).await;
+
+        let resp = list_attention(
+            State(services),
+            Query(AttentionQuery {
+                project: None,
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ok")
+        .0;
+
+        // S2 is too old; S1 + S3 only. S1 carries the todo + user_action,
+        // S3 carries the lone pending todo (goal_phase is filtered out).
+        assert_eq!(resp.count, 2);
+        let by_id: std::collections::HashMap<&str, &AttentionSession> = resp
+            .sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s))
+            .collect();
+        let s1 = by_id.get("S1").expect("S1 present");
+        assert_eq!(
+            s1.attention_count, 2,
+            "todo + user_action, completed dropped"
+        );
+        let s3 = by_id.get("S3").expect("S3 present");
+        assert_eq!(s3.attention_count, 1);
+        // f3 (completed) must not surface anywhere.
+        for s in &resp.sessions {
+            for item in &s.items {
+                assert_ne!(item.id, "f3", "completed todo must be excluded");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attention_filters_by_project_substring() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_attention_corpus(&services).await;
+
+        let resp = list_attention(
+            State(services),
+            Query(AttentionQuery {
+                project: Some("gamma".into()),
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ok")
+        .0;
+
+        assert_eq!(resp.count, 1);
+        assert_eq!(resp.sessions[0].session_id, "S3");
+    }
+
+    #[tokio::test]
+    async fn session_detail_groups_by_kind_in_priority_order() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_attention_corpus(&services).await;
+
+        let resp = session_detail(State(services), Path("S1".into()))
+            .await
+            .expect("ok")
+            .0;
+
+        assert_eq!(resp.total_fragments, 3);
+        assert_eq!(resp.project_cwd.as_deref(), Some("/repo/alpha"));
+        // by_kind keeps the completed todo (raw view; filtering belongs to
+        // /attention). user_action=1, todo=2 (f1 pending + f3 completed).
+        assert_eq!(resp.by_kind.get("user_action"), Some(&1));
+        assert_eq!(resp.by_kind.get("todo"), Some(&2));
+
+        // Group order: actionable kinds (user_action, todo) must come before
+        // anything else. S1 only carries user_action + todo so we expect
+        // exactly those two groups in that order.
+        let kinds: Vec<&str> = resp.groups.iter().map(|g| g.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["user_action", "todo"]);
+    }
+
+    #[tokio::test]
+    async fn session_detail_unknown_session_is_not_found() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let err = session_detail(State(services), Path("nope".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
 }
