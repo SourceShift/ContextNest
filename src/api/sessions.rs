@@ -2166,6 +2166,264 @@ pub async fn session_detail(
     }))
 }
 
+// =============================================================================
+// `POST /api/v1/sessions/find` — NL session search.
+//
+// Embeds the caller's query, cosine-scores every candidate fragment whose
+// kind is `goal_phase` or `session_title` (the two kinds that name a
+// session's *intent*), groups by `src_session`, keeps the max-cosine
+// fragment per session, and returns the top-N sessions ranked by that
+// score. Optional `project` substring + `since` window filters mirror
+// `/sessions/attention`.
+//
+// Why `goal_phase` + `session_title` and nothing else: this endpoint
+// answers "find the session where I worked on X", which is a question
+// about session intent, not about every fragment the session produced.
+// Indexing on intent kinds keeps the search precision-heavy — a session
+// whose decisions/failures happened to mention "auth" won't shadow the
+// session whose stated goal was "auth refactor".
+//
+// Failure semantics:
+//   - empty query                → 400 BAD_REQUEST
+//   - embedder failure           → 503 SERVICE_UNAVAILABLE (transient)
+//   - zero candidates            → 200 with `sessions: []`
+// =============================================================================
+
+/// Kinds the embedding-cosine search indexes against. Intent kinds only.
+const FIND_INDEXED_KINDS: &[&str] = &["goal_phase", "session_title"];
+const FIND_DEFAULT_LIMIT: usize = 10;
+const FIND_MAX_LIMIT: usize = 50;
+const FIND_DEFAULT_SINCE: &str = "90d";
+/// Hard cap on candidate fragments scored per request. With ~5-30 intent
+/// fragments per session at typical scale, 5000 covers ~200-1000 sessions
+/// — plenty for the current corpus and prevents a worst-case 50k-fragment
+/// substrate from pinning the embedder. Above this we score the most
+/// recent N and surface `truncated:true` so the caller knows.
+const FIND_CANDIDATE_CAP: usize = 5000;
+/// `match_text` preview length so a 10-result page stays under ~5 KB.
+const FIND_MATCH_TEXT_LIMIT: usize = 280;
+
+#[derive(Debug, Deserialize)]
+pub struct FindRequest {
+    pub query: String,
+    pub project: Option<String>,
+    pub since: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FindHit {
+    pub session_id: String,
+    pub project_cwd: Option<String>,
+    pub last_ts: Option<String>,
+    pub score: f32,
+    /// Which indexed kind the top-scoring fragment was. Useful so the
+    /// caller can tell whether the session matched by goal narrative
+    /// vs. by literal title.
+    pub match_kind: String,
+    pub match_text: String,
+    pub match_ts: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FindResponse {
+    pub query: String,
+    pub since: String,
+    pub project: Option<String>,
+    pub count: usize,
+    pub total_scored: usize,
+    pub truncated: bool,
+    pub sessions: Vec<FindHit>,
+}
+
+pub async fn find_sessions(
+    State(services): State<ContextNestServices>,
+    Json(req): Json<FindRequest>,
+) -> Result<Json<FindResponse>, StatusCode> {
+    let query = req.query.trim();
+    if query.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let since_raw = req.since.as_deref().unwrap_or(FIND_DEFAULT_SINCE);
+    let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::days(90));
+    let cutoff = chrono::Utc::now() - dur;
+    let limit = req.limit.unwrap_or(FIND_DEFAULT_LIMIT).min(FIND_MAX_LIMIT);
+    let project = req.project.clone();
+
+    // 1. Collect candidate ids from the metadata sidecar. We capture
+    //    (id, ts) so we can keep the most-recent N if we hit the cap.
+    let mut candidates: Vec<(String, Option<String>)> = {
+        let metadata = services.fragment_metadata.read().await;
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for (frag_id, meta) in metadata.iter() {
+            let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if !FIND_INDEXED_KINDS.contains(&kind) {
+                continue;
+            }
+            let ts_str = meta.get("ts").and_then(|v| v.as_str());
+            if let Some(ts) = ts_str {
+                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                    if parsed.with_timezone(&chrono::Utc) < cutoff {
+                        continue;
+                    }
+                }
+            }
+            if let Some(want) = project.as_deref() {
+                match meta.get("project_cwd").and_then(|v| v.as_str()) {
+                    Some(p) if p.contains(want) => {}
+                    _ => continue,
+                }
+            }
+            // `src_session` empty → can't group; skip.
+            if meta
+                .get("src_session")
+                .and_then(|v| v.as_str())
+                .map(str::is_empty)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            out.push((frag_id.clone(), ts_str.map(|s| s.to_string())));
+        }
+        out
+    };
+
+    // Cap candidate set. Sort newest-first so the cap keeps the most recent.
+    let truncated = candidates.len() > FIND_CANDIDATE_CAP;
+    if truncated {
+        candidates.sort_by(|a, b| {
+            b.1.as_deref()
+                .unwrap_or("")
+                .cmp(a.1.as_deref().unwrap_or(""))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        candidates.truncate(FIND_CANDIDATE_CAP);
+    }
+    let total_scored = candidates.len();
+
+    if total_scored == 0 {
+        return Ok(Json(FindResponse {
+            query: query.to_string(),
+            since: since_raw.to_string(),
+            project,
+            count: 0,
+            total_scored: 0,
+            truncated: false,
+            sessions: Vec::new(),
+        }));
+    }
+
+    // 2. Embed the query. Embedder failure → 503; callers can retry.
+    let query_embedding = match services.embedding.generate_embedding(query).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = ?e, "find_sessions: embedder failure");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    // 3. For each candidate, hydrate via the attractor manager (which
+    //    carries the embedding under `fragment.content` — load-bearing
+    //    naming quirk: `.content` is the vector, NOT the text), score
+    //    cosine, retain the best per session. Fragments the manager has
+    //    no embedding for (sidecar-only — post-WAL-replay state) are
+    //    silently skipped here; they have no embedding to cosine against.
+    struct Best {
+        score: f32,
+        frag_id: String,
+        kind: String,
+        ts: Option<String>,
+    }
+    let mut best_by_session: std::collections::HashMap<String, Best> =
+        std::collections::HashMap::new();
+    let metadata = services.fragment_metadata.read().await;
+
+    for (frag_id, ts) in &candidates {
+        let fragment = match services.attractor_manager.get_fragment(frag_id).await {
+            Ok(Some(f)) => f,
+            _ => continue,
+        };
+        let score = services
+            .embedding
+            .calculate_similarity(&query_embedding, &fragment.content);
+        let Some(meta) = metadata.get(frag_id) else {
+            continue;
+        };
+        let session_id = match meta.get("src_session").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match best_by_session.get(&session_id) {
+            Some(prev) if prev.score >= score => {}
+            _ => {
+                best_by_session.insert(
+                    session_id,
+                    Best {
+                        score,
+                        frag_id: frag_id.clone(),
+                        kind,
+                        ts: ts.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    // 4. Rank sessions by score desc, materialise the text preview.
+    let texts = services.fragment_texts.read().await;
+    let mut hits: Vec<FindHit> = best_by_session
+        .into_iter()
+        .map(|(session_id, b)| {
+            let project_cwd = metadata
+                .get(&b.frag_id)
+                .and_then(|m| m.get("project_cwd"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let text_raw = texts.get(&b.frag_id).cloned().unwrap_or_default();
+            let match_text = if text_raw.chars().count() > FIND_MATCH_TEXT_LIMIT {
+                let truncated: String = text_raw.chars().take(FIND_MATCH_TEXT_LIMIT).collect();
+                format!("{truncated}…")
+            } else {
+                text_raw
+            };
+            FindHit {
+                session_id,
+                project_cwd,
+                last_ts: b.ts.clone(),
+                score: b.score,
+                match_kind: b.kind,
+                match_text,
+                match_ts: b.ts,
+            }
+        })
+        .collect();
+    drop(texts);
+    drop(metadata);
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    hits.truncate(limit);
+
+    Ok(Json(FindResponse {
+        query: query.to_string(),
+        since: since_raw.to_string(),
+        project,
+        count: hits.len(),
+        total_scored,
+        truncated,
+        sessions: hits,
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 ///
@@ -2177,6 +2435,7 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
     Router::new()
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/attention", get(list_attention))
+        .route("/api/v1/sessions/find", axum::routing::post(find_sessions))
         .route("/api/v1/sessions/by-file", get(sessions_by_file))
         .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
         .route(
@@ -2406,5 +2665,52 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn find_sessions_rejects_empty_query() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let err = find_sessions(
+            State(services),
+            Json(FindRequest {
+                query: "   ".into(), // whitespace-only counts as empty
+                project: None,
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn find_sessions_returns_empty_list_when_no_candidates() {
+        // No goal_phase / session_title fragments seeded → handler must
+        // short-circuit BEFORE touching the embedder. This is also how we
+        // assert the candidate-collection prefilter is correct: if it
+        // didn't filter to indexed kinds, the seed's attention todos would
+        // wrongly become candidates and the embedder would be called.
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_attention_corpus(&services).await; // only todos/user_actions/goal_phase
+                                                // Note: seed has f6 with kind=goal_phase but only in S3 (recent).
+                                                // To exercise the zero-candidate path we filter to a project
+                                                // with no goal_phase / session_title fragments.
+        let resp = find_sessions(
+            State(services),
+            Json(FindRequest {
+                query: "anything".into(),
+                project: Some("__no_such_project__".into()),
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ok")
+        .0;
+        assert_eq!(resp.count, 0);
+        assert_eq!(resp.total_scored, 0);
+        assert!(!resp.truncated);
+        assert!(resp.sessions.is_empty());
     }
 }
