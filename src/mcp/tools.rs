@@ -1,11 +1,19 @@
-//! MCP tool definitions and dispatch for Phase 1.
+//! MCP tool definitions and dispatch.
 //!
-//! Three thin proxies over the substrate's seven-tool HTTP surface:
-//! `cn_store` → POST /api/v1/tools/store, `cn_retrieve` → .../retrieve,
-//! `cn_summarize` → .../summarize. Each handler validates required
-//! arguments locally (returning a JSON-RPC `INVALID_PARAMS` error before
-//! any network call), forwards the rest verbatim, and pretty-prints the
-//! substrate's JSON response as MCP text content.
+//! Phase 1 (write surface): `cn_store`, `cn_retrieve`, `cn_summarize`
+//! proxy the substrate's seven-tool HTTP write/query endpoints.
+//!
+//! Phase 2 (cross-session read surface): `cn_sessions_list`,
+//! `cn_session_summary`, `cn_session_trajectory`, `cn_inbox`, `cn_features`,
+//! `cn_prompt_context_atoms` proxy the substrate's read-only GET endpoints
+//! so an MCP-speaking agent can ask "what's open / what shipped / which
+//! trajectory atoms exist?" natively, without shelling out to `curl`.
+//!
+//! Each handler validates required arguments locally (returning a JSON-RPC
+//! `INVALID_PARAMS` error before any network call), forwards the rest
+//! verbatim, and pretty-prints the substrate's JSON response as MCP text
+//! content. Required path parameters (`session_id` in summary/trajectory)
+//! are injected into the URL, never into the query string.
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -23,7 +31,21 @@ pub enum ToolError {
 
 /// The `tools/list` payload: `{ "tools": [ {name, description, inputSchema} ] }`.
 pub fn list_tools() -> Value {
-    json!({ "tools": [store_def(), retrieve_def(), summarize_def()] })
+    json!({
+        "tools": [
+            // Phase 1 — write / query surface.
+            store_def(),
+            retrieve_def(),
+            summarize_def(),
+            // Phase 2 — cross-session read surface.
+            sessions_list_def(),
+            session_summary_def(),
+            session_trajectory_def(),
+            inbox_def(),
+            features_def(),
+            prompt_context_atoms_def(),
+        ]
+    })
 }
 
 fn store_def() -> Value {
@@ -82,6 +104,93 @@ fn summarize_def() -> Value {
     })
 }
 
+fn sessions_list_def() -> Value {
+    json!({
+        "name": "cn_sessions_list",
+        "description": "List every session the substrate knows about, newest-first. \
+    Returns fragment counts, most-common project_cwd, most-common src_session, \
+    and the latest ts per session. Use to discover recent work across projects.",
+        "inputSchema": { "type": "object", "properties": {} }
+    })
+}
+
+fn session_summary_def() -> Value {
+    json!({
+        "name": "cn_session_summary",
+        "description": "Return a single session's high-level summary — kinds histogram, \
+    top files touched, key timestamps. Use after `cn_sessions_list` surfaces a candidate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID (src_session)." }
+            },
+            "required": ["session_id"]
+        }
+    })
+}
+
+fn session_trajectory_def() -> Value {
+    json!({
+        "name": "cn_session_trajectory",
+        "description": "Return one session's trajectory: phased goal windows plus the \
+    decisions, failures, verifications, risks, prompt directives, and assumptions \
+    recorded during it. Includes basin/resonance signals when the substrate has \
+    consolidated the session's fragments.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "Session UUID (src_session)." }
+            },
+            "required": ["session_id"]
+        }
+    })
+}
+
+fn inbox_def() -> Value {
+    json!({
+        "name": "cn_inbox",
+        "description": "Return the cross-session attention inbox — todos and user_actions \
+    that still need attention, ranked by urgency. Use to discover what's blocking the \
+    user across all projects.",
+        "inputSchema": { "type": "object", "properties": {} }
+    })
+}
+
+fn features_def() -> Value {
+    json!({
+        "name": "cn_features",
+        "description": "Return the cross-session feature inventory — named deliverables \
+    shipped per session, with files, refs, layer, and replay recipe (how_to_test). Use \
+    to answer 'what shipped recently' or 'which session built X'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": { "type": "string", "description": "Age window (default 24h, e.g. 7d, 90m)." },
+                "layer": { "type": "string", "description": "Optional layer filter (frontend|backend|infra|docs|tests|other)." }
+            }
+        }
+    })
+}
+
+fn prompt_context_atoms_def() -> Value {
+    json!({
+        "name": "cn_prompt_context_atoms",
+        "description": "Return cross-session trajectory atoms — decisions, failures, \
+    verifications, evidence refs, risks, etc. — filterable by kind/project/session/age. \
+    The deterministic L1 read layer that feeds prompt-context compilation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "One trajectory kind (decision_made, failure, verification, read_context, evidence_ref, prompt_directive, assumption, artifact, memory_candidate, risk_flag)." },
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "session_id": { "type": "string", "description": "Exact src_session match." },
+                "since": { "type": "string", "description": "Age window (default 30d)." },
+                "limit": { "type": "integer", "description": "Max atoms returned (default 200, cap 1000)." }
+            }
+        }
+    })
+}
+
 /// Dispatch a `tools/call` to the matching handler.
 pub async fn call_tool(
     http: &Client,
@@ -90,9 +199,17 @@ pub async fn call_tool(
     args: Value,
 ) -> Result<String, ToolError> {
     match name {
+        // Phase 1.
         "cn_store" => call_store(http, base_url, args).await,
         "cn_retrieve" => call_retrieve(http, base_url, args).await,
         "cn_summarize" => call_summarize(http, base_url, args).await,
+        // Phase 2.
+        "cn_sessions_list" => call_sessions_list(http, base_url).await,
+        "cn_session_summary" => call_session_summary(http, base_url, args).await,
+        "cn_session_trajectory" => call_session_trajectory(http, base_url, args).await,
+        "cn_inbox" => call_inbox(http, base_url).await,
+        "cn_features" => call_features(http, base_url, args).await,
+        "cn_prompt_context_atoms" => call_prompt_context_atoms(http, base_url, args).await,
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
 }
@@ -120,6 +237,81 @@ async fn call_summarize(http: &Client, base: &str, args: Value) -> Result<String
     let mut body = json!({ "session_id": session_id });
     forward(&mut body, &args, &["target_tokens"]);
     post(http, base, "/api/v1/tools/summarize", body).await
+}
+
+async fn call_sessions_list(http: &Client, base: &str) -> Result<String, ToolError> {
+    get(http, base, "/api/v1/sessions", &[]).await
+}
+
+async fn call_session_summary(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    let session_id = require_str(&args, "session_id", "cn_session_summary")?;
+    let path = format!("/api/v1/sessions/{}/summary", urlencode(&session_id));
+    get(http, base, &path, &[]).await
+}
+
+async fn call_session_trajectory(
+    http: &Client,
+    base: &str,
+    args: Value,
+) -> Result<String, ToolError> {
+    let session_id = require_str(&args, "session_id", "cn_session_trajectory")?;
+    let path = format!("/api/v1/sessions/{}/trajectory", urlencode(&session_id));
+    get(http, base, &path, &[]).await
+}
+
+async fn call_inbox(http: &Client, base: &str) -> Result<String, ToolError> {
+    get(http, base, "/api/v1/inbox", &[]).await
+}
+
+async fn call_features(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    let q = collect_query(&args, &["since", "layer"]);
+    get(http, base, "/api/v1/features", &q).await
+}
+
+async fn call_prompt_context_atoms(
+    http: &Client,
+    base: &str,
+    args: Value,
+) -> Result<String, ToolError> {
+    let q = collect_query(&args, &["kind", "project", "session_id", "since", "limit"]);
+    get(http, base, "/api/v1/prompt-context/atoms", &q).await
+}
+
+/// Encode a path segment so a stray `/` or `?` in a `session_id` can't
+/// re-route the request. Minimal — only the chars that change Axum routing
+/// or URL parsing. (`session_id` is a UUID in normal flow, but the MCP
+/// agent can pass anything, so this is defence-in-depth.)
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Pluck the present keys from `args` and stringify their values as query
+/// pairs. Numbers serialize via their JSON form (`5`, not `"5"`), strings
+/// drop their quotes, anything else (arrays/objects) goes through
+/// `to_string` and lands in the URL — the substrate will reject malformed
+/// inputs with its own 400.
+fn collect_query(args: &Value, keys: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for k in keys {
+        if let Some(v) = args.get(*k) {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                Value::Null => continue,
+                other => other.to_string(),
+            };
+            out.push((k.to_string(), s));
+        }
+    }
+    out
 }
 
 /// Pull a required string argument or fail with a precise message.
@@ -150,6 +342,30 @@ async fn post(http: &Client, base: &str, path: &str, body: Value) -> Result<Stri
         .send()
         .await
         .map_err(|e| ToolError::Upstream(format!("request to {url} failed: {e}")))?;
+    finalize(url, resp).await
+}
+
+/// GET `<base><path>?<query>`; same response handling as `post`. Empty
+/// `query` means no `?` is appended.
+async fn get(
+    http: &Client,
+    base: &str,
+    path: &str,
+    query: &[(String, String)],
+) -> Result<String, ToolError> {
+    let url = format!("{base}{path}");
+    let mut req = http.get(&url);
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ToolError::Upstream(format!("request to {url} failed: {e}")))?;
+    finalize(url, resp).await
+}
+
+async fn finalize(url: String, resp: reqwest::Response) -> Result<String, ToolError> {
     let status = resp.status();
     let text = resp.text().await.map_err(|e| {
         ToolError::Upstream(format!("reading response body from {url} failed: {e}"))
@@ -170,14 +386,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_tools_advertises_three_named_tools() {
+    fn list_tools_advertises_all_phase1_and_phase2_tools() {
         let listed = list_tools();
         let tools = listed["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 9, "3 Phase-1 + 6 Phase-2 = 9 tools");
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-        assert!(names.contains(&"cn_store"));
-        assert!(names.contains(&"cn_retrieve"));
-        assert!(names.contains(&"cn_summarize"));
+        for expected in [
+            "cn_store",
+            "cn_retrieve",
+            "cn_summarize",
+            "cn_sessions_list",
+            "cn_session_summary",
+            "cn_session_trajectory",
+            "cn_inbox",
+            "cn_features",
+            "cn_prompt_context_atoms",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
         // Each tool must carry an object inputSchema with a properties map.
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -231,5 +457,94 @@ mod tests {
         assert_eq!(body["importance"], 0.9);
         assert_eq!(body["session_id"], "s1");
         assert!(body.get("metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_summary_without_session_id_is_bad_arguments() {
+        let http = Client::new();
+        let err = call_tool(&http, "http://127.0.0.1:1", "cn_session_summary", json!({}))
+            .await
+            .expect_err("missing session_id must fail before any network call");
+        assert!(matches!(err, ToolError::BadArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn session_trajectory_without_session_id_is_bad_arguments() {
+        let http = Client::new();
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_session_trajectory",
+            json!({}),
+        )
+        .await
+        .expect_err("missing session_id must fail before any network call");
+        assert!(matches!(err, ToolError::BadArguments(_)));
+    }
+
+    #[test]
+    fn collect_query_flattens_present_keys_only() {
+        let args = json!({
+            "kind": "decision_made",
+            "limit": 50,
+            "since": "7d",
+            "project": null,           // explicit null is dropped
+            "session_id": "s1"
+        });
+        let q = collect_query(
+            &args,
+            &["kind", "project", "session_id", "since", "limit", "missing"],
+        );
+        let map: std::collections::HashMap<_, _> = q.into_iter().collect();
+        assert_eq!(map.get("kind").map(String::as_str), Some("decision_made"));
+        assert_eq!(map.get("limit").map(String::as_str), Some("50"));
+        assert_eq!(map.get("since").map(String::as_str), Some("7d"));
+        assert_eq!(map.get("session_id").map(String::as_str), Some("s1"));
+        assert!(!map.contains_key("project"));
+        assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn urlencode_escapes_path_separators() {
+        // Realistic uuid stays untouched.
+        assert_eq!(
+            urlencode("01HXYZ-abcd_1234.test~ok"),
+            "01HXYZ-abcd_1234.test~ok"
+        );
+        // Slash and question mark must be escaped so an attacker-controlled
+        // session_id can't rewrite the URL.
+        assert_eq!(urlencode("a/b?c"), "a%2Fb%3Fc");
+        // Spaces are escaped (not + because we are not encoding form data).
+        assert_eq!(urlencode("a b"), "a%20b");
+    }
+
+    #[tokio::test]
+    async fn sessions_list_takes_no_args() {
+        // Tool exists and is dispatched (network call will fail at this host,
+        // but reaching that point proves the no-arg call path is wired).
+        let http = Client::new();
+        let err = call_tool(&http, "http://127.0.0.1:1", "cn_sessions_list", json!({}))
+            .await
+            .expect_err("nothing is listening on 127.0.0.1:1, so upstream must fail");
+        assert!(
+            matches!(err, ToolError::Upstream(_)),
+            "expected Upstream (network) error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn features_optional_args_round_trip_through_dispatch() {
+        let http = Client::new();
+        // since/layer are optional; passing them must still dispatch and only
+        // fail at the network step.
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_features",
+            json!({ "since": "7d", "layer": "backend" }),
+        )
+        .await
+        .expect_err("network must fail at 127.0.0.1:1");
+        assert!(matches!(err, ToolError::Upstream(_)));
     }
 }
