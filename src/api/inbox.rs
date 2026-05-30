@@ -424,6 +424,19 @@ pub(crate) fn is_inbox_eligible(meta: &HashMap<String, serde_json::Value>) -> bo
             .get("awaiting_decision")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        // Agent-substrate kinds (idea 023 Gap G2). Only OPEN asks and
+        // unprocessed handoffs surface in the inbox; answered asks and
+        // resolved handoffs fall to historical retrieval like decisions.
+        Some("ask") => meta
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "open")
+            .unwrap_or(true),
+        Some("handoff") => meta
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "open" || s == "pending")
+            .unwrap_or(true),
         _ => false,
     }
 }
@@ -610,5 +623,55 @@ mod tests {
         let out = truncate_md(&long_emoji, 240);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), 241);
+    }
+
+    // ── idea 023 Gap G2 — agent-substrate kinds ──────────────────────
+
+    #[test]
+    fn ask_open_is_eligible() {
+        // Open asks must surface — they block agents waiting on oracle.
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("ask")),
+            ("status", json!("open")),
+        ])));
+    }
+
+    #[test]
+    fn ask_without_status_is_eligible() {
+        // Missing status defaults to "open" semantics.
+        assert!(is_inbox_eligible(&meta(&[("kind", json!("ask"))])));
+    }
+
+    #[test]
+    fn ask_answered_is_ineligible() {
+        // Once answered, ask is historical context, not actionable.
+        assert!(!is_inbox_eligible(&meta(&[
+            ("kind", json!("ask")),
+            ("status", json!("answered")),
+        ])));
+    }
+
+    #[test]
+    fn handoff_open_is_eligible() {
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("handoff")),
+            ("status", json!("open")),
+        ])));
+    }
+
+    #[test]
+    fn handoff_pending_is_eligible() {
+        assert!(is_inbox_eligible(&meta(&[
+            ("kind", json!("handoff")),
+            ("status", json!("pending")),
+        ])));
+    }
+
+    #[test]
+    fn handoff_resolved_is_ineligible() {
+        assert!(!is_inbox_eligible(&meta(&[
+            ("kind", json!("handoff")),
+            ("status", json!("resolved")),
+        ])));
     }
 }

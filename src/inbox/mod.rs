@@ -67,13 +67,21 @@ impl InboxItem {
         let metadata = hit.get("metadata")?.as_object()?;
         let kind = metadata.get("kind")?.as_str()?.to_string();
 
-        // Only `user_action`, `todo`, and `decision` belong in the inbox.
-        // Kept in sync with the backend endpoint
+        // Only `user_action`, `todo`, `decision`, `ask`, `handoff` belong in
+        // the inbox. Kept in sync with the backend endpoint
         // (`src/api/inbox.rs::is_inbox_eligible`) and the frontend filter
         // (`web/src/hooks/useInbox.ts`). Researcher-style autopilot data
         // contains `todo` entries that read as "user needs to pick X" —
         // semantically inbox-worthy even without an explicit user_action tag.
-        if kind != "user_action" && kind != "decision" && kind != "todo" {
+        //
+        // `ask` and `handoff` added per idea 023 Gap G2 — agent-substrate
+        // primitives that need cross-session visibility before oracle wires up.
+        if kind != "user_action"
+            && kind != "decision"
+            && kind != "todo"
+            && kind != "ask"
+            && kind != "handoff"
+        {
             return None;
         }
 
