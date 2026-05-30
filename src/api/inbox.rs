@@ -192,7 +192,7 @@ pub async fn list_inbox(
 ///
 /// Any other kind (accomplishment, learning, state, goal_phase, …) is
 /// historical / contextual and excluded.
-fn is_inbox_eligible(meta: &HashMap<String, serde_json::Value>) -> bool {
+pub(crate) fn is_inbox_eligible(meta: &HashMap<String, serde_json::Value>) -> bool {
     match meta.get("kind").and_then(|v| v.as_str()) {
         Some("user_action") => true,
         Some("todo") => {
