@@ -54,6 +54,18 @@ impl EmbeddingService {
             .ok_or_else(|| ContextNestError::Api("Default embedding model not found".to_string()))
     }
 
+    /// Identifier of the embedder model this service is currently
+    /// configured to run. Returned verbatim from `config.default_model`
+    /// — typically a provider-prefixed identifier such as
+    /// `text-embedding-3-small` (OpenAI) or `BAAI/bge-small-en`
+    /// (DeepInfra). Used by the OpenAI-compat `/llm/v1/embeddings`
+    /// proxy to populate the response's `model` field with the actual
+    /// model that ran (not the model the client requested) so the
+    /// response carries no fidelity lie.
+    pub fn configured_model_name(&self) -> &str {
+        &self.config.default_model
+    }
+
     /// Resolve the embedding API key from the layered sources documented on
     /// [`Self::generate_openai_embedding`]. Returns `None` only if every
     /// source is empty / unset.
