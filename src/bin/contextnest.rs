@@ -11,7 +11,7 @@ use clap::Parser;
 use contextnest::api::create_app;
 use contextnest::cli::{Cli, Commands, IngestSource, McpCommands, PromptContextCommands};
 use contextnest::config::Config;
-use contextnest::inbox::{render_json, render_text, InboxItem};
+use contextnest::inbox::{render_json, render_markdown, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
     discover_sessions, ingest_session_file, parse_since, redactor::Redactor, sink::RedactingSink,
     DryRunSink, HttpSink, Sink, SinkReport,
@@ -48,7 +48,8 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             substrate,
             session_id,
             json,
-        } => inbox(project, urgency, substrate, session_id, json).await,
+            markdown,
+        } => inbox(project, urgency, substrate, session_id, json, markdown).await,
         Commands::Mcp { action } => mcp(action).await,
         Commands::PromptContext { action } => prompt_context(action).await,
         Commands::Features {
@@ -223,6 +224,7 @@ async fn inbox(
     substrate: String,
     session_id: Option<String>,
     json_mode: bool,
+    markdown_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate --urgency early — bad input is a hard error so users
     // notice typos.
@@ -309,8 +311,15 @@ async fn inbox(
         }
     }
 
+    // Dispatch the renderer. `--json` and `--markdown` are mutually
+    // exclusive at the clap layer (conflicts_with), so at most one is
+    // true; falling through to render_text is the terminal default.
     if json_mode {
         println!("{}", render_json(&all_items)?);
+    } else if markdown_mode {
+        // Markdown body carries its own trailing newlines; no extra
+        // println! so the output is pipe-clean.
+        print!("{}", render_markdown(&all_items));
     } else {
         print!("{}", render_text(&all_items));
     }
