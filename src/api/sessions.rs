@@ -462,6 +462,15 @@ pub struct FeaturesQuery {
     /// `tests`/`other`). Matches the `layer` field the agent supplied
     /// on `delivered_features[]`. Case-insensitive.
     pub layer: Option<String>,
+    /// Optional substring match on the feature record's `project_cwd`
+    /// metadata. Case-sensitive (mirrors the existing project filters
+    /// elsewhere in the substrate). Omit to include every project.
+    pub project: Option<String>,
+    /// Response format. `json` (default) returns `FeaturesResponse`;
+    /// `markdown` returns a `text/markdown; charset=utf-8` body shaped
+    /// for prose consumers (paste-into-prompt / dashboard cards /
+    /// daily-digest readers). Unknown values fall through to JSON.
+    pub format: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -513,11 +522,12 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::Duration> {
 pub async fn list_features(
     State(services): State<ContextNestServices>,
     Query(q): Query<FeaturesQuery>,
-) -> Result<Json<FeaturesResponse>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     let since_raw = q.since.as_deref().unwrap_or("24h");
     let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::hours(24));
     let cutoff = chrono::Utc::now() - dur;
     let layer_low = q.layer.as_deref().map(str::to_lowercase);
+    let want_project = q.project.as_deref();
 
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
@@ -545,6 +555,12 @@ pub async fn list_features(
             let got = layer.as_deref().unwrap_or("").to_lowercase();
             if got != *want {
                 continue;
+            }
+        }
+        if let Some(want) = want_project {
+            match meta.get("project_cwd").and_then(|v| v.as_str()) {
+                Some(p) if p.contains(want) => {}
+                _ => continue,
             }
         }
         let session_id = meta
@@ -606,12 +622,131 @@ pub async fn list_features(
             .then_with(|| a.feature.cmp(&b.feature))
     });
 
-    Ok(Json(FeaturesResponse {
-        since: since_raw.to_string(),
-        layer: q.layer,
-        count: entries.len(),
-        features: entries,
-    }))
+    use axum::response::IntoResponse;
+    let format_md = matches!(q.format.as_deref(), Some("markdown") | Some("md"));
+
+    if format_md {
+        let md = render_features_markdown(since_raw, q.layer.as_deref(), want_project, &entries);
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/markdown; charset=utf-8")
+            .body(axum::body::Body::from(md))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    } else {
+        Ok(Json(FeaturesResponse {
+            since: since_raw.to_string(),
+            layer: q.layer,
+            count: entries.len(),
+            features: entries,
+        })
+        .into_response())
+    }
+}
+
+/// Per-feature preview cap so the Markdown body stays bounded even when
+/// `how_to_test` carries a long recipe. Mirrors `CAPSULE_LINE_LIMIT`.
+const FEATURES_HOW_TO_TEST_LIMIT: usize = 280;
+
+/// Render the feature inventory as a Markdown digest. Newest-first list;
+/// each feature block carries title, layer, ts, session id, files, refs,
+/// defs, and a truncated `how_to_test` recipe. Designed for paste-into-
+/// prompt and shell-pipe-into-pbcopy workflows.
+fn render_features_markdown(
+    since_raw: &str,
+    layer: Option<&str>,
+    project: Option<&str>,
+    entries: &[FeatureEntry],
+) -> String {
+    let mut md = String::with_capacity(2 * 1024 + entries.len() * 256);
+    md.push_str("# Recently Shipped Features\n\n");
+    md.push_str(&format!("_Window: last {since_raw}"));
+    if let Some(l) = layer {
+        md.push_str(&format!(" · layer `{l}`"));
+    }
+    if let Some(p) = project {
+        md.push_str(&format!(" · project ~ `{p}`"));
+    }
+    md.push_str(&format!(" · {} features_\n\n", entries.len()));
+
+    if entries.is_empty() {
+        md.push_str("_(no features matched the filters)_\n");
+        return md;
+    }
+
+    for entry in entries {
+        // First-line bullet: title + layer + timestamp + session.
+        let layer_tag = entry
+            .layer
+            .as_deref()
+            .map(|l| format!(" _({l})_"))
+            .unwrap_or_default();
+        md.push_str(&format!("### {}{}\n", entry.feature, layer_tag));
+        let mut meta_parts: Vec<String> = Vec::new();
+        if let Some(ts) = &entry.ts {
+            meta_parts.push(format!("ts {ts}"));
+        }
+        let sid_short: String = entry.session_id.chars().take(8).collect();
+        meta_parts.push(format!("session `{sid_short}`"));
+        if !meta_parts.is_empty() {
+            md.push_str(&format!("_{}_\n\n", meta_parts.join(" · ")));
+        }
+        if !entry.files.is_empty() {
+            md.push_str("- **Files:** ");
+            md.push_str(
+                &entry
+                    .files
+                    .iter()
+                    .map(|f| format!("`{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            md.push('\n');
+        }
+        if !entry.refs.is_empty() {
+            let refs_str = entry
+                .refs
+                .iter()
+                .filter_map(|r| match r {
+                    Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !refs_str.is_empty() {
+                md.push_str(&format!("- **Refs:** {refs_str}\n"));
+            }
+        }
+        if !entry.defs.is_empty() {
+            md.push_str("- **Defs:** ");
+            md.push_str(
+                &entry
+                    .defs
+                    .iter()
+                    .map(|d| format!("`{d}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            md.push('\n');
+        }
+        if let Some(htt) = entry.how_to_test.as_deref() {
+            let truncated = truncate_to_chars(htt, FEATURES_HOW_TO_TEST_LIMIT);
+            md.push_str(&format!("- **Test:** {truncated}\n"));
+        }
+        md.push('\n');
+    }
+    md
+}
+
+/// Truncate `s` to at most `limit` chars (not bytes) and append an
+/// ellipsis when truncation occurred. Local copy of the same helper
+/// the prompt-context capsule uses; kept inline to keep this PR
+/// scope tight (the cross-module refactor isn't worth it yet).
+fn truncate_to_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.replace('\n', " ");
+    }
+    let head: String = s.chars().take(limit).collect();
+    format!("{}…", head.replace('\n', " "))
 }
 
 // =============================================================================
@@ -2712,5 +2847,102 @@ mod tests {
         assert_eq!(resp.total_scored, 0);
         assert!(!resp.truncated);
         assert!(resp.sessions.is_empty());
+    }
+
+    #[test]
+    fn render_features_markdown_renders_empty_window_explanation() {
+        let md = render_features_markdown("24h", None, None, &[]);
+        assert!(md.starts_with("# Recently Shipped Features\n"));
+        assert!(md.contains("_Window: last 24h"));
+        assert!(md.contains("0 features_"));
+        assert!(md.contains("_(no features matched the filters)_"));
+    }
+
+    #[test]
+    fn render_features_markdown_emits_per_entry_blocks() {
+        let entries = vec![FeatureEntry {
+            session_id: "abc1234567890".into(),
+            feature: "Demo feature title".into(),
+            ts: Some("2026-05-31T15:00:00Z".into()),
+            files: vec!["src/api/foo.rs".into(), "src/api/bar.rs".into()],
+            refs: vec![
+                serde_json::Value::String("PR #100".into()),
+                serde_json::Value::String("commit abc1234".into()),
+            ],
+            layer: Some("backend".into()),
+            how_to_test: Some("curl http://localhost/api/v1/foo".into()),
+            defs: vec!["fn foo".into(), "struct Bar".into()],
+        }];
+        let md = render_features_markdown("7d", Some("backend"), Some("ContextNest"), &entries);
+        // Header carries every active filter.
+        assert!(md.contains(
+            "_Window: last 7d · layer `backend` · project ~ `ContextNest` · 1 features_"
+        ));
+        // Title + layer badge.
+        assert!(md.contains("### Demo feature title _(backend)_"));
+        // Session id is shortened to 8 chars.
+        assert!(md.contains("session `abc12345`"));
+        // Files line is present with backticks.
+        assert!(md.contains("- **Files:** `src/api/foo.rs`, `src/api/bar.rs`"));
+        // Refs rendered as a comma-joined list (strings unquoted).
+        assert!(md.contains("- **Refs:** PR #100, commit abc1234"));
+        // Defs in backticks.
+        assert!(md.contains("- **Defs:** `fn foo`, `struct Bar`"));
+        // Test recipe.
+        assert!(md.contains("- **Test:** curl http://localhost/api/v1/foo"));
+    }
+
+    #[tokio::test]
+    async fn list_features_format_markdown_returns_text_markdown() {
+        // No fragments → an empty markdown body is still text/markdown.
+        let services = ContextNestServices::new_default().await.expect("services");
+        let resp = list_features(
+            State(services),
+            Query(FeaturesQuery {
+                since: Some("7d".into()),
+                layer: None,
+                project: None,
+                format: Some("markdown".into()),
+            }),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/markdown"),
+            "expected text/markdown, got {ct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_features_default_format_returns_json() {
+        // Default (no format param) preserves the legacy JSON contract.
+        let services = ContextNestServices::new_default().await.expect("services");
+        let resp = list_features(
+            State(services),
+            Query(FeaturesQuery {
+                since: Some("7d".into()),
+                layer: None,
+                project: None,
+                format: None,
+            }),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/json"),
+            "expected application/json, got {ct}"
+        );
     }
 }
