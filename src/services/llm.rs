@@ -342,6 +342,189 @@ impl LlmService {
 
         self.complete(&prompt).await
     }
+
+    /// Multi-message chat completion using the configured provider.
+    ///
+    /// The structured cousin of [`Self::complete`]: accepts a full
+    /// conversation (system + user + assistant + tool messages), per-call
+    /// generation knobs (temperature, max_tokens, ...), and returns the
+    /// model's text + token usage rather than just a string. Designed as
+    /// the integration point for the v0.3 LLM proxy
+    /// (`src/api/llm_proxy`); see `docs/roadmap/v0.3-llm-proxy.md`.
+    ///
+    /// Provider routing: this method uses whichever provider the service
+    /// was constructed with. Multi-provider routing keyed off the request's
+    /// `model` field is slice 1.3 of the v0.3 plan; until then, the
+    /// `model` parameter on `ChatCompletionOpts` is informational only —
+    /// the configured provider's default model is what actually runs.
+    ///
+    /// Returns [`ContextNestError::Configuration`] when the provider is
+    /// [`LlmProvider::Disabled`]; callers SHOULD check
+    /// [`Self::is_enabled`] first and map the error to a transport-
+    /// appropriate response (the proxy returns 503).
+    pub async fn complete_chat(
+        &self,
+        opts: ChatCompletionOpts,
+    ) -> ContextNestResult<ChatCompletionResult> {
+        let model = match &*self.inner {
+            LlmProvider::Disabled => {
+                return Err(ContextNestError::Configuration(
+                    "LLM provider not configured".to_string(),
+                ))
+            }
+            LlmProvider::Anthropic { model } => model.clone(),
+            LlmProvider::OpenAi { model } => model.clone(),
+            LlmProvider::Google { model } => model.clone(),
+            LlmProvider::Custom { model, .. } => model.clone(),
+        };
+
+        // Translate the public ChatMessage shape into llm-sdk-rs's
+        // Message + Part. Empty content on a user/system message becomes
+        // an empty text part rather than skipping the message — the
+        // turn order matters even if a message carries no visible text
+        // (e.g. assistant-tool-call without textual content).
+        let mut llm_messages: Vec<Message> = Vec::with_capacity(opts.messages.len());
+        for m in &opts.messages {
+            let part = Part::text(m.content.clone());
+            let msg = match m.role {
+                ChatRole::System => {
+                    // llm-sdk-rs models system content via the
+                    // `system_prompt` field on `LanguageModelInput`, not
+                    // via a `Message::system`. We aggregate multiple
+                    // system messages into one system_prompt below.
+                    continue;
+                }
+                ChatRole::User => Message::user([part]),
+                ChatRole::Assistant => Message::assistant([part]),
+                ChatRole::Tool => {
+                    // No first-class tool-role message in 0.3; map to a
+                    // user turn carrying the tool result text. Slice 1.3
+                    // will revisit when tool-calling is wired through.
+                    Message::user([part])
+                }
+            };
+            llm_messages.push(msg);
+        }
+
+        // Aggregate any system messages into a single system_prompt — the
+        // common case is one system message anyway; multiple are joined
+        // with newlines.
+        let system_prompt: Option<String> = {
+            let combined: Vec<String> = opts
+                .messages
+                .iter()
+                .filter(|m| matches!(m.role, ChatRole::System))
+                .map(|m| m.content.clone())
+                .collect();
+            if combined.is_empty() {
+                None
+            } else {
+                Some(combined.join("\n\n"))
+            }
+        };
+
+        let input = LanguageModelInput {
+            system_prompt,
+            messages: llm_messages,
+            temperature: opts.temperature.map(|t| t as f64),
+            top_p: opts.top_p.map(|t| t as f64),
+            max_tokens: opts.max_tokens,
+            seed: opts.seed.map(|s| s as i64),
+            presence_penalty: opts.presence_penalty.map(|p| p as f64),
+            frequency_penalty: opts.frequency_penalty.map(|p| p as f64),
+            ..Default::default()
+        };
+
+        let response = model
+            .generate(input)
+            .await
+            .map_err(|e| ContextNestError::Api(format!("LLM provider error: {e}")))?;
+
+        // Concatenate every text part in response.content. A model that
+        // returns multiple text parts (e.g. interspersed with tool_use
+        // parts not yet handled) gets joined with empty separator so the
+        // visible text is the user-facing string. Tool-use part handling
+        // arrives with slice 1.2.x or 1.3 depending on routing scope.
+        let text = response
+            .content
+            .iter()
+            .filter_map(|p| {
+                if let Part::Text(t) = p {
+                    Some(t.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        let (input_tokens, output_tokens) = response
+            .usage
+            .as_ref()
+            .map(|u| (u.input_tokens, u.output_tokens))
+            .unwrap_or((0, 0));
+
+        Ok(ChatCompletionResult {
+            text,
+            input_tokens,
+            output_tokens,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public chat-completion types
+// ---------------------------------------------------------------------------
+
+/// Conversation role for [`ChatMessage`]. Matches the OpenAI wire format
+/// (`system` / `user` / `assistant` / `tool`); the proxy translates from
+/// `api::llm_proxy::openai_shapes::Role` into this enum 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// One turn in a chat completion request. Carries a role + text content.
+/// Multimodal / structured content parts are reduced to text by the proxy
+/// before reaching this type — slice 1.2 ships text-only chat completion;
+/// multimodal pass-through is a later slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+/// Knobs the chat-completion handler can set when calling the LLM. Mirrors
+/// the OpenAI request surface that matters for cache-key derivation
+/// (`temperature`, `max_tokens`, `system_prompt` derived from messages),
+/// keeping the cache layer in Phase 2 able to consume this shape directly.
+#[derive(Debug, Clone, Default)]
+pub struct ChatCompletionOpts {
+    /// Provider-specific model identifier from the request. Informational
+    /// only in slice 1.2 — multi-provider routing keyed off this lands in
+    /// slice 1.3.
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub seed: Option<u64>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+}
+
+/// Output of [`LlmService::complete_chat`]. The proxy maps this into the
+/// OpenAI `ChatCompletionsResponse` shape (id, object, created, model,
+/// choices, usage) — `text` becomes the single choice's message content,
+/// the token counters land in the `usage` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatCompletionResult {
+    pub text: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
