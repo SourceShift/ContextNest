@@ -32,24 +32,82 @@ referenced epic spec is approved and tracked through CHANGELOG.
 Concrete code now in `main`. Listed here so contributors can see what
 the substrate currently exposes without re-reading the commit log.
 
-- **MCP server (Phases 1 → 2 → 3)** — `contextnest mcp serve`
-  advertises **12 tools** over stdio JSON-RPC: `cn_store`,
+- **MCP server (Phases 1 → 4)** — `contextnest mcp serve` advertises
+  **14 tools** over stdio JSON-RPC. Phases 1–3 (`cn_store`,
   `cn_retrieve`, `cn_summarize`, `cn_sessions_list`,
   `cn_session_summary`, `cn_session_trajectory`, `cn_inbox`,
   `cn_features`, `cn_prompt_context_atoms`, `cn_attention`,
-  `cn_session_get`, `cn_session_find`. Closes
-  [`epics/cc-ingest/E-mcp-server.md`](epics/cc-ingest/E-mcp-server.md).
+  `cn_session_get`, `cn_session_find`) closed
+  [`epics/cc-ingest/E-mcp-server.md`](epics/cc-ingest/E-mcp-server.md);
+  Phase 4 added `cn_prompt_context_clusters` and
+  `cn_prompt_context_capsule` after the corresponding HTTP endpoints
+  landed.
 - **Sessions endpoint epic** — `GET /sessions/attention` (per-session
   inbox-eligible aggregate), `GET /sessions/:id` (full grouped detail
   ordered actionable-first), `POST /sessions/find` (NL cosine search
   over goal_phase + session_title). Closes
   [`epics/cc-ingest/E-sessions-endpoint.md`](epics/cc-ingest/E-sessions-endpoint.md).
-- **Prompt-context Phases 1a + 1b** —
+- **v0.4 prompt-context surface — Phases 1a → 1c → 2** —
   `GET /prompt-context/atoms` (deterministic L1 trajectory-atom index
-  across every session) and `GET /prompt-context/clusters` (L1.5 dedup
-  by normalized text; ~88% compression on a real 7030-atom corpus).
-  Deterministic, no LLM — the floor future LLM-distilled capsule
-  phases build on.
+  across every session), `GET /prompt-context/clusters` (L1.5 dedup by
+  normalized text; ~88% compression on a real 7030-atom corpus),
+  `GET /prompt-context/capsule` (L1.5 Markdown digest with kind-priority
+  ordering — `Risks → Decisions → Failures → Verifications → ...` —
+  for paste-into-prompt workflows), plus an opt-in
+  `?semantic=true` paraphrase merge that reuses each fragment's
+  already-stored embedding to collapse near-duplicates at cosine ≥ 0.85.
+  Deterministic floor remains the default; semantic merge gracefully
+  degrades to deterministic when fragments aren't yet hydrated.
+- **Prose-shaped views across HTTP + MCP + CLI** — three substrate
+  read endpoints now support `?format=markdown` with `text/markdown;
+  charset=utf-8` bodies designed for paste-into-prompt and pipe-into-
+  pbcopy workflows: `/prompt-context/capsule`, `/features` (`What did
+  I miss while away`), and `/inbox` (`What needs my attention`, grouped
+  by urgency). Each has a matching MCP tool parameter and a `contextnest
+  <verb> [--markdown|--json]` CLI flag. See "Prose-shaped views" below.
+
+## Prose-shaped views convention
+
+Three current-state read endpoints follow the same access-pattern
+triangle so paste-into-prompt workflows compose identically regardless
+of consumer type:
+
+| Endpoint | HTTP | MCP tool | CLI |
+|---|---|---|---|
+| `/prompt-context/capsule` | `?format=markdown` (default md) | `cn_prompt_context_capsule` | `contextnest prompt-context capsule` |
+| `/features` | `?format=markdown` (default json) | `cn_features` | `contextnest features` (default md, `--json` toggles) |
+| `/inbox` | `?format=markdown` (default json) | `cn_inbox` | `contextnest inbox --markdown` (default terminal text) |
+
+**Substrate rules** (new endpoints should follow these to stay consistent):
+
+1. **HTTP** — accept `?format=markdown` (or `md`); return
+   `text/markdown; charset=utf-8`. Unknown `format` values fall through
+   to JSON. JSON contract must be unchanged when `format` is omitted.
+2. **MCP** — advertise `format` in `inputSchema.properties`; forward it
+   via `collect_query` so an agent passing
+   `{"format": "markdown"}` gets the Markdown body verbatim through the
+   shared `get()` helper's JSON-or-raw-text fallback. **Invariant test
+   pattern**: every MCP tool that uses `collect_query` should ship a
+   `<tool>_def_advertises_*` test asserting every key the handler
+   forwards also appears in `inputSchema.properties` — without it, an
+   MCP agent inspecting the schema can't discover the option even when
+   the handler accepts it.
+3. **CLI** — Markdown rendering lives in the CLI's renderer module
+   alongside `render_text` / `render_json` (or wrapping the substrate's
+   `?format=markdown` body directly when the CLI does no local
+   aggregation). The CLI flag should be either `--markdown` (additive,
+   default = legacy) or default Markdown with `--json` toggling
+   (depending on whether prose or structure is the dominant workflow
+   for that endpoint).
+4. **Body shape** — group by the endpoint's natural priority axis:
+   urgency for `/inbox`, kind-priority for `/capsule`, chronological-
+   newest-first for `/features`. Each item carries a one-line meta
+   tail with kind / session-short / project (last-2 components) / ts.
+5. **Truncation** — multibyte-safe char-count truncation at ~240–280
+   chars per item with an ellipsis. Local helper named `truncate_md`
+   or `truncate_preview` per module; cross-module extraction is worth
+   doing once a fourth caller appears (three exist today and the
+   duplication cost is < the abstraction cost).
 
 ## Future placeholders
 
