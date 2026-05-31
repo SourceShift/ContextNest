@@ -54,6 +54,9 @@ pub fn list_tools() -> Value {
             attention_def(),
             session_get_def(),
             session_find_def(),
+            // Phase 4 — prompt-context aggregation surface.
+            prompt_context_clusters_def(),
+            prompt_context_capsule_def(),
         ]
     })
 }
@@ -256,6 +259,49 @@ fn session_find_def() -> Value {
     })
 }
 
+fn prompt_context_clusters_def() -> Value {
+    json!({
+        "name": "cn_prompt_context_clusters",
+        "description": "Return cross-session trajectory atoms collapsed by normalized text \
+    into clusters. Each cluster carries the unique sessions[] it appeared in, so a cluster \
+    spanning multiple sessions is the deterministic 'promotion' signal — same lesson learned \
+    twice is a real pattern. Sorted by cross-session reach desc.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "One trajectory kind (e.g. decision_made, failure, verification, risk_flag)." },
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "session_id": { "type": "string", "description": "Exact src_session match." },
+                "since": { "type": "string", "description": "Age window (default 30d)." },
+                "min_count": { "type": "integer", "description": "Drop clusters below this count (default 2; 1 to include solo atoms)." },
+                "limit": { "type": "integer", "description": "Max clusters returned (default 50, cap 500)." }
+            }
+        }
+    })
+}
+
+fn prompt_context_capsule_def() -> Value {
+    json!({
+        "name": "cn_prompt_context_capsule",
+        "description": "Return a Markdown prompt-context capsule synthesising the top trajectory \
+    clusters across all sessions, ordered by what a next agent most needs to know first \
+    (Risks → Decisions → Failures → Verifications → Evidence → ...). The body is \
+    paste-ready into another agent's prompt. Optional `query` is a deterministic substring \
+    filter over cluster normalized text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Case-insensitive substring filter on normalized cluster text. Omit to include all." },
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "session_id": { "type": "string", "description": "Exact src_session match." },
+                "since": { "type": "string", "description": "Age window (default 30d)." },
+                "min_count": { "type": "integer", "description": "Drop clusters below this count (default 2)." },
+                "max_per_kind": { "type": "integer", "description": "Cap clusters listed per kind (default 5, cap 25)." }
+            }
+        }
+    })
+}
+
 /// Dispatch a `tools/call` to the matching handler.
 pub async fn call_tool(
     http: &Client,
@@ -279,6 +325,9 @@ pub async fn call_tool(
         "cn_attention" => call_attention(http, base_url, args).await,
         "cn_session_get" => call_session_get(http, base_url, args).await,
         "cn_session_find" => call_session_find(http, base_url, args).await,
+        // Phase 4.
+        "cn_prompt_context_clusters" => call_prompt_context_clusters(http, base_url, args).await,
+        "cn_prompt_context_capsule" => call_prompt_context_capsule(http, base_url, args).await,
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
 }
@@ -362,6 +411,46 @@ async fn call_session_find(http: &Client, base: &str, args: Value) -> Result<Str
     let mut body = json!({ "query": query });
     forward(&mut body, &args, &["project", "since", "limit"]);
     post(http, base, "/api/v1/sessions/find", body).await
+}
+
+async fn call_prompt_context_clusters(
+    http: &Client,
+    base: &str,
+    args: Value,
+) -> Result<String, ToolError> {
+    let q = collect_query(
+        &args,
+        &[
+            "kind",
+            "project",
+            "session_id",
+            "since",
+            "min_count",
+            "limit",
+        ],
+    );
+    get(http, base, "/api/v1/prompt-context/clusters", &q).await
+}
+
+async fn call_prompt_context_capsule(
+    http: &Client,
+    base: &str,
+    args: Value,
+) -> Result<String, ToolError> {
+    // Capsule returns text/markdown; the shared `get` helper's "JSON parse,
+    // else raw text" fallback delivers the Markdown body through verbatim.
+    let q = collect_query(
+        &args,
+        &[
+            "query",
+            "project",
+            "session_id",
+            "since",
+            "min_count",
+            "max_per_kind",
+        ],
+    );
+    get(http, base, "/api/v1/prompt-context/capsule", &q).await
 }
 
 /// Encode a path segment so a stray `/` or `?` in a `session_id` can't
@@ -478,8 +567,8 @@ mod tests {
         let tools = listed["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            12,
-            "3 Phase-1 + 6 Phase-2 + 3 Phase-3 = 12 tools"
+            14,
+            "3 Phase-1 + 6 Phase-2 + 3 Phase-3 + 2 Phase-4 = 14 tools"
         );
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         for expected in [
@@ -495,6 +584,8 @@ mod tests {
             "cn_attention",
             "cn_session_get",
             "cn_session_find",
+            "cn_prompt_context_clusters",
+            "cn_prompt_context_capsule",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -673,6 +764,34 @@ mod tests {
         let err = call_tool(&http, "http://127.0.0.1:1", "cn_attention", json!({}))
             .await
             .expect_err("network must fail at 127.0.0.1:1");
+        assert!(matches!(err, ToolError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn prompt_context_clusters_dispatches_with_optional_args() {
+        let http = Client::new();
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_prompt_context_clusters",
+            json!({ "kind": "decision_made", "min_count": 3, "limit": 10 }),
+        )
+        .await
+        .expect_err("network must fail at 127.0.0.1:1");
+        assert!(matches!(err, ToolError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn prompt_context_capsule_dispatches_with_optional_args() {
+        let http = Client::new();
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_prompt_context_capsule",
+            json!({ "query": "auth", "since": "7d" }),
+        )
+        .await
+        .expect_err("network must fail at 127.0.0.1:1");
         assert!(matches!(err, ToolError::Upstream(_)));
     }
 }
