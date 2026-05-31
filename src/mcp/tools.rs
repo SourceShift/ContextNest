@@ -265,7 +265,9 @@ fn prompt_context_clusters_def() -> Value {
         "description": "Return cross-session trajectory atoms collapsed by normalized text \
     into clusters. Each cluster carries the unique sessions[] it appeared in, so a cluster \
     spanning multiple sessions is the deterministic 'promotion' signal — same lesson learned \
-    twice is a real pattern. Sorted by cross-session reach desc.",
+    twice is a real pattern. Sorted by cross-session reach desc. Set `semantic: true` to also \
+    merge paraphrase clusters via embedding cosine (≥0.85); merged clusters carry a \
+    `merged_from` array listing the absorbed normalized keys.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -274,7 +276,8 @@ fn prompt_context_clusters_def() -> Value {
                 "session_id": { "type": "string", "description": "Exact src_session match." },
                 "since": { "type": "string", "description": "Age window (default 30d)." },
                 "min_count": { "type": "integer", "description": "Drop clusters below this count (default 2; 1 to include solo atoms)." },
-                "limit": { "type": "integer", "description": "Max clusters returned (default 50, cap 500)." }
+                "limit": { "type": "integer", "description": "Max clusters returned (default 50, cap 500)." },
+                "semantic": { "type": "boolean", "description": "When true, additionally merge clusters whose representative embeddings clear cosine ≥ 0.85. Gracefully degrades to deterministic-only when fragment embeddings aren't yet hydrated. Default false." }
             }
         }
     })
@@ -287,7 +290,8 @@ fn prompt_context_capsule_def() -> Value {
     clusters across all sessions, ordered by what a next agent most needs to know first \
     (Risks → Decisions → Failures → Verifications → Evidence → ...). The body is \
     paste-ready into another agent's prompt. Optional `query` is a deterministic substring \
-    filter over cluster normalized text.",
+    filter; optional `semantic: true` adds an embedding-based paraphrase merge pass and \
+    annotates the body header with `· semantic merge ON`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -296,7 +300,8 @@ fn prompt_context_capsule_def() -> Value {
                 "session_id": { "type": "string", "description": "Exact src_session match." },
                 "since": { "type": "string", "description": "Age window (default 30d)." },
                 "min_count": { "type": "integer", "description": "Drop clusters below this count (default 2)." },
-                "max_per_kind": { "type": "integer", "description": "Cap clusters listed per kind (default 5, cap 25)." }
+                "max_per_kind": { "type": "integer", "description": "Cap clusters listed per kind (default 5, cap 25)." },
+                "semantic": { "type": "boolean", "description": "When true, additionally merge clusters whose representative embeddings clear cosine ≥ 0.85. Gracefully degrades when embeddings aren't yet hydrated. Default false." }
             }
         }
     })
@@ -427,6 +432,7 @@ async fn call_prompt_context_clusters(
             "since",
             "min_count",
             "limit",
+            "semantic",
         ],
     );
     get(http, base, "/api/v1/prompt-context/clusters", &q).await
@@ -448,6 +454,7 @@ async fn call_prompt_context_capsule(
             "since",
             "min_count",
             "max_per_kind",
+            "semantic",
         ],
     );
     get(http, base, "/api/v1/prompt-context/capsule", &q).await

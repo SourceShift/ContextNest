@@ -165,6 +165,15 @@ pub enum PromptContextCommands {
         #[arg(long)]
         max_per_kind: Option<usize>,
 
+        /// When set, additionally merge clusters whose representative
+        /// embeddings clear cosine ≥ 0.85 (paraphrase dedup). The capsule
+        /// body's header line gains a `· semantic merge ON` annotation so
+        /// you can confirm the flag took effect. Gracefully degrades to
+        /// deterministic-only when fragment embeddings aren't yet
+        /// hydrated; never errors.
+        #[arg(long)]
+        semantic: bool,
+
         /// Substrate base URL. Falls back to `$CONTEXTNEST_URL`, then
         /// `http://localhost:8080`.
         #[arg(long)]
@@ -371,6 +380,7 @@ mod tests {
                         since,
                         min_count,
                         max_per_kind,
+                        semantic,
                         url,
                     },
             } => {
@@ -380,6 +390,7 @@ mod tests {
                 assert!(since.is_none());
                 assert!(min_count.is_none());
                 assert!(max_per_kind.is_none());
+                assert!(!semantic, "semantic flag must default to false");
                 assert!(url.is_none());
             }
             _ => panic!("expected Commands::PromptContext{{Capsule{{..}}}}"),
@@ -405,6 +416,7 @@ mod tests {
             "3",
             "--max-per-kind",
             "7",
+            "--semantic",
             "--url",
             "http://localhost:28080",
         ])
@@ -419,6 +431,7 @@ mod tests {
                         since,
                         min_count,
                         max_per_kind,
+                        semantic,
                         url,
                     },
             } => {
@@ -428,6 +441,7 @@ mod tests {
                 assert_eq!(since.as_deref(), Some("14d"));
                 assert_eq!(min_count, Some(3));
                 assert_eq!(max_per_kind, Some(7));
+                assert!(semantic, "--semantic flag must parse as true");
                 assert_eq!(url.as_deref(), Some("http://localhost:28080"));
             }
             _ => panic!("expected Commands::PromptContext{{Capsule{{..}}}}"),
