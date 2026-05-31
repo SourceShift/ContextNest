@@ -246,6 +246,102 @@ pub fn render_json(items: &[InboxItem]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(items)
 }
 
+/// Per-item content preview cap when rendering Markdown. Bounds the body
+/// even when an agent emits a multi-line user_action description.
+const INBOX_MD_CONTENT_LIMIT: usize = 280;
+
+/// Group items by urgency (now → soon → later → Unspecified), render as a
+/// paste-ready Markdown digest. Shape is intentionally aligned with the
+/// substrate's `/api/v1/inbox?format=markdown` body (PR #87) so an agent
+/// reading either surface sees the same priority structure — the CLI
+/// renders locally from the per-session aggregation, the substrate renders
+/// from the global fragment_metadata walk, but both bucket the same way.
+/// Pure — no IO.
+pub fn render_markdown(items: &[InboxItem]) -> String {
+    let mut md = String::with_capacity(2 * 1024 + items.len() * 180);
+    md.push_str("# Attention Inbox\n\n");
+    md.push_str(&format!("_{} items_\n\n", items.len()));
+
+    if items.is_empty() {
+        md.push_str("_(no items matched the filters)_\n");
+        return md;
+    }
+
+    // Group by urgency. Items keep their natural CLI sort (per-session
+    // aggregation upstream) inside each bucket because the buckets
+    // dominate the visual hierarchy; finer order doesn't matter once
+    // the priority is correct.
+    let buckets: &[(&str, &str)] = &[
+        ("now", "Now"),
+        ("soon", "Soon"),
+        ("later", "Later"),
+        ("", "Unspecified"),
+    ];
+    let mut grouped: std::collections::HashMap<&str, Vec<&InboxItem>> =
+        std::collections::HashMap::new();
+    for item in items {
+        let key = match item.urgency.as_str() {
+            "now" | "soon" | "later" => item.urgency.as_str(),
+            _ => "",
+        };
+        grouped.entry(key).or_default().push(item);
+    }
+
+    for (bucket_key, heading) in buckets {
+        let Some(group) = grouped.get(*bucket_key) else {
+            continue;
+        };
+        if group.is_empty() {
+            continue;
+        }
+        md.push_str(&format!("## {heading} ({count})\n\n", count = group.len()));
+        for item in group {
+            let preview = truncate_md(&item.content, INBOX_MD_CONTENT_LIMIT);
+            md.push_str(&format!("- {preview}\n"));
+            let session_short: String = item.session_id.chars().take(8).collect();
+            let mut meta_parts: Vec<String> = vec![format!("kind `{}`", item.kind)];
+            meta_parts.push(format!("session `{session_short}`"));
+            if !item.project_cwd.is_empty() {
+                // Trim to last-2 path components for readability.
+                let trimmed: Vec<&str> = item.project_cwd.rsplit('/').take(2).collect();
+                let label = trimmed.into_iter().rev().collect::<Vec<_>>().join("/");
+                meta_parts.push(format!("project `{label}`"));
+            }
+            if !item.timestamp.is_empty() {
+                meta_parts.push(format!("ts {ts}", ts = item.timestamp));
+            }
+            if let Some(step) = item.step {
+                meta_parts.push(format!("step {step}"));
+            }
+            if !item.reason.is_empty() {
+                let reason = truncate_md(&item.reason, INBOX_MD_CONTENT_LIMIT);
+                meta_parts.push(format!("reason: {reason}"));
+            }
+            md.push_str(&format!("  _{}_\n", meta_parts.join(" · ")));
+        }
+        md.push('\n');
+    }
+
+    md
+}
+
+/// Multibyte-safe char-count truncation that collapses newlines into
+/// spaces so a multi-line item stays on one bullet. Mirrors the helper in
+/// `src/api/inbox.rs` and `src/api/sessions.rs`; the three are independent
+/// because each module's local data shape differs slightly. Worth a
+/// cross-module extraction if a fourth caller appears.
+fn truncate_md(s: &str, limit: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= limit {
+        return cleaned;
+    }
+    let head: String = cleaned.chars().take(limit).collect();
+    format!("{head}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +554,106 @@ mod tests {
         assert!(parsed.is_array());
         assert_eq!(parsed.as_array().unwrap().len(), 1);
         assert_eq!(parsed[0]["content"], "a");
+    }
+
+    #[test]
+    fn render_markdown_empty_input_renders_explanation() {
+        let md = render_markdown(&[]);
+        assert!(md.starts_with("# Attention Inbox\n"));
+        assert!(md.contains("0 items"));
+        assert!(md.contains("_(no items matched the filters)_"));
+    }
+
+    #[test]
+    fn render_markdown_buckets_by_urgency_in_priority_order() {
+        // Four items spanning four urgency buckets including missing-urgency.
+        let items: Vec<InboxItem> = vec![
+            InboxItem::from_hit(&user_action_hit(
+                "sess-A12345678",
+                "/repo/x",
+                "Free disk",
+                "now",
+                1,
+                "low space",
+                "2026-05-31T10:00:00Z",
+            ))
+            .unwrap(),
+            InboxItem::from_hit(&user_action_hit(
+                "sess-B12345678",
+                "/repo/y",
+                "Run wrangler login",
+                "soon",
+                2,
+                "auth expires",
+                "2026-05-31T11:00:00Z",
+            ))
+            .unwrap(),
+            InboxItem::from_hit(&user_action_hit(
+                "sess-C12345678",
+                "/repo/z",
+                "Pick a target",
+                "later",
+                3,
+                "no rush",
+                "2026-05-31T12:00:00Z",
+            ))
+            .unwrap(),
+            // Synthesize an Unspecified item by setting urgency to empty.
+            {
+                let mut it = InboxItem::from_hit(&user_action_hit(
+                    "sess-D12345678",
+                    "/repo/w",
+                    "Set token",
+                    "now",
+                    4,
+                    "needed",
+                    "2026-05-31T09:00:00Z",
+                ))
+                .unwrap();
+                it.urgency = String::new();
+                it
+            },
+        ];
+        let md = render_markdown(&items);
+        // All four headings present in priority order.
+        let now_pos = md.find("## Now (1)").expect("now heading");
+        let soon_pos = md.find("## Soon (1)").expect("soon heading");
+        let later_pos = md.find("## Later (1)").expect("later heading");
+        let unspec_pos = md.find("## Unspecified (1)").expect("unspec heading");
+        assert!(now_pos < soon_pos);
+        assert!(soon_pos < later_pos);
+        assert!(later_pos < unspec_pos);
+        // Per-item meta line carries kind, session-short, project (trimmed),
+        // ts, step, reason.
+        assert!(md.contains("Free disk"));
+        assert!(md.contains("kind `user_action`"));
+        assert!(md.contains("session `sess-A12`"));
+        assert!(md.contains("project `repo/x`")); // last-2-components only
+        assert!(md.contains("ts 2026-05-31T10:00:00Z"));
+        assert!(md.contains("step 1"));
+        assert!(md.contains("reason: low space"));
+    }
+
+    #[test]
+    fn render_markdown_truncates_long_content_with_ellipsis() {
+        let mut it = InboxItem::from_hit(&user_action_hit(
+            "sess-E12345678",
+            "/repo/w",
+            "x",
+            "now",
+            1,
+            "r",
+            "t",
+        ))
+        .unwrap();
+        it.content = "x".repeat(500);
+        let md = render_markdown(std::slice::from_ref(&it));
+        // First bullet line ("- ...") is truncated to 280 chars + ellipsis.
+        let first_line = md
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .expect("bullet line");
+        assert!(first_line.ends_with('…'));
+        assert_eq!(first_line.chars().count(), 2 + 280 + 1); // "- " + 280 + "…"
     }
 }

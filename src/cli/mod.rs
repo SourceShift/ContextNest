@@ -77,8 +77,20 @@ pub enum Commands {
 
         /// Machine-readable JSON output instead of the terminal-styled
         /// list. Suitable for `jq` / scripts / piping into other tools.
-        #[arg(long)]
+        /// Mutually exclusive with `--markdown` (last flag wins).
+        #[arg(long, conflicts_with = "markdown")]
         json: bool,
+
+        /// Paste-ready Markdown digest grouped by urgency (now → soon →
+        /// later → Unspecified). Shape mirrors the substrate's
+        /// `/api/v1/inbox?format=markdown` so an agent reading either
+        /// surface sees the same priority structure. Pipe into pbcopy /
+        /// redirect to a file:
+        ///
+        ///   contextnest inbox --markdown | pbcopy
+        ///   contextnest inbox --markdown --urgency now > now.md
+        #[arg(long, conflicts_with = "json")]
+        markdown: bool,
     },
 
     /// Run the Model Context Protocol server so MCP-speaking agents
@@ -537,6 +549,45 @@ mod tests {
                 assert_eq!(url.as_deref(), Some("http://localhost:28080"));
             }
             _ => panic!("expected Commands::Features{{..}}"),
+        }
+    }
+
+    /// `contextnest inbox --markdown` parses and routes to the Inbox
+    /// variant with markdown=true, json=false.
+    #[test]
+    fn inbox_parses_with_markdown_flag() {
+        let cli = Cli::try_parse_from(["contextnest", "inbox", "--markdown"]).expect("must parse");
+        match cli.command {
+            Commands::Inbox { json, markdown, .. } => {
+                assert!(markdown, "--markdown must parse as true");
+                assert!(!json, "--json must default to false");
+            }
+            _ => panic!("expected Commands::Inbox{{..}}"),
+        }
+    }
+
+    /// `--json` and `--markdown` are mutually exclusive via clap
+    /// `conflicts_with`. Passing both must fail at the parser layer.
+    #[test]
+    fn inbox_json_and_markdown_are_mutually_exclusive() {
+        let result = Cli::try_parse_from(["contextnest", "inbox", "--json", "--markdown"]);
+        assert!(
+            result.is_err(),
+            "clap must reject --json + --markdown together"
+        );
+    }
+
+    /// Bare `contextnest inbox` keeps the legacy terminal default —
+    /// both flags false.
+    #[test]
+    fn inbox_default_has_neither_flag_set() {
+        let cli = Cli::try_parse_from(["contextnest", "inbox"]).expect("must parse");
+        match cli.command {
+            Commands::Inbox { json, markdown, .. } => {
+                assert!(!json);
+                assert!(!markdown);
+            }
+            _ => panic!("expected Commands::Inbox{{..}}"),
         }
     }
 }
