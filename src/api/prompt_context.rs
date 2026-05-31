@@ -218,6 +218,65 @@ pub struct ClustersQuery {
     pub min_count: Option<usize>,
     /// Max clusters returned (post-filter, post-sort). Default 50, cap 500.
     pub limit: Option<usize>,
+    /// When true (default false), run an additional post-pass that merges
+    /// clusters with cosine similarity ≥ `SEMANTIC_MERGE_THRESHOLD` on
+    /// their representative fragments' stored embeddings. Catches
+    /// paraphrases the deterministic normalizer misses. Fragments not yet
+    /// hydrated by the consolidation worker have no embedding → silently
+    /// excluded from the merge (graceful degradation, never a 5xx).
+    pub semantic: Option<bool>,
+}
+
+/// Cross-session trajectory cluster shape, shared by `/clusters` (JSON
+/// surface) and `/capsule` (Markdown renderer). Each handler builds its
+/// own `Vec<ClusterAggregate>` from a metadata walk; the optional semantic
+/// merge pass operates on this shape regardless of caller.
+///
+/// `rep_frag_id` is the fragment id whose text is currently the
+/// `representative`. Carried so the semantic merge can fetch the
+/// fragment's stored embedding (`MemoryFragment.content` — load-bearing
+/// naming quirk; `.content` is the embedding vector, NOT the text).
+pub(crate) struct ClusterAggregate {
+    pub kind: String,
+    pub normalized: String,
+    pub representative: String,
+    pub rep_frag_id: String,
+    pub count: usize,
+    pub sessions: std::collections::BTreeSet<String>,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+    /// Set when the semantic merge pass absorbed other clusters into this
+    /// one. Each entry is the normalized text of an absorbed cluster.
+    /// Empty on first-pass clusters and on every cluster when `semantic=false`.
+    pub merged_from: Vec<String>,
+}
+
+impl ClusterAggregate {
+    /// Merge `other` into `self`. Used by the semantic post-pass when two
+    /// clusters' representative embeddings clear the cosine threshold.
+    /// Keeps representative_text as the longer raw variant (most detail);
+    /// sums counts; unions sessions; widens the ts span; records the
+    /// absorbed cluster's normalized text in `merged_from` so callers can
+    /// audit which paraphrases collapsed.
+    pub(crate) fn absorb(&mut self, other: ClusterAggregate) {
+        if other.representative.chars().count() > self.representative.chars().count() {
+            self.representative = other.representative;
+            self.rep_frag_id = other.rep_frag_id;
+        }
+        self.count += other.count;
+        for s in other.sessions {
+            self.sessions.insert(s);
+        }
+        if other.first_ts.is_some() && (self.first_ts.is_none() || other.first_ts < self.first_ts) {
+            self.first_ts = other.first_ts;
+        }
+        if other.last_ts.is_some() && other.last_ts > self.last_ts {
+            self.last_ts = other.last_ts;
+        }
+        // Record the absorbed key + carry any keys it had previously absorbed.
+        self.merged_from.push(other.normalized);
+        self.merged_from.extend(other.merged_from);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +298,12 @@ pub struct TrajectoryCluster {
     pub sessions: Vec<String>,
     pub first_ts: Option<String>,
     pub last_ts: Option<String>,
+    /// When the semantic merge pass absorbed other deterministic clusters
+    /// into this one, their normalized keys are listed here. Omitted from
+    /// the JSON when empty so the response shape is identical for
+    /// deterministic-only and unmerged-cluster cases.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub merged_from: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +318,138 @@ pub struct ClustersResponse {
     /// would return for the same filter set.
     pub atoms_scanned: usize,
     pub clusters: Vec<TrajectoryCluster>,
+}
+
+/// Cosine threshold above which two clusters' representative embeddings
+/// are considered paraphrases of the same insight. Calibrated on
+/// normalized 768-d embeddings; mirrors the `EMBEDDING_CLUSTER_COSINE_THRESHOLD`
+/// constant used elsewhere in the cc-ingest path. Tunable later if the
+/// rate of false-merges (semantically related but distinct decisions
+/// getting collapsed) proves too high.
+const SEMANTIC_MERGE_THRESHOLD: f32 = 0.85;
+
+/// Optional post-pass over deterministic clusters: merges pairs whose
+/// representative fragments' stored embeddings clear the cosine threshold.
+/// Operates per-kind (decisions never merge with failures regardless of
+/// text overlap). Uses union-find so transitively-similar clusters all
+/// land in one bucket.
+///
+/// Failure modes are silent + non-fatal:
+/// - A representative fragment not yet hydrated by the consolidation
+///   worker has no embedding accessible via `attractor_manager.get_fragment`;
+///   that cluster simply doesn't participate in merging and survives as-is.
+/// - The embedding service's `calculate_similarity` returns 0 on
+///   length-mismatch (cross-model contamination) — that cluster pair
+///   never reaches the threshold, so they stay separate. Correct.
+///
+/// O(N²) per kind in cluster count; N is bounded by `min_count` filtering
+/// upstream (typical N < 200 per kind on the live WAL).
+async fn merge_clusters_semantically(
+    services: &crate::services::ContextNestServices,
+    clusters: Vec<ClusterAggregate>,
+) -> Vec<ClusterAggregate> {
+    // Group by kind first — paraphrase merging crosses sessions but never
+    // crosses kinds. A decision and a verification that read similarly are
+    // still semantically distinct prompt-context entries.
+    let mut by_kind: HashMap<String, Vec<ClusterAggregate>> = HashMap::new();
+    for c in clusters {
+        by_kind.entry(c.kind.clone()).or_default().push(c);
+    }
+
+    let mut out: Vec<ClusterAggregate> = Vec::new();
+    for (_kind, group) in by_kind {
+        out.extend(merge_within_kind(services, group).await);
+    }
+    out
+}
+
+async fn merge_within_kind(
+    services: &crate::services::ContextNestServices,
+    mut group: Vec<ClusterAggregate>,
+) -> Vec<ClusterAggregate> {
+    let n = group.len();
+    if n < 2 {
+        return group;
+    }
+
+    // Fetch each representative's embedding. None for any cluster whose
+    // representative fragment isn't in the attractor manager yet (cold-
+    // substrate / sidecar-only state) — those rows simply skip the merge.
+    let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(n);
+    for c in &group {
+        let emb = match services
+            .attractor_manager
+            .get_fragment(&c.rep_frag_id)
+            .await
+        {
+            Ok(Some(f)) => Some(f.content),
+            _ => None,
+        };
+        embeddings.push(emb);
+    }
+
+    // Union-find with path compression (iterative — no recursive borrow).
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]]; // path halving
+            i = parent[i];
+        }
+        i
+    }
+
+    // Pairwise cosine — symmetric, so only the upper triangle is needed.
+    // The j-loop indexes embeddings AND parent (union-find), so the
+    // straightforward range-index form is more readable than the clippy-
+    // suggested `.iter().enumerate()` rewrite.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let Some(ei) = embeddings[i].as_ref() else {
+            continue;
+        };
+        for j in (i + 1)..n {
+            let Some(ej) = embeddings[j].as_ref() else {
+                continue;
+            };
+            let sim = services.embedding.calculate_similarity(ei, ej);
+            if sim >= SEMANTIC_MERGE_THRESHOLD {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    // Collect indices per root. For determinism, sort indices within a
+    // group ascending so the survivor is always the lowest-index member
+    // (which itself is ordered by HashMap iteration of (kind, normalized);
+    // the merge order doesn't affect the final aggregate because absorb()
+    // is associative on the fields that survive).
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+
+    // Move each cluster into an Option so we can take() by index without
+    // disturbing the Vec layout. After this, we discard `group`.
+    let mut slot: Vec<Option<ClusterAggregate>> = group.drain(..).map(Some).collect();
+    let mut merged: Vec<ClusterAggregate> = Vec::with_capacity(groups.len());
+    for (_, mut indices) in groups {
+        indices.sort_unstable();
+        let mut iter = indices.into_iter();
+        let first_idx = iter.next().expect("group is non-empty");
+        let mut base = slot[first_idx].take().expect("first slot present");
+        for idx in iter {
+            if let Some(other) = slot[idx].take() {
+                base.absorb(other);
+            }
+        }
+        merged.push(base);
+    }
+    merged
 }
 
 /// Lowercase + replace any non-alphanumeric run with a single space, trim.
@@ -297,20 +494,10 @@ pub async fn list_clusters(
         .unwrap_or(CLUSTERS_DEFAULT_LIMIT)
         .min(CLUSTERS_MAX_LIMIT);
 
-    struct ClusterAcc {
-        kind: String,
-        normalized: String,
-        representative: String,
-        count: usize,
-        sessions: std::collections::BTreeSet<String>,
-        first_ts: Option<String>,
-        last_ts: Option<String>,
-    }
-
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
 
-    let mut clusters: HashMap<(String, String), ClusterAcc> = HashMap::new();
+    let mut clusters: HashMap<(String, String), ClusterAggregate> = HashMap::new();
     let mut atoms_scanned: usize = 0;
 
     for (frag_id, meta) in metadata.iter() {
@@ -356,22 +543,27 @@ pub async fn list_clusters(
         }
         atoms_scanned += 1;
         let key = (kind.to_string(), normalized.clone());
-        let acc = clusters.entry(key).or_insert_with(|| ClusterAcc {
+        let acc = clusters.entry(key).or_insert_with(|| ClusterAggregate {
             kind: kind.to_string(),
             normalized,
             representative: text.clone(),
+            rep_frag_id: frag_id.clone(),
             count: 0,
             sessions: std::collections::BTreeSet::new(),
             first_ts: None,
             last_ts: None,
+            merged_from: Vec::new(),
         });
         acc.count += 1;
         if !session_id.is_empty() {
             acc.sessions.insert(session_id);
         }
         // Representative = longest text seen so far (most detail).
+        // When representative swaps, rep_frag_id swaps too so the semantic
+        // merge pass fetches the embedding of the actual representative.
         if text.chars().count() > acc.representative.chars().count() {
             acc.representative = text;
+            acc.rep_frag_id = frag_id.clone();
         }
         if let Some(ts) = ts_str {
             if acc.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
@@ -385,9 +577,21 @@ pub async fn list_clusters(
     drop(texts);
     drop(metadata);
 
-    let mut out: Vec<TrajectoryCluster> = clusters
+    // Deterministic filter first; the optional semantic merge then operates
+    // on the already-promoted survivors (saves embedding lookups + keeps
+    // the cluster_count math clear).
+    let deterministic: Vec<ClusterAggregate> = clusters
         .into_values()
         .filter(|c| c.count >= min_count)
+        .collect();
+    let after_semantic = if q.semantic.unwrap_or(false) {
+        merge_clusters_semantically(&services, deterministic).await
+    } else {
+        deterministic
+    };
+
+    let mut out: Vec<TrajectoryCluster> = after_semantic
+        .into_iter()
         .map(|c| TrajectoryCluster {
             kind: c.kind,
             representative_text: c.representative,
@@ -396,6 +600,7 @@ pub async fn list_clusters(
             sessions: c.sessions.into_iter().collect(),
             first_ts: c.first_ts,
             last_ts: c.last_ts,
+            merged_from: c.merged_from,
         })
         .collect();
 
@@ -487,6 +692,11 @@ pub struct CapsuleQuery {
     pub min_count: Option<usize>,
     /// Max clusters listed per kind. Default 5, cap 25.
     pub max_per_kind: Option<usize>,
+    /// When true (default false), also merge clusters whose representative
+    /// fragments' embeddings clear the cosine threshold — catches
+    /// paraphrases the normalizer misses. See `merge_clusters_semantically`
+    /// for failure semantics (graceful degradation, never 5xx).
+    pub semantic: Option<bool>,
 }
 
 pub async fn render_capsule(
@@ -503,17 +713,9 @@ pub async fn render_capsule(
         .min(CAPSULE_MAX_PER_KIND_CAP);
     let query_lower = q.query.as_deref().map(str::to_lowercase);
 
-    struct ClusterRow {
-        kind: String,
-        normalized: String,
-        representative: String,
-        count: usize,
-        sessions: std::collections::BTreeSet<String>,
-    }
-
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
-    let mut acc: HashMap<(String, String), ClusterRow> = HashMap::new();
+    let mut acc: HashMap<(String, String), ClusterAggregate> = HashMap::new();
     let mut atoms_scanned: usize = 0;
 
     for (frag_id, meta) in metadata.iter() {
@@ -522,7 +724,8 @@ pub async fn render_capsule(
         if !CAPSULE_KIND_ORDER.iter().any(|(k, _)| *k == kind) {
             continue;
         }
-        if let Some(ts) = meta.get("ts").and_then(|v| v.as_str()) {
+        let ts_str = meta.get("ts").and_then(|v| v.as_str());
+        if let Some(ts) = ts_str {
             if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
                 if parsed.with_timezone(&chrono::Utc) < cutoff {
                     continue;
@@ -558,12 +761,16 @@ pub async fn render_capsule(
         atoms_scanned += 1;
         let row = acc
             .entry((kind.to_string(), normalized.clone()))
-            .or_insert_with(|| ClusterRow {
+            .or_insert_with(|| ClusterAggregate {
                 kind: kind.to_string(),
                 normalized,
                 representative: text.clone(),
+                rep_frag_id: frag_id.clone(),
                 count: 0,
                 sessions: std::collections::BTreeSet::new(),
+                first_ts: None,
+                last_ts: None,
+                merged_from: Vec::new(),
             });
         row.count += 1;
         if !session_id.is_empty() {
@@ -571,15 +778,34 @@ pub async fn render_capsule(
         }
         if text.chars().count() > row.representative.chars().count() {
             row.representative = text;
+            row.rep_frag_id = frag_id.clone();
+        }
+        if let Some(ts) = ts_str {
+            if row.first_ts.as_deref().map(|cur| ts < cur).unwrap_or(true) {
+                row.first_ts = Some(ts.to_string());
+            }
+            if row.last_ts.as_deref().map(|cur| ts > cur).unwrap_or(true) {
+                row.last_ts = Some(ts.to_string());
+            }
         }
     }
     drop(texts);
     drop(metadata);
 
-    // Group by kind, drop below min_count, rank within kind.
-    let mut by_kind: HashMap<String, Vec<ClusterRow>> = HashMap::new();
+    // Drop singletons below min_count, then optionally semantic-merge.
+    let deterministic: Vec<ClusterAggregate> =
+        acc.into_values().filter(|c| c.count >= min_count).collect();
+    let semantic_on = q.semantic.unwrap_or(false);
+    let surviving = if semantic_on {
+        merge_clusters_semantically(&services, deterministic).await
+    } else {
+        deterministic
+    };
+
+    // Group by kind, rank within kind, cap per kind.
+    let mut by_kind: HashMap<String, Vec<ClusterAggregate>> = HashMap::new();
     let mut total_clusters: usize = 0;
-    for (_, row) in acc.into_iter().filter(|(_, r)| r.count >= min_count) {
+    for row in surviving {
         by_kind.entry(row.kind.clone()).or_default().push(row);
         total_clusters += 1;
     }
@@ -605,6 +831,9 @@ pub async fn render_capsule(
     }
     if let Some(qy) = q.query.as_deref() {
         md.push_str(&format!(" · query ~ `{qy}`"));
+    }
+    if semantic_on {
+        md.push_str(" · semantic merge ON");
     }
     md.push_str(&format!(
         " · scanned {atoms_scanned} atoms, {total_clusters} clusters_"
@@ -963,6 +1192,7 @@ mod tests {
                 since: None,
                 min_count: None, // default 2
                 limit: None,
+                semantic: None,
             }),
         )
         .await
@@ -1001,6 +1231,7 @@ mod tests {
                 since: None,
                 min_count: Some(1),
                 limit: None,
+                semantic: None,
             }),
         )
         .await
@@ -1028,6 +1259,7 @@ mod tests {
                 since: None,
                 min_count: None,
                 limit: None,
+                semantic: None,
             }),
         )
         .await
@@ -1082,6 +1314,7 @@ mod tests {
                 query: None,
                 min_count: Some(1), // surface BOTH the decision cluster and the solo failure
                 max_per_kind: None,
+                semantic: None,
             }),
         )
         .await
@@ -1127,6 +1360,7 @@ mod tests {
                 query: Some("cargo".into()),
                 min_count: Some(1),
                 max_per_kind: None,
+                semantic: None,
             }),
         )
         .await
@@ -1154,6 +1388,7 @@ mod tests {
                 query: Some("__no_such_substring__".into()),
                 min_count: Some(1),
                 max_per_kind: None,
+                semantic: None,
             }),
         )
         .await
@@ -1162,5 +1397,112 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(md.contains("# Prompt Context"));
         assert!(md.contains("(no clusters matched the filters)"));
+    }
+
+    #[test]
+    fn cluster_aggregate_absorb_unions_sessions_and_picks_longest_rep() {
+        let mut a = ClusterAggregate {
+            kind: "decision_made".into(),
+            normalized: "always run cargo fmt".into(),
+            representative: "Always run cargo fmt".into(),
+            rep_frag_id: "fA".into(),
+            count: 2,
+            sessions: ["S1".to_string(), "S2".to_string()].into_iter().collect(),
+            first_ts: Some("2026-05-01T00:00:00Z".into()),
+            last_ts: Some("2026-05-10T00:00:00Z".into()),
+            merged_from: Vec::new(),
+        };
+        let b = ClusterAggregate {
+            kind: "decision_made".into(),
+            normalized: "run cargo fmt always to fix formatting".into(),
+            // Longer raw text — must win representative + rep_frag_id swap.
+            representative: "Run cargo fmt always — fixes formatting drift across the repo".into(),
+            rep_frag_id: "fB".into(),
+            count: 3,
+            sessions: ["S2".to_string(), "S3".to_string()].into_iter().collect(),
+            first_ts: Some("2026-04-15T00:00:00Z".into()), // earlier
+            last_ts: Some("2026-05-20T00:00:00Z".into()),  // later
+            merged_from: vec!["earlier-absorbed".into()],
+        };
+        a.absorb(b);
+        // Longest text wins.
+        assert!(a.representative.starts_with("Run cargo fmt always"));
+        assert_eq!(a.rep_frag_id, "fB");
+        // Counts sum.
+        assert_eq!(a.count, 5);
+        // Sessions union (S1 + S2 + S3; BTreeSet keeps unique + sorted).
+        let sessions_vec: Vec<_> = a.sessions.iter().cloned().collect();
+        assert_eq!(sessions_vec, vec!["S1", "S2", "S3"]);
+        // ts span widens both directions.
+        assert_eq!(a.first_ts.as_deref(), Some("2026-04-15T00:00:00Z"));
+        assert_eq!(a.last_ts.as_deref(), Some("2026-05-20T00:00:00Z"));
+        // merged_from records absorbed normalized + carries its prior list.
+        assert_eq!(
+            a.merged_from,
+            vec![
+                "run cargo fmt always to fix formatting".to_string(),
+                "earlier-absorbed".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clusters_semantic_true_returns_at_least_as_few_as_deterministic() {
+        // No fragments have embeddings hydrated in the attractor manager
+        // for a `new_default()` test substrate, so the semantic merge pass
+        // gracefully degrades to a no-op. The invariant verified here is
+        // that semantic=true never INCREASES cluster count vs deterministic
+        // — it should be ≤, regardless of whether embeddings are available.
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_clusters_corpus(&services).await;
+
+        let det = list_clusters(
+            State(services.clone()),
+            Query(ClustersQuery {
+                kind: None,
+                project: None,
+                session_id: None,
+                since: None,
+                min_count: Some(1),
+                limit: None,
+                semantic: Some(false),
+            }),
+        )
+        .await
+        .expect("ok det")
+        .0;
+
+        let sem = list_clusters(
+            State(services),
+            Query(ClustersQuery {
+                kind: None,
+                project: None,
+                session_id: None,
+                since: None,
+                min_count: Some(1),
+                limit: None,
+                semantic: Some(true),
+            }),
+        )
+        .await
+        .expect("ok sem")
+        .0;
+
+        assert!(
+            sem.count <= det.count,
+            "semantic={sem_count} must not exceed deterministic={det_count}",
+            sem_count = sem.count,
+            det_count = det.count
+        );
+        // No fragments are hydrated → no merges happened → counts are equal
+        // AND no cluster carries a `merged_from`. (This is the cold-substrate
+        // graceful-degradation case codified.)
+        assert_eq!(sem.count, det.count);
+        for c in &sem.clusters {
+            assert!(
+                c.merged_from.is_empty(),
+                "cold substrate must not produce merged_from entries"
+            );
+        }
     }
 }
