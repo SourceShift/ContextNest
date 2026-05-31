@@ -174,12 +174,15 @@ fn features_def() -> Value {
         "name": "cn_features",
         "description": "Return the cross-session feature inventory — named deliverables \
     shipped per session, with files, refs, layer, and replay recipe (how_to_test). Use \
-    to answer 'what shipped recently' or 'which session built X'.",
+    to answer 'what shipped recently' or 'which session built X'. Pass `format: \
+    \"markdown\"` to get a paste-ready Markdown digest instead of JSON.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "since": { "type": "string", "description": "Age window (default 24h, e.g. 7d, 90m)." },
-                "layer": { "type": "string", "description": "Optional layer filter (frontend|backend|infra|docs|tests|other)." }
+                "layer": { "type": "string", "description": "Optional layer filter (frontend|backend|infra|docs|tests|other)." },
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "format": { "type": "string", "description": "`json` (default) or `markdown` for a paste-ready prose body." }
             }
         }
     })
@@ -387,7 +390,10 @@ async fn call_inbox(http: &Client, base: &str) -> Result<String, ToolError> {
 }
 
 async fn call_features(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
-    let q = collect_query(&args, &["since", "layer"]);
+    // `format=markdown` returns text/markdown; the shared `get` helper's
+    // JSON-or-raw-text fallback delivers the Markdown body verbatim
+    // (same passthrough that `cn_prompt_context_capsule` relies on).
+    let q = collect_query(&args, &["since", "layer", "project", "format"]);
     get(http, base, "/api/v1/features", &q).await
 }
 
@@ -724,16 +730,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn features_def_advertises_project_and_format_params() {
+        // The inputSchema must list every key the handler forwards via
+        // `collect_query`, otherwise an MCP agent inspecting the schema
+        // can't discover the new options.
+        let listed = list_tools();
+        let tools = listed["tools"].as_array().expect("tools array");
+        let features = tools
+            .iter()
+            .find(|t| t["name"] == "cn_features")
+            .expect("cn_features advertised");
+        let props = features["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties object");
+        for required in ["since", "layer", "project", "format"] {
+            assert!(
+                props.contains_key(required),
+                "cn_features inputSchema missing `{required}`"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn features_optional_args_round_trip_through_dispatch() {
         let http = Client::new();
-        // since/layer are optional; passing them must still dispatch and only
-        // fail at the network step.
+        // Pass all four optional args (since/layer/project/format) — they
+        // must dispatch and only fail at the network step, proving
+        // collect_query forwards every key the new schema advertises.
         let err = call_tool(
             &http,
             "http://127.0.0.1:1",
             "cn_features",
-            json!({ "since": "7d", "layer": "backend" }),
+            json!({
+                "since": "7d",
+                "layer": "backend",
+                "project": "ContextNest",
+                "format": "markdown",
+            }),
         )
         .await
         .expect_err("network must fail at 127.0.0.1:1");
