@@ -12,6 +12,7 @@ pub use crate::services::HealthStatus;
 pub mod cc_hooks;
 pub mod field;
 pub mod inbox;
+pub mod llm_proxy;
 pub mod middleware;
 pub mod prompt_context;
 pub mod server;
