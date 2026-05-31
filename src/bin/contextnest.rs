@@ -51,7 +51,72 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => inbox(project, urgency, substrate, session_id, json).await,
         Commands::Mcp { action } => mcp(action).await,
         Commands::PromptContext { action } => prompt_context(action).await,
+        Commands::Features {
+            since,
+            layer,
+            project,
+            json,
+            url,
+        } => features(since, layer, project, json, url).await,
     }
+}
+
+/// Dispatch the `features` subcommand. Calls `GET /api/v1/features` with
+/// the requested filters; Markdown by default (server-rendered via
+/// `?format=markdown`), JSON via `--json`. Markdown body streams to
+/// stdout verbatim; JSON is pretty-printed for terminal readability and
+/// `jq`-pipe ergonomics.
+async fn features(
+    since: Option<String>,
+    layer: Option<String>,
+    project: Option<String>,
+    json_mode: bool,
+    url: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = url
+        .or_else(|| std::env::var("CONTEXTNEST_URL").ok())
+        .unwrap_or_else(|| "http://localhost:8080".to_string());
+    let endpoint = format!("{}/api/v1/features", base.trim_end_matches('/'));
+    let mut query_pairs: Vec<(&str, String)> = Vec::new();
+    if let Some(v) = since.as_deref() {
+        query_pairs.push(("since", v.to_string()));
+    }
+    if let Some(v) = layer.as_deref() {
+        query_pairs.push(("layer", v.to_string()));
+    }
+    if let Some(v) = project.as_deref() {
+        query_pairs.push(("project", v.to_string()));
+    }
+    if !json_mode {
+        query_pairs.push(("format", "markdown".to_string()));
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&endpoint)
+        .query(&query_pairs)
+        .send()
+        .await
+        .map_err(|e| format!("GET {endpoint} failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading features body from {endpoint} failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("substrate {endpoint} returned {status}: {body}").into());
+    }
+    if json_mode {
+        // Pretty-print for terminal readability; trailing newline so
+        // shell prompts render cleanly.
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(body)),
+            Err(_) => print!("{body}"),
+        }
+    } else {
+        // Markdown body already carries trailing newlines.
+        print!("{body}");
+    }
+    Ok(())
 }
 
 /// Dispatch the `mcp` subcommand. Resolves the substrate base URL from the

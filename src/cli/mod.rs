@@ -100,6 +100,40 @@ pub enum Commands {
         #[command(subcommand)]
         action: PromptContextCommands,
     },
+
+    /// List features the substrate has seen agents ship — across every
+    /// session — and render as Markdown (default) or JSON. The "what did
+    /// I miss while away" workflow:
+    ///
+    ///   contextnest features --since 24h | pbcopy
+    ///   contextnest features --since 7d --layer backend
+    ///   contextnest features --project ContextNest --json | jq
+    Features {
+        /// Age window (default `24h`). Format: `<n>{m,h,d}`.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Layer filter (case-insensitive: backend / frontend / infra /
+        /// docs / tests / other). Matches the `layer` field on the
+        /// agent's `delivered_features[]` z-insight entries.
+        #[arg(long)]
+        layer: Option<String>,
+
+        /// Substring match on `project_cwd`.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Switch from Markdown stdout (default — pipe into pbcopy /
+        /// redirect to file / paste into prompt) to raw JSON (suitable
+        /// for `jq`).
+        #[arg(long)]
+        json: bool,
+
+        /// Substrate base URL. Falls back to `$CONTEXTNEST_URL`, then
+        /// `http://localhost:8080`.
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 /// MCP server modes. v0.x ships only the stdio transport (the standard
@@ -445,6 +479,64 @@ mod tests {
                 assert_eq!(url.as_deref(), Some("http://localhost:28080"));
             }
             _ => panic!("expected Commands::PromptContext{{Capsule{{..}}}}"),
+        }
+    }
+
+    /// `contextnest features` with no flags must parse to the Features
+    /// variant with json defaulting to false (Markdown is the default).
+    #[test]
+    fn features_parses_with_no_flags() {
+        let cli = Cli::try_parse_from(["contextnest", "features"]).expect("must parse");
+        match cli.command {
+            Commands::Features {
+                since,
+                layer,
+                project,
+                json,
+                url,
+            } => {
+                assert!(since.is_none());
+                assert!(layer.is_none());
+                assert!(project.is_none());
+                assert!(!json, "json must default to false (Markdown is default)");
+                assert!(url.is_none());
+            }
+            _ => panic!("expected Commands::Features{{..}}"),
+        }
+    }
+
+    /// All flags + the `--json` toggle threads through correctly.
+    #[test]
+    fn features_parses_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "contextnest",
+            "features",
+            "--since",
+            "7d",
+            "--layer",
+            "backend",
+            "--project",
+            "ContextNest",
+            "--json",
+            "--url",
+            "http://localhost:28080",
+        ])
+        .expect("must parse");
+        match cli.command {
+            Commands::Features {
+                since,
+                layer,
+                project,
+                json,
+                url,
+            } => {
+                assert_eq!(since.as_deref(), Some("7d"));
+                assert_eq!(layer.as_deref(), Some("backend"));
+                assert_eq!(project.as_deref(), Some("ContextNest"));
+                assert!(json, "--json flag must parse as true");
+                assert_eq!(url.as_deref(), Some("http://localhost:28080"));
+            }
+            _ => panic!("expected Commands::Features{{..}}"),
         }
     }
 }
