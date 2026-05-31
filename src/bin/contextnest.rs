@@ -9,7 +9,7 @@
 
 use clap::Parser;
 use contextnest::api::create_app;
-use contextnest::cli::{Cli, Commands, IngestSource, McpCommands};
+use contextnest::cli::{Cli, Commands, IngestSource, McpCommands, PromptContextCommands};
 use contextnest::config::Config;
 use contextnest::inbox::{render_json, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
@@ -50,6 +50,7 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => inbox(project, urgency, substrate, session_id, json).await,
         Commands::Mcp { action } => mcp(action).await,
+        Commands::PromptContext { action } => prompt_context(action).await,
     }
 }
 
@@ -63,6 +64,72 @@ async fn mcp(action: McpCommands) -> Result<(), Box<dyn std::error::Error>> {
                 .or_else(|| std::env::var("CONTEXTNEST_URL").ok())
                 .unwrap_or_else(|| "http://localhost:8080".to_string());
             contextnest::mcp::McpServer::new(base).serve_stdio().await
+        }
+    }
+}
+
+/// Dispatch the `prompt-context` subcommand. Currently only `capsule` —
+/// fetches `GET /api/v1/prompt-context/capsule` with the provided filters
+/// and prints the Markdown body to stdout. Logs / errors are written to
+/// stderr (init_logging is called WITHOUT log_to_stderr mode for this
+/// command, but `eprintln!` still goes to stderr), so the user can pipe
+/// stdout into `pbcopy` / a file without polluting the output.
+async fn prompt_context(action: PromptContextCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        PromptContextCommands::Capsule {
+            query,
+            project,
+            session_id,
+            since,
+            min_count,
+            max_per_kind,
+            url,
+        } => {
+            let base = url
+                .or_else(|| std::env::var("CONTEXTNEST_URL").ok())
+                .unwrap_or_else(|| "http://localhost:8080".to_string());
+            let endpoint = format!(
+                "{}/api/v1/prompt-context/capsule",
+                base.trim_end_matches('/')
+            );
+            let mut query_pairs: Vec<(&str, String)> = Vec::new();
+            if let Some(v) = query.as_deref() {
+                query_pairs.push(("query", v.to_string()));
+            }
+            if let Some(v) = project.as_deref() {
+                query_pairs.push(("project", v.to_string()));
+            }
+            if let Some(v) = session_id.as_deref() {
+                query_pairs.push(("session_id", v.to_string()));
+            }
+            if let Some(v) = since.as_deref() {
+                query_pairs.push(("since", v.to_string()));
+            }
+            if let Some(v) = min_count {
+                query_pairs.push(("min_count", v.to_string()));
+            }
+            if let Some(v) = max_per_kind {
+                query_pairs.push(("max_per_kind", v.to_string()));
+            }
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(&endpoint)
+                .query(&query_pairs)
+                .send()
+                .await
+                .map_err(|e| format!("GET {endpoint} failed: {e}"))?;
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| format!("reading capsule body from {endpoint} failed: {e}"))?;
+            if !status.is_success() {
+                return Err(format!("substrate {endpoint} returned {status}: {body}").into());
+            }
+            // Markdown body to stdout. Single newline already on the body
+            // from the renderer; no extra `println!` newline needed.
+            print!("{body}");
+            Ok(())
         }
     }
 }
