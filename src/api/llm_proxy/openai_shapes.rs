@@ -294,6 +294,80 @@ pub struct Usage {
 }
 
 // =============================================================================
+// Embeddings request / response
+// =============================================================================
+
+/// `POST /v1/embeddings` request body. `input` is the polymorphic field
+/// the OpenAI SDK accepts in four shapes: a single string, an array of
+/// strings, a single token-id array, or an array of token-id arrays.
+/// Slice 1.3b accepts the two text-string shapes; token-id arrays
+/// return 400 (the underlying `EmbeddingService` operates on text).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingsRequest {
+    /// Model identifier from the caller. The proxy forwards to the
+    /// substrate's configured embedder regardless; the response's
+    /// `model` field reports the substrate's actual model so the
+    /// caller sees no fidelity lie.
+    pub model: String,
+    /// String, string-array, token-id-array, or array-of-token-id-arrays
+    /// per OpenAI's spec. The handler validates which variant landed.
+    pub input: EmbeddingsInput,
+    /// `"float"` (default — Vec<f32> in response) or `"base64"`. v0.3
+    /// slice 1.3b ships float only; base64 returns 501.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    /// Provider-specific override for the embedding dimensionality
+    /// (some embedder models support trimmed dimensions). Forwarded to
+    /// the substrate which currently ignores it — slice 1.3c will
+    /// surface this through to the EmbeddingService if multi-model
+    /// support lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Polymorphic `input` field. Untagged enum accepts the four shapes
+/// OpenAI's SDK emits.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Text(String),
+    Texts(Vec<String>),
+    TokenIds(Vec<u32>),
+    TokenIdsBatch(Vec<Vec<u32>>),
+}
+
+/// `POST /v1/embeddings` response body.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EmbeddingsResponse {
+    /// Always `"list"`.
+    pub object: String,
+    pub data: Vec<EmbeddingEntry>,
+    /// The model that actually ran. May differ from
+    /// `EmbeddingsRequest.model` when the proxy substitutes the
+    /// substrate's configured embedder — by design, so callers can
+    /// audit fidelity from the response itself.
+    pub model: String,
+    pub usage: EmbeddingsUsage,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EmbeddingEntry {
+    /// Always `"embedding"`.
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EmbeddingsUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+// =============================================================================
 // Tests — round-trip fixtures from real SDK request/response bodies
 // =============================================================================
 
