@@ -428,11 +428,242 @@ pub async fn list_clusters(
     }))
 }
 
+// =============================================================================
+// `GET /api/v1/prompt-context/capsule` — Phase 1c markdown digest renderer.
+//
+// Reads the same cluster aggregation as `/clusters` but renders it as a
+// Markdown document an agent can paste directly into another agent's
+// prompt. No LLM, still deterministic — the value is in the SHAPE: kind
+// headings ordered by what a next agent most needs to know first
+// (risk_flags + decisions + failures before evidence_refs + artifacts),
+// each section capped at `max_per_kind` clusters, ranked by cross-session
+// reach desc (the deterministic promotion signal).
+//
+// Optional `?query=<text>` is a deterministic substring filter — agents
+// asking "what do I know about auth?" get only clusters whose normalized
+// text contains "auth". Substring match keeps the no-LLM principle;
+// semantic filtering earns the LLM call once usage proves substring is
+// insufficient.
+//
+// Content-Type: `text/markdown; charset=utf-8` so an HTTP client treats
+// the body as already-formatted prose rather than re-encoding it as JSON.
+// =============================================================================
+
+/// Kinds ordered by "what should the next agent be told first" — risks +
+/// decisions + failures lead because they shape behaviour; verifications +
+/// evidence + reads follow because they ground claims; artifacts and
+/// assumptions are weakest signal so they come last. Anything not listed
+/// is dropped from the capsule (out of scope for prompt context).
+const CAPSULE_KIND_ORDER: &[(&str, &str)] = &[
+    ("risk_flag", "Risks"),
+    ("decision_made", "Decisions"),
+    ("failure", "Failures to avoid"),
+    ("prompt_directive", "Prompt directives"),
+    ("memory_candidate", "Candidate long-term memories"),
+    ("verification", "Verifications run"),
+    ("evidence_ref", "Evidence references"),
+    ("read_context", "Files / docs read"),
+    ("assumption", "Assumptions in play"),
+    ("artifact", "Artifacts produced"),
+];
+
+const CAPSULE_DEFAULT_MAX_PER_KIND: usize = 5;
+const CAPSULE_MAX_PER_KIND_CAP: usize = 25;
+const CAPSULE_DEFAULT_MIN_COUNT: usize = 2;
+const CAPSULE_DEFAULT_SINCE: &str = "30d";
+/// Per-line preview cap so the capsule stays under ~8KB even with the cap
+/// at 25 entries × 10 kinds. Mirrors `FIND_MATCH_TEXT_LIMIT` in sessions.
+const CAPSULE_LINE_LIMIT: usize = 240;
+
+#[derive(Debug, Deserialize)]
+pub struct CapsuleQuery {
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub since: Option<String>,
+    /// Deterministic substring filter (case-insensitive) over a cluster's
+    /// normalized text. Omit to include all clusters.
+    pub query: Option<String>,
+    /// Drop clusters whose total count is below this. Default 2.
+    pub min_count: Option<usize>,
+    /// Max clusters listed per kind. Default 5, cap 25.
+    pub max_per_kind: Option<usize>,
+}
+
+pub async fn render_capsule(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<CapsuleQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    let since_raw = q.since.as_deref().unwrap_or(CAPSULE_DEFAULT_SINCE);
+    let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::days(30));
+    let cutoff = chrono::Utc::now() - dur;
+    let min_count = q.min_count.unwrap_or(CAPSULE_DEFAULT_MIN_COUNT).max(1);
+    let max_per_kind = q
+        .max_per_kind
+        .unwrap_or(CAPSULE_DEFAULT_MAX_PER_KIND)
+        .min(CAPSULE_MAX_PER_KIND_CAP);
+    let query_lower = q.query.as_deref().map(str::to_lowercase);
+
+    struct ClusterRow {
+        kind: String,
+        normalized: String,
+        representative: String,
+        count: usize,
+        sessions: std::collections::BTreeSet<String>,
+    }
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+    let mut acc: HashMap<(String, String), ClusterRow> = HashMap::new();
+    let mut atoms_scanned: usize = 0;
+
+    for (frag_id, meta) in metadata.iter() {
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        // Only the capsule-relevant kinds (subset of TRAJECTORY_KINDS).
+        if !CAPSULE_KIND_ORDER.iter().any(|(k, _)| *k == kind) {
+            continue;
+        }
+        if let Some(ts) = meta.get("ts").and_then(|v| v.as_str()) {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if parsed.with_timezone(&chrono::Utc) < cutoff {
+                    continue;
+                }
+            }
+        }
+        if let Some(want) = q.project.as_deref() {
+            match meta.get("project_cwd").and_then(|v| v.as_str()) {
+                Some(p) if p.contains(want) => {}
+                _ => continue,
+            }
+        }
+        let session_id = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if let Some(want) = q.session_id.as_deref() {
+            if session_id != want {
+                continue;
+            }
+        }
+        let text = texts.get(frag_id).cloned().unwrap_or_default();
+        let normalized = normalize_text(&text);
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Some(want) = query_lower.as_deref() {
+            if !normalized.contains(want) {
+                continue;
+            }
+        }
+        atoms_scanned += 1;
+        let row = acc
+            .entry((kind.to_string(), normalized.clone()))
+            .or_insert_with(|| ClusterRow {
+                kind: kind.to_string(),
+                normalized,
+                representative: text.clone(),
+                count: 0,
+                sessions: std::collections::BTreeSet::new(),
+            });
+        row.count += 1;
+        if !session_id.is_empty() {
+            row.sessions.insert(session_id);
+        }
+        if text.chars().count() > row.representative.chars().count() {
+            row.representative = text;
+        }
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Group by kind, drop below min_count, rank within kind.
+    let mut by_kind: HashMap<String, Vec<ClusterRow>> = HashMap::new();
+    let mut total_clusters: usize = 0;
+    for (_, row) in acc.into_iter().filter(|(_, r)| r.count >= min_count) {
+        by_kind.entry(row.kind.clone()).or_default().push(row);
+        total_clusters += 1;
+    }
+    for rows in by_kind.values_mut() {
+        rows.sort_by(|a, b| {
+            b.sessions
+                .len()
+                .cmp(&a.sessions.len())
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.normalized.cmp(&b.normalized))
+        });
+        rows.truncate(max_per_kind);
+    }
+
+    // Render markdown. Use String::with_capacity for the worst case.
+    let mut md = String::with_capacity(8 * 1024);
+    md.push_str("# Prompt Context\n\n");
+    md.push_str(&format!(
+        "_Window: last {since_raw} · min_count {min_count} · max_per_kind {max_per_kind}"
+    ));
+    if let Some(p) = q.project.as_deref() {
+        md.push_str(&format!(" · project ~ `{p}`"));
+    }
+    if let Some(qy) = q.query.as_deref() {
+        md.push_str(&format!(" · query ~ `{qy}`"));
+    }
+    md.push_str(&format!(
+        " · scanned {atoms_scanned} atoms, {total_clusters} clusters_"
+    ));
+    md.push_str("\n\n");
+
+    if total_clusters == 0 {
+        md.push_str("_(no clusters matched the filters)_\n");
+    } else {
+        for (kind_key, heading) in CAPSULE_KIND_ORDER {
+            let Some(rows) = by_kind.get(*kind_key) else {
+                continue;
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("## {heading}\n\n"));
+            for row in rows {
+                let preview = truncate_preview(&row.representative, CAPSULE_LINE_LIMIT);
+                md.push_str(&format!(
+                    "- {preview} _({} session{}, count {})_\n",
+                    row.sessions.len(),
+                    if row.sessions.len() == 1 { "" } else { "s" },
+                    row.count
+                ));
+            }
+            md.push('\n');
+        }
+    }
+
+    let resp = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/markdown; charset=utf-8")
+        .body(axum::body::Body::from(md))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(resp)
+}
+
+/// Truncate `s` to at most `limit` chars (not bytes — multibyte-safe),
+/// appending an ellipsis when truncation actually happened. Also collapses
+/// embedded newlines into spaces so a multi-line atom stays on one bullet.
+fn truncate_preview(s: &str, limit: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= limit {
+        return cleaned;
+    }
+    let truncated: String = cleaned.chars().take(limit).collect();
+    format!("{truncated}…")
+}
+
 /// Build the prompt-context router. Mounted in `create_simple_app`.
 pub fn create_prompt_context_router() -> Router<ContextNestServices> {
     Router::new()
         .route("/api/v1/prompt-context/atoms", get(list_atoms))
         .route("/api/v1/prompt-context/clusters", get(list_clusters))
+        .route("/api/v1/prompt-context/capsule", get(render_capsule))
 }
 
 #[cfg(test)]
@@ -802,5 +1033,134 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn truncate_preview_collapses_newlines_and_caps_length() {
+        // Short input: passes through, no ellipsis.
+        assert_eq!(truncate_preview("hello", 10), "hello");
+        // Newlines collapse to spaces.
+        assert_eq!(truncate_preview("a\nb\rc", 10), "a b c");
+        // Long input: truncated + ellipsis (counts in chars not bytes).
+        let long = "x".repeat(300);
+        let out = truncate_preview(&long, 240);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 241);
+        // Multibyte safety: 300 emoji → take 240 of them + ellipsis.
+        let emoji_long = "🦀".repeat(300);
+        let out2 = truncate_preview(&emoji_long, 240);
+        assert!(out2.ends_with('…'));
+        assert_eq!(out2.chars().count(), 241);
+    }
+
+    async fn read_capsule_body(resp: axum::response::Response) -> (StatusCode, String, String) {
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8(body_bytes.to_vec()).expect("utf-8 body");
+        (status, content_type, body)
+    }
+
+    #[tokio::test]
+    async fn capsule_renders_markdown_with_kind_priority_order() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_clusters_corpus(&services).await;
+
+        let resp = render_capsule(
+            State(services),
+            Query(CapsuleQuery {
+                project: None,
+                session_id: None,
+                since: None,
+                query: None,
+                min_count: Some(1), // surface BOTH the decision cluster and the solo failure
+                max_per_kind: None,
+            }),
+        )
+        .await
+        .expect("ok");
+        let (status, ct, md) = read_capsule_body(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            ct.starts_with("text/markdown"),
+            "expected text/markdown, got {ct}"
+        );
+        // The header + meta line.
+        assert!(md.starts_with("# Prompt Context\n"));
+        assert!(md.contains("_Window: last 30d"));
+        // Both sections present.
+        assert!(md.contains("## Decisions"));
+        assert!(md.contains("## Failures to avoid"));
+        // Decisions section MUST appear before Failures (priority ordering).
+        let dec_pos = md.find("## Decisions").expect("decisions section");
+        let fail_pos = md.find("## Failures to avoid").expect("failures section");
+        assert!(
+            dec_pos < fail_pos,
+            "decisions ({dec_pos}) must precede failures ({fail_pos})"
+        );
+        // Cluster row carries session + count metadata.
+        assert!(md.contains("(3 sessions, count 3)"));
+        assert!(md.contains("(1 session, count 1)"));
+    }
+
+    #[tokio::test]
+    async fn capsule_query_substring_filters_clusters() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_clusters_corpus(&services).await;
+
+        // The decision cluster's normalized text is "always run cargo fmt";
+        // the failure cluster is "lone failure that nobody else hit".
+        // Query "cargo" matches only the first.
+        let resp = render_capsule(
+            State(services),
+            Query(CapsuleQuery {
+                project: None,
+                session_id: None,
+                since: None,
+                query: Some("cargo".into()),
+                min_count: Some(1),
+                max_per_kind: None,
+            }),
+        )
+        .await
+        .expect("ok");
+        let (status, _, md) = read_capsule_body(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(md.contains("## Decisions"), "decisions kept");
+        assert!(
+            !md.contains("## Failures to avoid"),
+            "failure cluster must be filtered out by `cargo` substring"
+        );
+    }
+
+    #[tokio::test]
+    async fn capsule_with_no_matches_renders_explanatory_body() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        seed_clusters_corpus(&services).await;
+
+        let resp = render_capsule(
+            State(services),
+            Query(CapsuleQuery {
+                project: None,
+                session_id: None,
+                since: None,
+                query: Some("__no_such_substring__".into()),
+                min_count: Some(1),
+                max_per_kind: None,
+            }),
+        )
+        .await
+        .expect("ok");
+        let (status, _, md) = read_capsule_body(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(md.contains("# Prompt Context"));
+        assert!(md.contains("(no clusters matched the filters)"));
     }
 }
