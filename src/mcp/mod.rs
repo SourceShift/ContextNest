@@ -205,7 +205,10 @@ mod tests {
             .await
             .expect("respond");
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 12, "3 Phase-1 + 6 Phase-2 + 3 Phase-3 = 12 tools");
+        assert_eq!(
+            tools, 14,
+            "3 Phase-1 + 6 Phase-2 + 3 Phase-3 + 2 Phase-4 = 14 tools"
+        );
     }
 
     #[tokio::test]
