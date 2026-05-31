@@ -88,6 +88,18 @@ pub enum Commands {
         #[command(subcommand)]
         action: McpCommands,
     },
+
+    /// Query the substrate's `prompt-context` surface — the deterministic
+    /// L1 / L1.5 read layer over trajectory atoms (decisions, failures,
+    /// verifications, risks, ...). Pairs cleanly with shell pipes:
+    ///
+    ///   contextnest prompt-context capsule --query auth | pbcopy
+    ///   contextnest prompt-context capsule --since 7d > .claude/ctx.md
+    #[command(name = "prompt-context")]
+    PromptContext {
+        #[command(subcommand)]
+        action: PromptContextCommands,
+    },
 }
 
 /// MCP server modes. v0.x ships only the stdio transport (the standard
@@ -105,6 +117,54 @@ pub enum McpCommands {
     ///     "env": { "CONTEXTNEST_URL": "http://localhost:28080" }
     ///   }
     Serve {
+        /// Substrate base URL. Falls back to `$CONTEXTNEST_URL`, then
+        /// `http://localhost:8080`.
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+/// `prompt-context` subcommand modes. Currently exposes only `capsule`
+/// because the JSON `/atoms` and `/clusters` surfaces are already easy to
+/// consume via `curl` and `jq`; the Markdown capsule is the one that
+/// genuinely benefits from a CLI shortcut (paste-into-prompt workflow).
+#[derive(Subcommand)]
+pub enum PromptContextCommands {
+    /// Print a Markdown prompt-context capsule to stdout. Body shape and
+    /// kind ordering match `GET /api/v1/prompt-context/capsule`. Stdout
+    /// carries the Markdown; logs and errors go to stderr — so a pipe
+    /// into `pbcopy` or redirect into a file gives you ONLY the capsule.
+    ///
+    /// Examples:
+    ///   contextnest prompt-context capsule
+    ///   contextnest prompt-context capsule --query auth --since 14d
+    ///   contextnest prompt-context capsule --project ContextNest > ctx.md
+    Capsule {
+        /// Case-insensitive substring filter on cluster normalized text.
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Substring match on the project_cwd metadata.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Scope to a single src_session UUID.
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Age window suffix (`30d`, `24h`, `90m`). Default: `30d`.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Drop clusters whose total count is below this. Default: 2.
+        /// Set to 1 to include solo-occurrence atoms.
+        #[arg(long)]
+        min_count: Option<usize>,
+
+        /// Cap clusters listed per kind. Default: 5, max: 25.
+        #[arg(long)]
+        max_per_kind: Option<usize>,
+
         /// Substrate base URL. Falls back to `$CONTEXTNEST_URL`, then
         /// `http://localhost:8080`.
         #[arg(long)]
@@ -286,6 +346,91 @@ impl std::str::FromStr for BuildTarget {
             "debug" => Ok(BuildTarget::Debug),
             "release" => Ok(BuildTarget::Release),
             _ => Err(CliError::Config(format!("Unknown build target: {}", s))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `contextnest prompt-context capsule` with no flags must parse and
+    /// route to the Capsule variant with every option `None`.
+    #[test]
+    fn prompt_context_capsule_parses_with_no_flags() {
+        let cli =
+            Cli::try_parse_from(["contextnest", "prompt-context", "capsule"]).expect("must parse");
+        match cli.command {
+            Commands::PromptContext {
+                action:
+                    PromptContextCommands::Capsule {
+                        query,
+                        project,
+                        session_id,
+                        since,
+                        min_count,
+                        max_per_kind,
+                        url,
+                    },
+            } => {
+                assert!(query.is_none());
+                assert!(project.is_none());
+                assert!(session_id.is_none());
+                assert!(since.is_none());
+                assert!(min_count.is_none());
+                assert!(max_per_kind.is_none());
+                assert!(url.is_none());
+            }
+            _ => panic!("expected Commands::PromptContext{{Capsule{{..}}}}"),
+        }
+    }
+
+    /// All flags carry through to the parsed variant.
+    #[test]
+    fn prompt_context_capsule_parses_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "contextnest",
+            "prompt-context",
+            "capsule",
+            "--query",
+            "auth",
+            "--project",
+            "ContextNest",
+            "--session-id",
+            "sid-xyz",
+            "--since",
+            "14d",
+            "--min-count",
+            "3",
+            "--max-per-kind",
+            "7",
+            "--url",
+            "http://localhost:28080",
+        ])
+        .expect("must parse");
+        match cli.command {
+            Commands::PromptContext {
+                action:
+                    PromptContextCommands::Capsule {
+                        query,
+                        project,
+                        session_id,
+                        since,
+                        min_count,
+                        max_per_kind,
+                        url,
+                    },
+            } => {
+                assert_eq!(query.as_deref(), Some("auth"));
+                assert_eq!(project.as_deref(), Some("ContextNest"));
+                assert_eq!(session_id.as_deref(), Some("sid-xyz"));
+                assert_eq!(since.as_deref(), Some("14d"));
+                assert_eq!(min_count, Some(3));
+                assert_eq!(max_per_kind, Some(7));
+                assert_eq!(url.as_deref(), Some("http://localhost:28080"));
+            }
+            _ => panic!("expected Commands::PromptContext{{Capsule{{..}}}}"),
         }
     }
 }
