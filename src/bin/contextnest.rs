@@ -83,6 +83,7 @@ async fn prompt_context(action: PromptContextCommands) -> Result<(), Box<dyn std
             since,
             min_count,
             max_per_kind,
+            semantic,
             url,
         } => {
             let base = url
@@ -110,6 +111,10 @@ async fn prompt_context(action: PromptContextCommands) -> Result<(), Box<dyn std
             }
             if let Some(v) = max_per_kind {
                 query_pairs.push(("max_per_kind", v.to_string()));
+            }
+            // Only forward `semantic` when set — substrate default is off.
+            if semantic {
+                query_pairs.push(("semantic", "true".to_string()));
             }
             let client = reqwest::Client::new();
             let resp = client
