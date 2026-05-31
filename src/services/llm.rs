@@ -259,6 +259,24 @@ impl LlmService {
         !matches!(*self.inner, LlmProvider::Disabled)
     }
 
+    /// Identifier for the configured provider, suitable for the
+    /// `owned_by` field of OpenAI's `/models` endpoint or any other
+    /// caller that wants to display "what's actually wired up". Returns
+    /// `None` when the service is [`LlmProvider::Disabled`].
+    ///
+    /// The string values are stable identifiers — clients can pattern-
+    /// match against them — so they live on this method rather than
+    /// being derived from `Debug` impls.
+    pub fn provider_kind(&self) -> Option<&'static str> {
+        match &*self.inner {
+            LlmProvider::Disabled => None,
+            LlmProvider::Anthropic { .. } => Some("anthropic"),
+            LlmProvider::OpenAi { .. } => Some("openai"),
+            LlmProvider::Google { .. } => Some("google"),
+            LlmProvider::Custom { .. } => Some("custom"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Core operations
     // -----------------------------------------------------------------------
