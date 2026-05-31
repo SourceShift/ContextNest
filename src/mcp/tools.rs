@@ -164,8 +164,18 @@ fn inbox_def() -> Value {
         "name": "cn_inbox",
         "description": "Return the cross-session attention inbox — todos and user_actions \
     that still need attention, ranked by urgency. Use to discover what's blocking the \
-    user across all projects.",
-        "inputSchema": { "type": "object", "properties": {} }
+    user across all projects. Pass `format: \"markdown\"` for a paste-ready digest grouped \
+    by urgency (now / soon / later / unspecified).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": { "type": "string", "description": "Substring match on project_cwd." },
+                "urgency": { "type": "string", "description": "One of `now`/`soon`/`later`. Case-insensitive." },
+                "kind": { "type": "string", "description": "One of `user_action`/`todo`/`decision`." },
+                "limit": { "type": "integer", "description": "Max items returned (capped at 500)." },
+                "format": { "type": "string", "description": "`json` (default) or `markdown`." }
+            }
+        }
     })
 }
 
@@ -326,7 +336,7 @@ pub async fn call_tool(
         "cn_sessions_list" => call_sessions_list(http, base_url).await,
         "cn_session_summary" => call_session_summary(http, base_url, args).await,
         "cn_session_trajectory" => call_session_trajectory(http, base_url, args).await,
-        "cn_inbox" => call_inbox(http, base_url).await,
+        "cn_inbox" => call_inbox(http, base_url, args).await,
         "cn_features" => call_features(http, base_url, args).await,
         "cn_prompt_context_atoms" => call_prompt_context_atoms(http, base_url, args).await,
         // Phase 3.
@@ -385,8 +395,11 @@ async fn call_session_trajectory(
     get(http, base, &path, &[]).await
 }
 
-async fn call_inbox(http: &Client, base: &str) -> Result<String, ToolError> {
-    get(http, base, "/api/v1/inbox", &[]).await
+async fn call_inbox(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
+    // `format=markdown` returns text/markdown; the shared `get` helper's
+    // JSON-or-raw-text fallback delivers the Markdown body verbatim.
+    let q = collect_query(&args, &["project", "urgency", "kind", "limit", "format"]);
+    get(http, base, "/api/v1/inbox", &q).await
 }
 
 async fn call_features(http: &Client, base: &str, args: Value) -> Result<String, ToolError> {
@@ -766,6 +779,47 @@ mod tests {
                 "since": "7d",
                 "layer": "backend",
                 "project": "ContextNest",
+                "format": "markdown",
+            }),
+        )
+        .await
+        .expect_err("network must fail at 127.0.0.1:1");
+        assert!(matches!(err, ToolError::Upstream(_)));
+    }
+
+    #[test]
+    fn inbox_def_advertises_filter_and_format_params() {
+        // Same schema-invariant as the features test: every key the
+        // handler forwards must be discoverable in the inputSchema.
+        let listed = list_tools();
+        let tools = listed["tools"].as_array().expect("tools array");
+        let inbox = tools
+            .iter()
+            .find(|t| t["name"] == "cn_inbox")
+            .expect("cn_inbox advertised");
+        let props = inbox["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties object");
+        for required in ["project", "urgency", "kind", "limit", "format"] {
+            assert!(
+                props.contains_key(required),
+                "cn_inbox inputSchema missing `{required}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_filter_args_round_trip_through_dispatch() {
+        let http = Client::new();
+        let err = call_tool(
+            &http,
+            "http://127.0.0.1:1",
+            "cn_inbox",
+            json!({
+                "project": "ContextNest",
+                "urgency": "now",
+                "kind": "user_action",
+                "limit": 20,
                 "format": "markdown",
             }),
         )
