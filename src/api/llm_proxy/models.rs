@@ -52,15 +52,24 @@ pub struct ModelsListResponse {
 const CANONICAL_CREATED_TS: i64 = 1_704_067_200; // 2024-01-01T00:00:00Z
 
 /// `GET /llm/v1/models` handler.
+///
+/// Reports the UNION of canonical model lists for every provider the
+/// substrate currently has configured. With slice 1.3c's multi-provider
+/// routing, a substrate carrying both `ANTHROPIC_API_KEY` and
+/// `OPENAI_API_KEY` exposes BOTH providers' models — the client can
+/// then send a request with `model: "gpt-4o"` or `model:
+/// "claude-3-5-sonnet-latest"` and the proxy routes accordingly.
 pub async fn list_models(State(services): State<ContextNestServices>) -> Json<ModelsListResponse> {
-    let data = match services.llm.provider_kind() {
-        None => Vec::new(),
-        Some("openai") => openai_models(),
-        Some("anthropic") => anthropic_models(),
-        Some("google") => google_models(),
-        Some("custom") => custom_models(),
-        Some(_) => Vec::new(), // unreachable; provider_kind returns the four cases above
-    };
+    let mut data: Vec<ModelEntry> = Vec::new();
+    for kind in services.llm.configured_provider_kinds() {
+        match kind {
+            "openai" => data.extend(openai_models()),
+            "anthropic" => data.extend(anthropic_models()),
+            "google" => data.extend(google_models()),
+            "custom" => data.extend(custom_models()),
+            _ => {} // unreachable; configured_provider_kinds emits the four cases
+        }
+    }
     Json(ModelsListResponse {
         object: "list",
         data,
