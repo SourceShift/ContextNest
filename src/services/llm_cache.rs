@@ -360,18 +360,46 @@ pub struct LlmCacheService {
     /// `None` here means "in-memory only" mode (matches pre-2.5
     /// behaviour exactly — useful for tests and offline CI).
     wal: Option<Arc<tokio::sync::OnceCell<crate::services::wal::Wal>>>,
+    /// Optional AES-256-GCM key for encrypting cache payloads on
+    /// disk. Set via [`Self::with_encryption`] when the operator has
+    /// configured `CONTEXTNEST_LLM_CACHE_ENCRYPTION_KEY`. `None`
+    /// means cache entries land in WAL as plaintext (Phase 2
+    /// behaviour). Toggling this between runs:
+    ///   - on -> off: existing encrypted entries skip during replay
+    ///     with a `warn!`; cache reverts to plaintext for new inserts
+    ///   - off -> on: plaintext entries continue to replay (forward-
+    ///     compat); new inserts ship encrypted to the same WAL
+    ///
+    /// In both directions the substrate continues to serve cached
+    /// responses for entries it can still read.
+    encryption: Option<Arc<ring::aead::LessSafeKey>>,
 }
 
 impl LlmCacheService {
     /// Construct with roadmap defaults: threshold 0.92, TTL 3600s.
-    /// No WAL persistence — call [`Self::with_wal`] to enable.
+    /// No WAL persistence and no encryption — call [`Self::with_wal`]
+    /// and [`Self::with_encryption`] to enable.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(LlmCacheInner::new())),
             similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
             default_ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             wal: None,
+            encryption: None,
         }
+    }
+
+    /// Attach an AES-256-GCM encryption key. When set, every WAL
+    /// `LlmCacheInsert` ships the embedding + response JSON as a
+    /// `CachePayload::AesGcm` envelope; the exact-prefix fields stay
+    /// cleartext (the HashMap lookup happens before decryption).
+    pub fn with_encryption(mut self, key: Arc<ring::aead::LessSafeKey>) -> Self {
+        self.encryption = Some(key);
+        self
+    }
+
+    pub fn encryption_enabled(&self) -> bool {
+        self.encryption.is_some()
     }
 
     /// Override the cosine-similarity threshold. `1.0` requires exact
@@ -415,7 +443,7 @@ impl LlmCacheService {
     ///
     /// Returns the number of entries that were replayed back in.
     pub fn replay(&self, records: &[crate::services::wal::WalRecord], now_unix_secs: u64) -> usize {
-        use crate::services::wal::WalRecord;
+        use crate::services::wal::{CachePayload, WalRecord};
 
         let now_instant = Instant::now();
         let default_ttl_secs = self.default_ttl.as_secs();
@@ -428,9 +456,8 @@ impl LlmCacheService {
                 model,
                 temperature_bucket,
                 system_prompt_hash,
-                embedding,
-                response_json,
                 inserted_at_unix_secs,
+                payload,
             } = record
             else {
                 continue;
@@ -443,14 +470,61 @@ impl LlmCacheService {
                 continue;
             }
 
-            let response: ChatCompletionsResponse = match serde_json::from_str(response_json) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "llm_cache replay: failed to parse stored response_json; skipping entry"
-                    );
-                    continue;
+            let prefix = ExactKeyPrefix {
+                project_id: project_id.clone(),
+                model: model.clone(),
+                temperature_bucket: *temperature_bucket,
+                system_prompt_hash: *system_prompt_hash,
+            };
+
+            let (embedding, response): (Vec<f32>, ChatCompletionsResponse) = match payload {
+                CachePayload::Plaintext {
+                    embedding,
+                    response_json,
+                } => match serde_json::from_str::<ChatCompletionsResponse>(response_json) {
+                    Ok(r) => (embedding.clone(), r),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "llm_cache replay: failed to parse stored response_json; skipping entry"
+                        );
+                        continue;
+                    }
+                },
+                CachePayload::AesGcm { nonce, ciphertext } => {
+                    let Some(enc_key) = self.encryption.as_ref() else {
+                        tracing::warn!(
+                            "llm_cache replay: encrypted entry on disk but no encryption key configured; skipping entry"
+                        );
+                        continue;
+                    };
+                    let aad = prefix.fingerprint();
+                    let blob = crate::services::llm_cache_crypto::EncryptedBlob {
+                        nonce: *nonce,
+                        ciphertext: ciphertext.clone(),
+                    };
+                    let plain = match crate::services::llm_cache_crypto::decrypt_with_aad(
+                        enc_key, &blob, &aad,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "llm_cache replay: decryption failed (wrong key or tampered ciphertext); skipping entry"
+                            );
+                            continue;
+                        }
+                    };
+                    match decode_encrypted_payload(&plain) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "llm_cache replay: malformed plaintext after decryption; skipping entry"
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
 
@@ -458,14 +532,8 @@ impl LlmCacheService {
                 .checked_sub(Duration::from_secs(age_secs))
                 .unwrap_or(now_instant);
 
-            let prefix = ExactKeyPrefix {
-                project_id: project_id.clone(),
-                model: model.clone(),
-                temperature_bucket: *temperature_bucket,
-                system_prompt_hash: *system_prompt_hash,
-            };
             let entry = CacheEntry {
-                embedding: embedding.clone(),
+                embedding,
                 response,
                 inserted_at,
                 hit_count: 0,
@@ -568,14 +636,47 @@ impl LlmCacheService {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let response_json = serde_json::to_string(&response).unwrap_or_default();
+            let payload = match self.encryption.as_ref() {
+                None => crate::services::wal::CachePayload::Plaintext {
+                    embedding: key.semantic_embedding.clone(),
+                    response_json,
+                },
+                Some(enc_key) => {
+                    // Encrypt the (embedding, response_json) pair as one
+                    // sealed blob. AAD binds to the entry's exact prefix
+                    // so a ciphertext can't be replayed into another
+                    // bucket. On encryption failure, fall back to
+                    // plaintext + warn! — never silently drop the
+                    // insert, never silently lose persistence.
+                    let plain = encode_encrypted_payload(&key.semantic_embedding, &response_json);
+                    let aad = key.exact.fingerprint();
+                    match crate::services::llm_cache_crypto::encrypt_with_aad(enc_key, &plain, &aad)
+                    {
+                        Ok(blob) => crate::services::wal::CachePayload::AesGcm {
+                            nonce: blob.nonce,
+                            ciphertext: blob.ciphertext,
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "llm_cache: encryption failed; falling back to plaintext WAL write"
+                            );
+                            crate::services::wal::CachePayload::Plaintext {
+                                embedding: key.semantic_embedding.clone(),
+                                response_json,
+                            }
+                        }
+                    }
+                }
+            };
             crate::services::wal::WalRecord::LlmCacheInsert {
                 project_id: key.exact.project_id.clone(),
                 model: key.exact.model.clone(),
                 temperature_bucket: key.exact.temperature_bucket,
                 system_prompt_hash: key.exact.system_prompt_hash,
-                embedding: key.semantic_embedding.clone(),
-                response_json: serde_json::to_string(&response).unwrap_or_default(),
                 inserted_at_unix_secs,
+                payload,
             }
         });
 
@@ -634,11 +735,72 @@ impl std::fmt::Debug for LlmCacheService {
             .field("similarity_threshold", &self.similarity_threshold)
             .field("default_ttl_secs", &self.default_ttl.as_secs())
             .field("wal_attached", &self.wal.is_some())
+            .field("encryption_enabled", &self.encryption.is_some())
             .field("total_entries", &stats.total_entries)
             .field("total_hits", &stats.total_hits)
             .field("total_misses", &stats.total_misses)
             .finish()
     }
+}
+
+/// Encode an `(embedding, response_json)` pair into a single byte
+/// buffer for AEAD encryption. Format:
+///
+///   [embedding_len_u32_le][embedding_bytes...][response_json_utf8_bytes...]
+///
+/// The embedding bytes are little-endian f32 IEEE-754. We don't
+/// need a response_json length prefix because it's the tail.
+/// Format version is implicit in the WAL `CachePayload::AesGcm`
+/// variant tag — bumping it means adding a new variant.
+fn encode_encrypted_payload(embedding: &[f32], response_json: &str) -> Vec<u8> {
+    let emb_byte_len = std::mem::size_of_val(embedding);
+    let mut out = Vec::with_capacity(4 + emb_byte_len + response_json.len());
+    out.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
+    for v in embedding {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(response_json.as_bytes());
+    out
+}
+
+/// Decode the inverse of [`encode_encrypted_payload`]. Returns
+/// `Err(&'static str)` on malformed input — callers must downgrade
+/// to a skip-with-warn rather than panic.
+fn decode_encrypted_payload(
+    bytes: &[u8],
+) -> Result<
+    (
+        Vec<f32>,
+        crate::api::llm_proxy::openai_shapes::ChatCompletionsResponse,
+    ),
+    &'static str,
+> {
+    if bytes.len() < 4 {
+        return Err("plaintext too short for length prefix");
+    }
+    let mut len_buf = [0u8; 4];
+    len_buf.copy_from_slice(&bytes[..4]);
+    let emb_len = u32::from_le_bytes(len_buf) as usize;
+    let emb_byte_len = emb_len.checked_mul(4).ok_or("embedding length overflow")?;
+    let needed = 4_usize
+        .checked_add(emb_byte_len)
+        .ok_or("embedding offset overflow")?;
+    if bytes.len() < needed {
+        return Err("plaintext shorter than encoded embedding length");
+    }
+    let mut embedding = Vec::with_capacity(emb_len);
+    for i in 0..emb_len {
+        let off = 4 + i * 4;
+        let mut f_buf = [0u8; 4];
+        f_buf.copy_from_slice(&bytes[off..off + 4]);
+        embedding.push(f32::from_le_bytes(f_buf));
+    }
+    let json_bytes = &bytes[needed..];
+    let json_str =
+        std::str::from_utf8(json_bytes).map_err(|_| "response_json is not valid UTF-8")?;
+    let response: crate::api::llm_proxy::openai_shapes::ChatCompletionsResponse =
+        serde_json::from_str(json_str).map_err(|_| "response_json is not valid OpenAI shape")?;
+    Ok((embedding, response))
 }
 
 #[cfg(test)]
@@ -1126,9 +1288,11 @@ mod tests {
             model: model.to_string(),
             temperature_bucket: bucket,
             system_prompt_hash: sys_hash,
-            embedding,
-            response_json: serde_json::to_string(&dummy_response(response_id)).unwrap(),
             inserted_at_unix_secs: now.saturating_sub(age_secs),
+            payload: crate::services::wal::CachePayload::Plaintext {
+                embedding,
+                response_json: serde_json::to_string(&dummy_response(response_id)).unwrap(),
+            },
         }
     }
 
@@ -1234,9 +1398,11 @@ mod tests {
             model: "m".into(),
             temperature_bucket: 14,
             system_prompt_hash: prefix_hash,
-            embedding: vec![1.0, 0.0],
-            response_json: "{not valid json".into(),
             inserted_at_unix_secs: now.saturating_sub(5),
+            payload: crate::services::wal::CachePayload::Plaintext {
+                embedding: vec![1.0, 0.0],
+                response_json: "{not valid json".into(),
+            },
         }];
         let restored = cache.replay(&records, now);
         assert_eq!(restored, 0);
@@ -1252,9 +1418,11 @@ mod tests {
             model: "gpt-4o-mini".into(),
             temperature_bucket: 14,
             system_prompt_hash: [1, 2, 3, 4, 5, 6, 7, 8],
-            embedding: vec![0.1, 0.2, 0.3],
-            response_json: r#"{"id":"x"}"#.into(),
             inserted_at_unix_secs: 1717000000,
+            payload: crate::services::wal::CachePayload::Plaintext {
+                embedding: vec![0.1, 0.2, 0.3],
+                response_json: r#"{"id":"x"}"#.into(),
+            },
         };
         let line = serde_json::to_string(&original).expect("serialise");
         // Pin the `op` tag value — old binaries discriminating on `op`
@@ -1275,6 +1443,184 @@ mod tests {
         assert!(
             dbg.contains("wal_attached: true"),
             "Debug must reflect WAL attachment; got: {dbg}"
+        );
+    }
+
+    // =========================================================================
+    // Encryption tests (slice 3.1)
+    // =========================================================================
+
+    fn test_encryption_key() -> Arc<ring::aead::LessSafeKey> {
+        let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &[7u8; 32]).unwrap();
+        Arc::new(ring::aead::LessSafeKey::new(unbound))
+    }
+
+    #[test]
+    fn encoded_payload_round_trips() {
+        let emb = vec![1.0f32, 2.0, 3.0, -0.5, 0.0];
+        let resp = dummy_response("resp-roundtrip");
+        let json = serde_json::to_string(&resp).unwrap();
+        let bytes = encode_encrypted_payload(&emb, &json);
+        let (out_emb, out_resp) = decode_encrypted_payload(&bytes).expect("decode");
+        assert_eq!(out_emb, emb);
+        assert_eq!(out_resp.id, resp.id);
+    }
+
+    #[test]
+    fn encoded_payload_rejects_truncated_input() {
+        let err = decode_encrypted_payload(&[]).unwrap_err();
+        assert!(err.contains("too short"));
+        let err = decode_encrypted_payload(&[0; 3]).unwrap_err();
+        assert!(err.contains("too short"));
+    }
+
+    #[test]
+    fn encoded_payload_rejects_length_overflow() {
+        // Embedding length claims a value far larger than the
+        // remaining buffer — must not panic, must surface as an
+        // error.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(1_000_000u32).to_le_bytes());
+        bytes.extend_from_slice(b"short");
+        let err = decode_encrypted_payload(&bytes).unwrap_err();
+        assert!(err.contains("shorter than encoded embedding length"));
+    }
+
+    #[test]
+    fn insert_with_encryption_writes_aes_gcm_payload_to_wal() {
+        // Wire up WAL + encryption in a tempfile, insert, read back
+        // raw WAL, verify the on-disk record is the AesGcm variant
+        // (NOT plaintext). This is the load-bearing test: it pins
+        // that encrypted mode actually encrypts.
+        use crate::services::wal::{CachePayload, Wal, WalRecord};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.jsonl");
+
+        let wal_cell: Arc<tokio::sync::OnceCell<Wal>> = Arc::new(tokio::sync::OnceCell::new());
+        let writer = Wal::open_for_append(wal_path.clone()).unwrap();
+        wal_cell.set(writer).unwrap();
+
+        let cache = LlmCacheService::new()
+            .with_wal(wal_cell)
+            .with_encryption(test_encryption_key());
+        assert!(cache.encryption_enabled());
+
+        let key = derive_cache_key(
+            "p",
+            "gpt-4o",
+            Some(0.7),
+            "you are helpful",
+            vec![0.1, 0.2, 0.3],
+        );
+        cache.insert(key.clone(), dummy_response("encrypted-resp"));
+
+        let records = Wal::read_records(&wal_path).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            WalRecord::LlmCacheInsert { payload, .. } => match payload {
+                CachePayload::AesGcm { nonce, ciphertext } => {
+                    assert_eq!(nonce.len(), 12, "GCM nonce is 96 bits");
+                    assert!(!ciphertext.is_empty());
+                    // Ciphertext must NOT contain "encrypted-resp" — if
+                    // it does, we're shipping plaintext on the encrypted
+                    // path which is the failure mode this test guards.
+                    let plaintext_marker = b"encrypted-resp";
+                    let window_search = ciphertext
+                        .windows(plaintext_marker.len())
+                        .any(|w| w == plaintext_marker);
+                    assert!(
+                        !window_search,
+                        "ciphertext contained plaintext marker — encryption did NOT happen"
+                    );
+                }
+                CachePayload::Plaintext { .. } => panic!(
+                    "expected CachePayload::AesGcm when encryption is enabled, got Plaintext"
+                ),
+            },
+            other => panic!("expected LlmCacheInsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_decrypts_aes_gcm_payload_when_key_matches() {
+        // The full round-trip: insert with encryption → WAL → fresh
+        // cache (same key) replays → response is recoverable.
+        use crate::services::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.jsonl");
+        let wal_cell: Arc<tokio::sync::OnceCell<Wal>> = Arc::new(tokio::sync::OnceCell::new());
+        let writer = Wal::open_for_append(wal_path.clone()).unwrap();
+        wal_cell.set(writer).unwrap();
+
+        let cache = LlmCacheService::new()
+            .with_wal(wal_cell)
+            .with_encryption(test_encryption_key());
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", vec![1.0, 0.0]);
+        cache.insert(key.clone(), dummy_response("the-cached-content"));
+
+        // Simulate restart: fresh cache + same encryption key, replay
+        // the WAL records.
+        let records = Wal::read_records(&wal_path).unwrap();
+        let cache2 = LlmCacheService::new().with_encryption(test_encryption_key());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let restored = cache2.replay(&records, now);
+        assert_eq!(restored, 1, "encrypted entry must replay back into memory");
+
+        let hit = cache2.lookup(&key, None).expect("post-replay hit");
+        assert_eq!(hit.id, "the-cached-content");
+    }
+
+    #[test]
+    fn replay_skips_aes_gcm_payload_when_no_key_configured() {
+        // Insert with encryption ON, restart with encryption OFF.
+        // The encrypted entry must be SKIPPED (warn logged), not
+        // panicked on. This is the operator-downgrade path:
+        // turning off encryption leaves prior encrypted entries
+        // unreachable but doesn't break the substrate.
+        use crate::services::wal::Wal;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal.jsonl");
+        let wal_cell: Arc<tokio::sync::OnceCell<Wal>> = Arc::new(tokio::sync::OnceCell::new());
+        wal_cell
+            .set(Wal::open_for_append(wal_path.clone()).unwrap())
+            .unwrap();
+
+        let cache = LlmCacheService::new()
+            .with_wal(wal_cell)
+            .with_encryption(test_encryption_key());
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", vec![1.0, 0.0]);
+        cache.insert(key, dummy_response("x"));
+
+        let records = Wal::read_records(&wal_path).unwrap();
+        // Restart with no encryption key — encrypted entry must be skipped.
+        let cache2 = LlmCacheService::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let restored = cache2.replay(&records, now);
+        assert_eq!(
+            restored, 0,
+            "encrypted entry must skip when no key configured"
+        );
+    }
+
+    #[test]
+    fn debug_surface_exposes_encryption_enabled_flag() {
+        let cache = LlmCacheService::new().with_encryption(test_encryption_key());
+        let dbg = format!("{:?}", cache);
+        assert!(
+            dbg.contains("encryption_enabled: true"),
+            "Debug must reflect encryption state; got: {dbg}"
         );
     }
 }

@@ -19,6 +19,7 @@ pub mod graph;
 pub mod graph_enhanced;
 pub mod llm;
 pub mod llm_cache;
+pub mod llm_cache_crypto;
 pub mod parser;
 pub mod session_index;
 pub mod wal;
@@ -221,7 +222,31 @@ impl ContextNestServices {
         // TTL 3600s). Shares the WAL OnceCell with the substrate so
         // `WalRecord::LlmCacheInsert` records persist across restarts;
         // bootstrap replays them before serving traffic.
-        let llm_cache = LlmCacheService::new().with_wal(wal_cell.clone());
+        //
+        // When `CONTEXTNEST_LLM_CACHE_ENCRYPTION_KEY` is set (32 bytes
+        // hex), cache entries are sealed with AES-256-GCM before
+        // hitting the WAL. Bad-format keys produce a `warn!` and the
+        // cache falls back to plaintext mode — the substrate still
+        // boots, the operator notices in logs.
+        let mut llm_cache = LlmCacheService::new().with_wal(wal_cell.clone());
+        match llm_cache_crypto::load_key_from_env() {
+            Ok(Some(key)) => {
+                tracing::info!("LlmCacheService: AES-256-GCM encryption enabled");
+                llm_cache = llm_cache.with_encryption(key);
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "LlmCacheService: encryption disabled (set CONTEXTNEST_LLM_CACHE_ENCRYPTION_KEY to enable)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "LlmCacheService: CONTEXTNEST_LLM_CACHE_ENCRYPTION_KEY is invalid — running in plaintext mode"
+                );
+            }
+        }
+        let llm_cache = llm_cache;
 
         Ok(Self {
             context_manager,
