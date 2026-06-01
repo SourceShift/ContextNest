@@ -281,7 +281,7 @@ pub struct CacheEntry {
 
 /// Snapshot of cache counters. Returned by `LlmCacheService::stats()`
 /// and serialised by the slice 2.4 stats endpoint.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct CacheStats {
     pub total_entries: usize,
     pub total_hits: u64,
