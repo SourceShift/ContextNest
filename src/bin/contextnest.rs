@@ -1149,6 +1149,23 @@ async fn bootstrap_wal(
     }
 
     let start = std::time::Instant::now();
+
+    // Slice 2.5: pull out LLM-cache records and replay them into the
+    // in-memory cache before dispatching the remaining records to the
+    // substrate replay path. Cache replay is independent of
+    // sidecars/full mode (and cheap — just rebuilds an in-memory map).
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cache_replayed = services.llm_cache.replay(&records, now_unix_secs);
+    if cache_replayed > 0 {
+        tracing::info!(
+            count = cache_replayed,
+            "WAL replay: restored llm_cache entries"
+        );
+    }
+
     let (replayed, failed) = match mode {
         WalReplayMode::Sidecars => replay_sidecars(services, records).await,
         WalReplayMode::Full => replay_full(services, records).await,
@@ -1183,19 +1200,23 @@ async fn replay_sidecars(
 ) -> (usize, usize) {
     use contextnest::services::wal::WalRecord;
 
-    // Project records into the tuple shape `restore_sidecars_bulk` wants.
-    // Importance is dropped — sidecars-only doesn't store it (canonical
-    // fragments do, and those are skipped in this mode).
+    // Project Store records into the tuple shape
+    // `restore_sidecars_bulk` wants. Importance is dropped — sidecars-
+    // only doesn't store it (canonical fragments do, and those are
+    // skipped in this mode). Non-Store variants (e.g. LlmCacheInsert)
+    // were already handled by `LlmCacheService::replay` earlier in
+    // `bootstrap_wal`; filter them out here.
     let projected: Vec<_> = records
         .into_iter()
-        .map(|r| match r {
+        .filter_map(|r| match r {
             WalRecord::Store {
                 fragment_id,
                 session_id,
                 content,
                 importance: _,
                 metadata,
-            } => (fragment_id, session_id, content, metadata),
+            } => Some((fragment_id, session_id, content, metadata)),
+            _ => None,
         })
         .collect();
 
@@ -1246,6 +1267,9 @@ async fn replay_full(
                     );
                 }
             },
+            // Cache-insert records were already restored in bootstrap_wal
+            // via `LlmCacheService::replay` before this loop. Skip silently.
+            WalRecord::LlmCacheInsert { .. } => {}
         }
         if (idx + 1) % 100 == 0 {
             tracing::info!(
