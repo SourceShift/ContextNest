@@ -1,0 +1,4 @@
+{
+  "model": "text-embedding-3-small",
+  "input": "The quick brown fox jumps over the lazy dog."
+}

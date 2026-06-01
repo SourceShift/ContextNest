@@ -1,0 +1,13 @@
+{
+  "model": "gemini-1.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Translate 'hello world' into Japanese."
+    }
+  ],
+  "n": 1,
+  "stream": false,
+  "top_p": 0.95,
+  "temperature": 0.9
+}
