@@ -32,6 +32,7 @@ pub use embedding_providers::{
 pub use graph::GraphService;
 pub use graph_enhanced::EnhancedGraphService;
 pub use llm::{LlmProvider, LlmService, LlmServiceBuilder};
+pub use llm_cache::LlmCacheService;
 pub use parser::ParserService;
 
 /// Central service container (domain-agnostic).
@@ -127,6 +128,12 @@ pub struct ContextNestServices {
     /// and degrade gracefully when it returns `false`. This design ensures
     /// the substrate boots in fully offline / CI environments without error.
     pub llm: LlmService,
+    /// LLM proxy response cache. Best-effort — cache failures never
+    /// fail the upstream call. Backs `POST /llm/v1/chat/completions`
+    /// hit/miss path. v0.3 Phase 2 slice 2.3 wires this in; 2.5 will
+    /// promote the semantic-match step to the substrate's attractor
+    /// activation.
+    pub llm_cache: LlmCacheService,
 }
 
 impl ContextNestServices {
@@ -204,6 +211,10 @@ impl ContextNestServices {
             );
         }
 
+        // LLM proxy response cache — roadmap defaults (threshold 0.92,
+        // TTL 3600s). Shared across all chat-completion handlers via Clone.
+        let llm_cache = LlmCacheService::new();
+
         Ok(Self {
             context_manager,
             graph,
@@ -219,6 +230,7 @@ impl ContextNestServices {
             consolidation_queue,
             wal: Arc::new(tokio::sync::OnceCell::new()),
             llm,
+            llm_cache,
         })
     }
 

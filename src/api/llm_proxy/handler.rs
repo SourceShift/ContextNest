@@ -1,10 +1,19 @@
-//! `POST /llm/v1/chat/completions` handler (v0.3 slice 1.2).
+//! `POST /llm/v1/chat/completions` handler.
 //!
 //! Maps OpenAI's chat/completions wire format (from `openai_shapes`) to
 //! [`crate::services::llm::LlmService::complete_chat`], then maps the
-//! result back to the OpenAI response shape. No caching, no
-//! multi-provider routing — this is the plain forwarder. Both later
-//! land as their own slices per `docs/roadmap/v0.3-llm-proxy.md`.
+//! result back to the OpenAI response shape.
+//!
+//! ## Slice history
+//!
+//! - 1.2 plain forwarder
+//! - 1.3c multi-provider routing
+//! - **2.3 (this commit) caching:** consult `LlmCacheService` before
+//!   dispatching upstream; insert on miss. Per-request
+//!   `x-cn-cache-max-age: <seconds>` header overrides the default TTL;
+//!   `max-age: 0` forces a cache bypass. Cache failures (embedder
+//!   unavailable, empty embedding, etc.) are best-effort — they never
+//!   fail the upstream call.
 //!
 //! ## Error surface
 //!
@@ -26,9 +35,11 @@
 //! - Streaming SSE responses (out of scope for v0.3 per open-q #1).
 //! - Caching (Phase 2).
 
+use std::time::Duration;
+
 use axum::{
     extract::{Json, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde_json::json;
 
@@ -37,7 +48,15 @@ use super::openai_shapes::{
     Role, Usage,
 };
 use crate::services::llm::{ChatCompletionOpts, ChatMessage, ChatRole};
+use crate::services::llm_cache::{
+    derive_cache_key, extract_system_prompt_text, extract_user_prompt_text, CacheKey,
+    DEFAULT_PROJECT_ID,
+};
 use crate::services::ContextNestServices;
+
+/// Header name (lowercase as required by HTTP/2) for per-request TTL override.
+/// Mirrors OpenAI's `x-*` extension convention.
+pub const CACHE_MAX_AGE_HEADER: &str = "x-cn-cache-max-age";
 
 /// `POST /llm/v1/chat/completions` — OpenAI-compatible plain proxy.
 ///
@@ -45,6 +64,7 @@ use crate::services::ContextNestServices;
 /// response with the model's text + token usage.
 pub async fn chat_completions(
     State(services): State<ContextNestServices>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionsRequest>,
 ) -> Result<Json<ChatCompletionsResponse>, (StatusCode, Json<serde_json::Value>)> {
     // --- Validation ---------------------------------------------------------
@@ -91,6 +111,34 @@ pub async fn chat_completions(
     // `max_completion_tokens` wins; we mirror that.
     let effective_max_tokens = req.max_completion_tokens.or(req.max_tokens);
 
+    // --- Cache lookup -------------------------------------------------------
+    //
+    // Best-effort cache attempt BEFORE the upstream-availability check.
+    // A cached entry is valid even when the upstream provider is offline —
+    // that's the whole point of the cache. Embedder failures, empty
+    // embeddings, or missing cache configuration all fall through to the
+    // upstream path; no cache error fails the request.
+    let max_age = parse_max_age_header(&headers);
+    let cache_attempt = try_build_cache_key(&services, &req).await;
+    if let Some(ref key) = cache_attempt {
+        if let Some(hit) = services.llm_cache.lookup(key, max_age) {
+            // Cache hit. Re-stamp `id` and `created` so distinct hits
+            // from one cached entry carry distinct trace identifiers
+            // (per-request traceability is preserved even on hit) and
+            // overwrite the response's `model` field with the originally
+            // requested model so the client sees what it asked for.
+            let mut hit = hit;
+            hit.id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+            hit.created = chrono::Utc::now().timestamp();
+            hit.model = req.model.clone();
+            tracing::debug!(
+                model = %req.model,
+                "llm_proxy cache hit"
+            );
+            return Ok(Json(hit));
+        }
+    }
+
     let opts = ChatCompletionOpts {
         model: req.model.clone(),
         messages: internal_messages,
@@ -123,8 +171,6 @@ pub async fn chat_completions(
 
     // --- Translate ChatCompletionResult → OpenAI response -------------------
     let response = ChatCompletionsResponse {
-        // Synthetic id is fine in the plain proxy; once caching lands in
-        // Phase 2 the cache-entry uuid becomes the canonical id.
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         object: "chat.completion".to_string(),
         created: chrono::Utc::now().timestamp(),
@@ -155,7 +201,65 @@ pub async fn chat_completions(
         system_fingerprint: None,
     };
 
+    // --- Cache insert (best-effort) -----------------------------------------
+    //
+    // Only when we successfully derived a cache key on the lookup pass. If
+    // the embedder was unavailable then we can't key the entry and there's
+    // nothing to store; the upstream response still returns normally.
+    // `max_age = 0` (bypass) is honored on the lookup but NOT on insert —
+    // a bypass request still warms the cache for subsequent callers,
+    // matching `Cache-Control: no-cache` HTTP semantics ("don't serve me
+    // a cached response, but you may cache mine").
+    if let Some(key) = cache_attempt {
+        services.llm_cache.insert(key, response.clone());
+        tracing::debug!(model = %response.model, "llm_proxy cache insert");
+    }
+
     Ok(Json(response))
+}
+
+/// Best-effort `CacheKey` derivation. Returns `None` when the embedder
+/// can't produce a vector for the user prompt — in that case the caller
+/// proceeds without cache lookup or insert. Errors are logged at
+/// `debug!` because they're a normal degradation path, not a problem.
+async fn try_build_cache_key(
+    services: &ContextNestServices,
+    req: &ChatCompletionsRequest,
+) -> Option<CacheKey> {
+    let user_text = extract_user_prompt_text(&req.messages);
+    if user_text.is_empty() {
+        // No user content to embed — can happen for assistant-only
+        // requests (rare). Skip cache for these.
+        return None;
+    }
+    let system_text = extract_system_prompt_text(&req.messages);
+    let embedding = match services.embedding.generate_embedding(&user_text).await {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            tracing::debug!("llm_proxy: empty embedding — skipping cache");
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "llm_proxy: embedder failed — skipping cache");
+            return None;
+        }
+    };
+    Some(derive_cache_key(
+        DEFAULT_PROJECT_ID,
+        &req.model,
+        req.temperature,
+        &system_text,
+        embedding,
+    ))
+}
+
+/// Parse the per-request TTL override header. Returns `Some(Duration)`
+/// when present and valid; `None` falls back to the cache's default TTL.
+/// `Some(Duration::ZERO)` forces a cache bypass.
+pub fn parse_max_age_header(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(CACHE_MAX_AGE_HEADER)?.to_str().ok()?;
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
 }
 
 /// Reduce a [`Message`]'s content (string OR array of parts) into a single
@@ -331,5 +435,72 @@ mod tests {
         assert_eq!(err["type"], "invalid_request_error");
         assert!(err["code"].is_null());
         assert!(err["param"].is_null());
+    }
+
+    // =========================================================================
+    // Cache integration tests (slice 2.3)
+    // =========================================================================
+    //
+    // These cover the cache header parsing + the bypass / TTL-override
+    // semantics. Full end-to-end hit/miss against the live handler is
+    // covered by direct `LlmCacheService` tests in `services::llm_cache`
+    // (slice 2.2) since spinning up `ContextNestServices` in a unit
+    // test would couple this handler test to mock-mode database wiring.
+
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn parse_max_age_header_returns_none_when_missing() {
+        let h = HeaderMap::new();
+        assert_eq!(parse_max_age_header(&h), None);
+    }
+
+    #[test]
+    fn parse_max_age_header_returns_seconds_when_present() {
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_MAX_AGE_HEADER, HeaderValue::from_static("3600"));
+        assert_eq!(parse_max_age_header(&h), Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn parse_max_age_header_zero_is_explicit_bypass() {
+        // The bypass path. `Duration::ZERO` reaches `LlmCacheService::lookup`
+        // which short-circuits to miss. Documents the wire contract:
+        // `x-cn-cache-max-age: 0` means "don't serve me a cached response".
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_MAX_AGE_HEADER, HeaderValue::from_static("0"));
+        assert_eq!(parse_max_age_header(&h), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_max_age_header_tolerates_whitespace() {
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_MAX_AGE_HEADER, HeaderValue::from_static("  60  "));
+        assert_eq!(parse_max_age_header(&h), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn parse_max_age_header_rejects_non_numeric() {
+        // Garbled value → None (fall back to default TTL). Not a 400 —
+        // mirroring how OpenAI ignores unknown `x-*` headers.
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_MAX_AGE_HEADER, HeaderValue::from_static("forever"));
+        assert_eq!(parse_max_age_header(&h), None);
+    }
+
+    #[test]
+    fn parse_max_age_header_rejects_negative_value() {
+        // u64 parse rejects "-1" — None falls back to default TTL.
+        let mut h = HeaderMap::new();
+        h.insert(CACHE_MAX_AGE_HEADER, HeaderValue::from_static("-1"));
+        assert_eq!(parse_max_age_header(&h), None);
+    }
+
+    #[test]
+    fn header_name_constant_is_lowercase_for_http2_compat() {
+        // HTTP/2 requires lowercase header names; if the constant ever
+        // gains an uppercase character, axum will mis-route the header
+        // lookup. Pin the contract.
+        assert_eq!(CACHE_MAX_AGE_HEADER, CACHE_MAX_AGE_HEADER.to_lowercase());
     }
 }
