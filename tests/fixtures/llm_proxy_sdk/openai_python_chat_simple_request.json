@@ -1,0 +1,14 @@
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise assistant."
+    },
+    {
+      "role": "user",
+      "content": "What is 2 + 2?"
+    }
+  ],
+  "temperature": 0.7
+}

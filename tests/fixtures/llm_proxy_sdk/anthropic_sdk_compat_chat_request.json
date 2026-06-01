@@ -1,0 +1,15 @@
+{
+  "model": "claude-3-5-sonnet-latest",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a careful assistant."
+    },
+    {
+      "role": "user",
+      "content": "Summarise the second law of thermodynamics."
+    }
+  ],
+  "max_tokens": 512,
+  "temperature": 1.0
+}

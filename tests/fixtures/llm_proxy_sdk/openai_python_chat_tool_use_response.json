@@ -1,0 +1,32 @@
+{
+  "id": "chatcmpl-9XwR4mFgxMETh4KqR8Yo0A4qQcDvW",
+  "object": "chat.completion",
+  "created": 1717000050,
+  "model": "gpt-4o-mini-2024-07-18",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "call_abc123def456",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Berlin\",\"unit\":\"celsius\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 84,
+    "completion_tokens": 23,
+    "total_tokens": 107
+  },
+  "system_fingerprint": "fp_a8b9c0d1e2"
+}

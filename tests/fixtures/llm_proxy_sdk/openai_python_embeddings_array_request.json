@@ -1,0 +1,10 @@
+{
+  "model": "text-embedding-3-small",
+  "input": [
+    "First document to embed.",
+    "Second document to embed.",
+    "Third document to embed."
+  ],
+  "encoding_format": "float",
+  "user": "user-1234"
+}
