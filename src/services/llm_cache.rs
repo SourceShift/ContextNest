@@ -1,8 +1,13 @@
-//! LLM proxy response cache — key derivation (v0.3 Phase 2 slice 2.1).
+//! LLM proxy response cache — key derivation + in-memory store
+//! (v0.3 Phase 2 slices 2.1 + 2.2).
 //!
-//! Pure logic for deriving a `CacheKey` from a chat-completion request.
-//! Storage, lookup, freshness policy, and the `GET /llm/v1/cache/stats`
-//! endpoint land in subsequent slices.
+//! Pure logic for deriving a `CacheKey` from a chat-completion request
+//! (slice 2.1) plus an in-memory `LlmCacheService` providing
+//! exact-prefix + cosine-similarity lookup, insert, TTL freshness, and
+//! hit/miss statistics (slice 2.2). Handler wiring lands in slice 2.3;
+//! the `GET /llm/v1/cache/stats` endpoint lands in slice 2.4;
+//! substrate-backed semantic match (vs the in-memory cosine match here)
+//! lands in slice 2.5.
 //!
 //! ## Design (from `docs/roadmap/v0.3-llm-proxy.md`)
 //!
@@ -35,18 +40,51 @@
 //! prompt corpus. Storing the full hash would inflate the key by 24
 //! bytes per entry for no gain.
 //!
-//! ## What this slice does NOT do
+//! ## What 2.2 ships on top of 2.1
+//!
+//! - `LlmCacheService` with `Arc<RwLock<...>>` interior — concurrent
+//!   reads, serialized writes.
+//! - `lookup(&CacheKey, max_age) -> Option<CachedResponse>` performs
+//!   exact-prefix HashMap probe → TTL filter → cosine-similarity
+//!   match against entries sharing the prefix, returning the entry
+//!   exceeding the configured threshold (default 0.92).
+//! - `insert(CacheKey, ChatCompletionsResponse)` appends to the
+//!   prefix bucket; no eviction in 2.2 (LRU lands when the demo
+//!   workloads in slice 2.4 show memory pressure).
+//! - `stats() -> CacheStats` snapshots hits, misses, total entries,
+//!   and computed hit rate.
+//!
+//! ## Why an in-memory store first, substrate later?
+//!
+//! Slice 2.5 promotes the semantic-match component from local cosine
+//! similarity to the substrate's attractor activation (which scales
+//! across processes and persists to WAL). Shipping the in-memory
+//! store first lets slices 2.3 and 2.4 (handler wiring + stats
+//! endpoint) be developed and tested without coupling to the
+//! substrate's async worker tick, then swap the lookup backend in 2.5
+//! behind the same `lookup()` signature.
+//!
+//! ## What this module does NOT do (yet)
 //!
 //! - Does not compute the user-prompt embedding. The caller passes
 //!   the embedding in (it comes from `EmbeddingService`).
-//! - Does not look up the substrate or any cache backing store.
-//! - Does not enforce TTL freshness — that's slice 2.2/2.3.
+//! - Does not wire into the chat-completions handler — slice 2.3.
+//! - Does not expose `GET /llm/v1/cache/stats` — slice 2.4.
+//! - Does not back semantic match with the substrate — slice 2.5.
+//! - Does not evict; the map grows unbounded until restart. LRU/size
+//!   caps land when the demo workloads in 2.4 demonstrate the need.
 //! - Does not handle multi-tenancy scoping beyond defaulting
 //!   `project_id` to a fixed sentinel until v0.2 lands.
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
 use sha2::{Digest, Sha256};
 
-use crate::api::llm_proxy::openai_shapes::{ContentPart, Message, MessageContent, Role};
+use crate::api::llm_proxy::openai_shapes::{
+    ChatCompletionsResponse, ContentPart, Message, MessageContent, Role,
+};
 
 /// Number of temperature buckets across the OpenAI range `[0.0, 1.0]`.
 /// Bucket index = round(temp * 20). 0.0 → 0, 0.05 → 1, ..., 1.0 → 20.
@@ -206,6 +244,251 @@ pub fn derive_cache_key(
             system_prompt_hash,
         },
         semantic_embedding: user_prompt_embedding,
+    }
+}
+
+// =============================================================================
+// In-memory cache store (slice 2.2)
+// =============================================================================
+
+/// Default cosine-similarity threshold for the semantic-match step.
+/// 0.92 per `docs/roadmap/v0.3-llm-proxy.md`. Tunable per-service via
+/// the builder so demo workloads can sweep the curve.
+pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.92;
+
+/// Default TTL for cached entries. 3600s (1h) per roadmap. Per-request
+/// override via `x-cn-cache-max-age` lands in slice 2.3.
+pub const DEFAULT_TTL_SECS: u64 = 3600;
+
+/// One stored response associated with an exact-prefix bucket.
+#[derive(Debug, Clone)]
+pub struct CacheEntry {
+    /// The user-prompt embedding this entry was inserted under.
+    /// Cosine similarity is computed against this vector.
+    pub embedding: Vec<f32>,
+    /// The cached response body. Sent verbatim back to clients on hit
+    /// (the handler in slice 2.3 will rewrite `id` so duplicates from
+    /// distinct cache lookups carry distinct trace ids).
+    pub response: ChatCompletionsResponse,
+    /// Monotonic instant of insertion. TTL check uses `Instant` so
+    /// cache freshness is unaffected by wall-clock skew or system
+    /// suspend/resume.
+    pub inserted_at: Instant,
+    /// Times this entry has been served as a hit. Surfaced via
+    /// `stats()` for hot-entry analysis in slice 2.4.
+    pub hit_count: u64,
+}
+
+/// Snapshot of cache counters. Returned by `LlmCacheService::stats()`
+/// and serialised by the slice 2.4 stats endpoint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheStats {
+    pub total_entries: usize,
+    pub total_hits: u64,
+    pub total_misses: u64,
+    /// hits / (hits + misses), or 0.0 when there have been no lookups.
+    pub hit_rate: f32,
+}
+
+struct LlmCacheInner {
+    by_prefix: HashMap<ExactKeyPrefix, Vec<CacheEntry>>,
+    hits: u64,
+    misses: u64,
+}
+
+impl LlmCacheInner {
+    fn new() -> Self {
+        Self {
+            by_prefix: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn total_entries(&self) -> usize {
+        self.by_prefix.values().map(|v| v.len()).sum()
+    }
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0
+/// for mismatched lengths, empty vectors, or either-zero-magnitude —
+/// "not similar" is the safe answer when the comparison is degenerate.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut mag_a = 0.0f32;
+    let mut mag_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        mag_a += x * x;
+        mag_b += y * y;
+    }
+    let mag_a = mag_a.sqrt();
+    let mag_b = mag_b.sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return 0.0;
+    }
+    dot / (mag_a * mag_b)
+}
+
+/// In-memory cache store. Concurrent reads via `RwLock::read()`;
+/// writes (including hit-count increments) take `write()`.
+///
+/// Cheap to `Clone` — the inner state is an `Arc`. Multiple handlers
+/// can share one service instance.
+#[derive(Clone)]
+pub struct LlmCacheService {
+    inner: Arc<RwLock<LlmCacheInner>>,
+    similarity_threshold: f32,
+    default_ttl: Duration,
+}
+
+impl LlmCacheService {
+    /// Construct with roadmap defaults: threshold 0.92, TTL 3600s.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(LlmCacheInner::new())),
+            similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
+            default_ttl: Duration::from_secs(DEFAULT_TTL_SECS),
+        }
+    }
+
+    /// Override the cosine-similarity threshold. `1.0` requires exact
+    /// embedding match; `0.0` matches any entry sharing the exact
+    /// prefix.
+    pub fn with_similarity_threshold(mut self, threshold: f32) -> Self {
+        self.similarity_threshold = threshold.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Override the default TTL. Per-request override via `max_age`
+    /// argument to `lookup` still takes precedence.
+    pub fn with_default_ttl(mut self, ttl: Duration) -> Self {
+        self.default_ttl = ttl;
+        self
+    }
+
+    pub fn similarity_threshold(&self) -> f32 {
+        self.similarity_threshold
+    }
+
+    pub fn default_ttl(&self) -> Duration {
+        self.default_ttl
+    }
+
+    /// Look up a cache key. `max_age` overrides `default_ttl` when
+    /// provided — slice 2.3 will populate this from the request's
+    /// `x-cn-cache-max-age` header.
+    ///
+    /// Returns the cloned response on hit and increments the entry's
+    /// `hit_count` + the service `hits` counter. Returns `None` on
+    /// miss and increments `misses`.
+    pub fn lookup(
+        &self,
+        key: &CacheKey,
+        max_age: Option<Duration>,
+    ) -> Option<ChatCompletionsResponse> {
+        let ttl = max_age.unwrap_or(self.default_ttl);
+        // `max_age = Duration::ZERO` forces a miss — semantic match
+        // of "never serve from cache for this request".
+        if ttl.is_zero() {
+            self.bump_miss();
+            return None;
+        }
+        let mut guard = self.inner.write().expect("llm_cache lock poisoned");
+        let now = Instant::now();
+        let Some(bucket) = guard.by_prefix.get_mut(&key.exact) else {
+            guard.misses += 1;
+            return None;
+        };
+        let mut best: Option<(usize, f32)> = None;
+        for (idx, entry) in bucket.iter().enumerate() {
+            // TTL check first — older entries are filtered out before
+            // similarity comparison so an old high-similarity entry
+            // can't shadow a fresh acceptable-similarity entry.
+            if now.duration_since(entry.inserted_at) > ttl {
+                continue;
+            }
+            let sim = cosine_similarity(&key.semantic_embedding, &entry.embedding);
+            if sim < self.similarity_threshold {
+                continue;
+            }
+            best = match best {
+                None => Some((idx, sim)),
+                Some((_, prev)) if sim > prev => Some((idx, sim)),
+                Some(x) => Some(x),
+            };
+        }
+        match best {
+            Some((idx, _)) => {
+                bucket[idx].hit_count += 1;
+                let resp = bucket[idx].response.clone();
+                guard.hits += 1;
+                Some(resp)
+            }
+            None => {
+                guard.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn bump_miss(&self) {
+        let mut guard = self.inner.write().expect("llm_cache lock poisoned");
+        guard.misses += 1;
+    }
+
+    /// Insert a response under the given key. Appends to the
+    /// prefix bucket; does not replace existing entries with
+    /// matching embeddings (a subsequent lookup picks the best-
+    /// similarity match anyway).
+    pub fn insert(&self, key: CacheKey, response: ChatCompletionsResponse) {
+        let entry = CacheEntry {
+            embedding: key.semantic_embedding,
+            response,
+            inserted_at: Instant::now(),
+            hit_count: 0,
+        };
+        let mut guard = self.inner.write().expect("llm_cache lock poisoned");
+        guard.by_prefix.entry(key.exact).or_default().push(entry);
+    }
+
+    /// Snapshot of current counters.
+    pub fn stats(&self) -> CacheStats {
+        let guard = self.inner.read().expect("llm_cache lock poisoned");
+        let total = guard.hits + guard.misses;
+        let hit_rate = if total == 0 {
+            0.0
+        } else {
+            guard.hits as f32 / total as f32
+        };
+        CacheStats {
+            total_entries: guard.total_entries(),
+            total_hits: guard.hits,
+            total_misses: guard.misses,
+            hit_rate,
+        }
+    }
+}
+
+impl Default for LlmCacheService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for LlmCacheService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stats = self.stats();
+        f.debug_struct("LlmCacheService")
+            .field("similarity_threshold", &self.similarity_threshold)
+            .field("default_ttl_secs", &self.default_ttl.as_secs())
+            .field("total_entries", &stats.total_entries)
+            .field("total_hits", &stats.total_hits)
+            .field("total_misses", &stats.total_misses)
+            .finish()
     }
 }
 
@@ -434,5 +717,239 @@ mod tests {
         let mut map: HashMap<ExactKeyPrefix, &'static str> = HashMap::new();
         map.insert(k1.exact.clone(), "hit");
         assert_eq!(map.get(&k2.exact), Some(&"hit"));
+    }
+
+    // =========================================================================
+    // Store tests (slice 2.2)
+    // =========================================================================
+
+    use crate::api::llm_proxy::openai_shapes::{ChatCompletionsResponse, Choice, Usage};
+
+    fn dummy_response(id: &str) -> ChatCompletionsResponse {
+        ChatCompletionsResponse {
+            id: id.to_string(),
+            object: "chat.completion".to_string(),
+            created: 1717000000,
+            model: "gpt-4o-mini".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: Message {
+                    role: Role::Assistant,
+                    content: Some(MessageContent::Text("cached answer".into())),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+        }
+    }
+
+    fn unit_vec(dim: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[hot] = 1.0;
+        v
+    }
+
+    #[test]
+    fn cache_empty_returns_miss() {
+        let cache = LlmCacheService::new();
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", unit_vec(8, 0));
+        assert!(cache.lookup(&key, None).is_none());
+        let s = cache.stats();
+        assert_eq!(s.total_misses, 1);
+        assert_eq!(s.total_hits, 0);
+        assert_eq!(s.total_entries, 0);
+        assert_eq!(s.hit_rate, 0.0);
+    }
+
+    #[test]
+    fn insert_then_lookup_same_key_returns_hit() {
+        let cache = LlmCacheService::new();
+        let emb = unit_vec(8, 0);
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", emb);
+        cache.insert(key.clone(), dummy_response("resp-1"));
+        let hit = cache.lookup(&key, None).expect("expected hit");
+        assert_eq!(hit.id, "resp-1");
+        let s = cache.stats();
+        assert_eq!(s.total_hits, 1);
+        assert_eq!(s.total_misses, 0);
+        assert_eq!(s.total_entries, 1);
+        assert!((s.hit_rate - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lookup_with_different_prefix_returns_miss_without_consulting_embeddings() {
+        let cache = LlmCacheService::new();
+        let emb = unit_vec(8, 0);
+        let insert_key = derive_cache_key("p", "model-a", Some(0.7), "sys", emb.clone());
+        cache.insert(insert_key, dummy_response("resp"));
+        // Same embedding, DIFFERENT model — must miss because exact
+        // prefix differs. Bug shape this guards against: prefix
+        // collision via Hash-only-but-not-Eq dispatch.
+        let lookup_key = derive_cache_key("p", "model-b", Some(0.7), "sys", emb);
+        assert!(cache.lookup(&lookup_key, None).is_none());
+    }
+
+    #[test]
+    fn lookup_with_distant_embedding_returns_miss() {
+        let cache = LlmCacheService::new();
+        let stored_emb = unit_vec(8, 0); // hot in dim 0
+        let store_key = derive_cache_key("p", "m", Some(0.7), "sys", stored_emb);
+        cache.insert(store_key, dummy_response("resp"));
+        // Orthogonal embedding, same prefix — cosine = 0.0, below
+        // the 0.92 default threshold.
+        let lookup_emb = unit_vec(8, 7);
+        let lookup_key = derive_cache_key("p", "m", Some(0.7), "sys", lookup_emb);
+        assert!(cache.lookup(&lookup_key, None).is_none());
+    }
+
+    #[test]
+    fn lookup_with_near_embedding_returns_hit() {
+        let cache = LlmCacheService::new();
+        let stored_emb = vec![1.0f32, 0.0, 0.0, 0.0];
+        let store_key = derive_cache_key("p", "m", Some(0.7), "sys", stored_emb);
+        cache.insert(store_key, dummy_response("resp"));
+        // [0.95, 0.05, 0, 0] vs [1, 0, 0, 0] has cosine ≈ 0.9986 — above 0.92.
+        let lookup_emb = vec![0.95f32, 0.05, 0.0, 0.0];
+        let lookup_key = derive_cache_key("p", "m", Some(0.7), "sys", lookup_emb);
+        assert!(cache.lookup(&lookup_key, None).is_some());
+    }
+
+    #[test]
+    fn lookup_max_age_zero_forces_miss_even_with_exact_match() {
+        let cache = LlmCacheService::new();
+        let emb = unit_vec(8, 0);
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", emb);
+        cache.insert(key.clone(), dummy_response("resp"));
+        // Per-request override of max_age = 0 means "never serve
+        // from cache for this request" — the bypass path.
+        assert!(cache.lookup(&key, Some(Duration::ZERO)).is_none());
+        let s = cache.stats();
+        assert_eq!(s.total_misses, 1);
+    }
+
+    #[test]
+    fn expired_entry_is_treated_as_miss() {
+        let cache = LlmCacheService::new().with_default_ttl(Duration::from_secs(3600));
+        let emb = unit_vec(8, 0);
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", emb);
+        cache.insert(key.clone(), dummy_response("resp"));
+        // Per-request max_age of 0 nanoseconds is functionally
+        // equivalent to "ignore TTL entirely" only when permissive;
+        // here we use Duration::from_nanos(1) to mean "every entry
+        // older than 1ns is stale" → the just-inserted entry (whose
+        // age is >0 by the time lookup runs) is filtered out.
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(cache.lookup(&key, Some(Duration::from_nanos(1))).is_none());
+    }
+
+    #[test]
+    fn multiple_distinct_embeddings_can_share_an_exact_prefix() {
+        let cache = LlmCacheService::new();
+        let key1 = derive_cache_key("p", "m", Some(0.7), "sys", vec![1.0, 0.0, 0.0]);
+        let key2 = derive_cache_key("p", "m", Some(0.7), "sys", vec![0.0, 1.0, 0.0]);
+        cache.insert(key1.clone(), dummy_response("for-key1"));
+        cache.insert(key2.clone(), dummy_response("for-key2"));
+        // Both must look up cleanly to their own response.
+        let hit1 = cache.lookup(&key1, None).expect("hit1");
+        let hit2 = cache.lookup(&key2, None).expect("hit2");
+        assert_eq!(hit1.id, "for-key1");
+        assert_eq!(hit2.id, "for-key2");
+        // Stats: 2 entries under the single shared prefix.
+        let s = cache.stats();
+        assert_eq!(s.total_entries, 2);
+    }
+
+    #[test]
+    fn hit_count_increments_per_entry() {
+        let cache = LlmCacheService::new();
+        let emb = unit_vec(8, 0);
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", emb);
+        cache.insert(key.clone(), dummy_response("resp"));
+        for _ in 0..3 {
+            cache.lookup(&key, None).expect("hit");
+        }
+        let s = cache.stats();
+        assert_eq!(s.total_hits, 3);
+        assert_eq!(s.total_misses, 0);
+        assert_eq!(s.total_entries, 1);
+    }
+
+    #[test]
+    fn similarity_threshold_one_requires_exact_embedding_match() {
+        let cache = LlmCacheService::new().with_similarity_threshold(1.0);
+        let stored_emb = vec![1.0f32, 0.0];
+        let store_key = derive_cache_key("p", "m", Some(0.7), "sys", stored_emb);
+        cache.insert(store_key, dummy_response("resp"));
+        // Slightly-different normalized vector — cosine just below 1.0.
+        let lookup_emb = vec![0.999f32, 0.001];
+        let lookup_key = derive_cache_key("p", "m", Some(0.7), "sys", lookup_emb);
+        // Threshold = 1.0 means cosine must equal 1.0 exactly. Even
+        // 0.9999... is rejected. Documents the strictest setting.
+        assert!(cache.lookup(&lookup_key, None).is_none());
+    }
+
+    #[test]
+    fn similarity_threshold_zero_matches_any_same_prefix_entry() {
+        let cache = LlmCacheService::new().with_similarity_threshold(0.0);
+        let stored_emb = vec![1.0f32, 0.0];
+        let store_key = derive_cache_key("p", "m", Some(0.7), "sys", stored_emb);
+        cache.insert(store_key, dummy_response("resp"));
+        // Orthogonal vector — cosine = 0.0. With threshold 0.0 this
+        // still matches: `sim < threshold` is false at equality.
+        let lookup_emb = vec![0.0f32, 1.0];
+        let lookup_key = derive_cache_key("p", "m", Some(0.7), "sys", lookup_emb);
+        assert!(cache.lookup(&lookup_key, None).is_some());
+    }
+
+    #[test]
+    fn cosine_similarity_handles_degenerate_inputs() {
+        // Mismatched length → 0.0. Empty → 0.0. Zero-magnitude → 0.0.
+        // Each path that would otherwise NaN or panic must return the
+        // "not similar" safe answer.
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 1.0], &[0.0, 0.0]), 0.0);
+        // Identical non-zero vectors → 1.0.
+        let s = cosine_similarity(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+        assert!((s - 1.0).abs() < 1e-6, "expected ~1.0, got {s}");
+        // Orthogonal → 0.0.
+        let s = cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(s.abs() < 1e-6, "expected ~0.0, got {s}");
+    }
+
+    #[test]
+    fn stats_hit_rate_is_zero_when_no_lookups() {
+        let cache = LlmCacheService::new();
+        let s = cache.stats();
+        assert_eq!(s.hit_rate, 0.0);
+        assert_eq!(s.total_hits, 0);
+        assert_eq!(s.total_misses, 0);
+    }
+
+    #[test]
+    fn service_is_clone_and_shares_state_across_clones() {
+        // Multiple handlers share one logical cache via Clone.
+        let cache1 = LlmCacheService::new();
+        let cache2 = cache1.clone();
+        let emb = unit_vec(4, 0);
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", emb);
+        cache1.insert(key.clone(), dummy_response("resp"));
+        // Insert via cache1, lookup via cache2 — same Arc<RwLock<...>>
+        // means the data is visible.
+        assert!(cache2.lookup(&key, None).is_some());
+        // Both views see the same stats.
+        assert_eq!(cache1.stats().total_hits, cache2.stats().total_hits);
     }
 }
