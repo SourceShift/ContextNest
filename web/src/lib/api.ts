@@ -8,6 +8,7 @@ import type {
   PromptPreviewResponse,
   RetrieveResponse,
   SessionListResponse,
+  SessionsByFeatureResponse,
   StatsResponse,
   StatusResponse,
   TrajectoryResponse,
@@ -140,4 +141,16 @@ export const api = {
       { method: 'GET' },
     );
   },
+
+  /**
+   * Substring search across every session's declared
+   * `delivered_features[].feature` name. Use this when you remember
+   * what you SHIPPED but not WHICH SESSION shipped it.
+   * Backed by `GET /api/v1/sessions/by-feature?q=<substring>`.
+   */
+  sessionsByFeature: (q: string) =>
+    request<SessionsByFeatureResponse>(
+      `/api/v1/sessions/by-feature?q=${encodeURIComponent(q)}`,
+      { method: 'GET' },
+    ),
 };

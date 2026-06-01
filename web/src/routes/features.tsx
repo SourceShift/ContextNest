@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useMemo, useState } from 'react';
 
-import { Icon } from '@/components/atoms';
+import { Icon, SessionPill } from '@/components/atoms';
 import { useFeatures } from '@/hooks/useFeatures';
 import type { FeatureEntry } from '@/lib/types';
 
@@ -183,10 +183,11 @@ function FeaturesPage() {
                   </div>
 
                   <div className="feature-card-meta mono dim">
-                    session{' '}
-                    <span style={{ color: 'var(--ink-muted)' }}>
-                      {f.session_id.slice(0, 8)}
-                    </span>
+                    {/* Was: plaintext 8-char prefix, unclickable. Now: real
+                        SessionPill that navigates to the session detail
+                        page on click — the obvious "show me what shipped
+                        in this session" path. */}
+                    <SessionPill id={f.session_id} />
                     {f.files.length > 0 && (
                       <>
                         <span style={{ margin: '0 6px' }}>·</span>

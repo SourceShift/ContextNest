@@ -154,6 +154,21 @@ export type FeaturesResponse = {
   features: FeatureEntry[];
 };
 
+/** One match from `GET /api/v1/sessions/by-feature?q=<substring>`. */
+export type FeatureHit = {
+  session_id: string;
+  feature: string;
+  ts: string | null;
+  files: string[];
+  refs: unknown[];
+  layer: string | null;
+};
+
+export type SessionsByFeatureResponse = {
+  query: string;
+  hits: FeatureHit[];
+};
+
 export type TrajectoryRecord = {
   id: string;
   kind: string;
