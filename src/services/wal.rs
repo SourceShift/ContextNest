@@ -66,9 +66,10 @@ pub enum WalRecord {
         #[serde(default)]
         metadata: HashMap<String, serde_json::Value>,
     },
-    /// LLM proxy cache insert (v0.3 Phase 2 slice 2.5). Persists a
-    /// cached chat-completion response across restarts so the warm-up
-    /// curve doesn't have to be re-paid on every binary deploy.
+    /// LLM proxy cache insert (v0.3 Phase 2 slice 2.5 + Phase 3
+    /// slice 3.1 encryption). Persists a cached chat-completion
+    /// response across restarts so the warm-up curve doesn't have to
+    /// be re-paid on every binary deploy.
     ///
     /// Stored separately from `Store` because cache entries are NOT
     /// user memories — mixing them through `process_memories` would
@@ -78,20 +79,45 @@ pub enum WalRecord {
     LlmCacheInsert {
         /// Exact-match prefix fields (replay rebuilds the in-memory
         /// HashMap key from these without needing to reverse the
-        /// truncated SHA-256).
+        /// truncated SHA-256). These stay cleartext on disk because
+        /// the HashMap lookup happens BEFORE decryption.
         project_id: String,
         model: String,
         temperature_bucket: u8,
         system_prompt_hash: [u8; 8],
-        /// User-prompt embedding for semantic-match lookup.
-        embedding: Vec<f32>,
-        /// Serialised `ChatCompletionsResponse` JSON. Stored as a
-        /// string rather than a typed `Value` so wire-format drift
-        /// in the response shape doesn't break WAL replay.
-        response_json: String,
         /// Unix timestamp in seconds of the original insert. Used to
         /// reconstruct entry age for TTL checks after replay.
         inserted_at_unix_secs: u64,
+        /// Either plaintext (legacy) or AES-256-GCM-sealed embedding
+        /// + response_json. See [`CachePayload`].
+        payload: CachePayload,
+    },
+}
+
+/// Either a plaintext or AEAD-sealed envelope of the embedding +
+/// response body for one cache entry. Discriminator field is `mode`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CachePayload {
+    /// Plaintext on disk. Default when the substrate has no
+    /// encryption key configured. Equivalent to Phase 2 slice 2.5
+    /// behaviour.
+    Plaintext {
+        embedding: Vec<f32>,
+        /// Serialised `ChatCompletionsResponse` JSON.
+        response_json: String,
+    },
+    /// AES-256-GCM ciphertext over a length-prefixed concatenation of
+    /// the embedding (as little-endian f32 bytes) and the response
+    /// JSON. AAD binds the ciphertext to the
+    /// `ExactKeyPrefix::fingerprint` of the entry (project + model +
+    /// temperature + system_prompt_hash) so a ciphertext lifted from
+    /// one bucket can't be replayed into another. `nonce` is the GCM
+    /// nonce; `ciphertext` is the sealed bytes including the 16-byte
+    /// authentication tag.
+    AesGcm {
+        nonce: [u8; 12],
+        ciphertext: Vec<u8>,
     },
 }
 
