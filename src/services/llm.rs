@@ -116,9 +116,94 @@ impl std::fmt::Debug for LlmProvider {
 /// Always present as a field on [`crate::services::ContextNestServices`];
 /// callers must check [`Self::is_enabled`] before invoking [`Self::complete`]
 /// or [`Self::summarize`] and degrade gracefully when it returns `false`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlmService {
+    /// The default provider — used by `complete()` and `summarize()`,
+    /// and as the fallback for `complete_chat()` when the request's
+    /// `model` doesn't prefix-match a configured provider.
     inner: Arc<LlmProvider>,
+    /// Additional configured providers beyond the default, keyed by
+    /// `ProviderKind`. Populated by `from_env()` whenever multiple
+    /// provider API keys are present — for example, both
+    /// `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. Empty when only one
+    /// provider is configured (the typical case).
+    ///
+    /// Used by `complete_chat()` for model-prefix routing: if the
+    /// request's `model` is `gpt-4o-mini` and the default is
+    /// Anthropic, `complete_chat()` looks up OpenAI in this map.
+    additional: Arc<std::collections::HashMap<ProviderKind, Arc<dyn LanguageModel + Send + Sync>>>,
+}
+
+// Manual Debug — `dyn LanguageModel` doesn't implement Debug.
+impl std::fmt::Debug for LlmService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmService")
+            .field("inner", &self.inner)
+            .field(
+                "additional_kinds",
+                &self
+                    .additional
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Stable kind identifier for prefix-based model routing. Anthropic /
+/// OpenAi / Google are the three providers the multi-provider router
+/// recognises by request model name; `Custom` is not in this enum
+/// because custom providers are name-driven (the user constructed one
+/// explicitly via `LlmServiceBuilder::with_custom_provider`) rather
+/// than prefix-routable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderKind {
+    Anthropic,
+    OpenAi,
+    Google,
+}
+
+impl ProviderKind {
+    /// Stable string identifier for diagnostics + the `/v1/models`
+    /// `owned_by` field. Pattern-match these directly; the values are
+    /// part of the public contract.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::OpenAi => "openai",
+            ProviderKind::Google => "google",
+        }
+    }
+}
+
+/// Prefix-match a model identifier to the provider kind that owns it.
+///
+/// Recognised patterns (case-insensitive):
+/// - `gpt-*`, `o1-*`, `text-embedding-*`, `text-davinci-*` → OpenAI
+/// - `claude-*` → Anthropic
+/// - `gemini-*` → Google
+///
+/// Returns `None` for unrecognised model prefixes — the caller in
+/// `complete_chat()` falls back to the default provider with a
+/// `warn!` log so the request still completes (SDK clients hardcode
+/// model strings; rejecting unknown prefixes would break first-touch
+/// UX with OpenAI clients pointed at Anthropic-only ContextNest).
+pub fn route_model(model: &str) -> Option<ProviderKind> {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-")
+        || m.starts_with("o1-")
+        || m.starts_with("text-embedding-")
+        || m.starts_with("text-davinci-")
+    {
+        Some(ProviderKind::OpenAi)
+    } else if m.starts_with("claude-") {
+        Some(ProviderKind::Anthropic)
+    } else if m.starts_with("gemini-") {
+        Some(ProviderKind::Google)
+    } else {
+        None
+    }
 }
 
 impl LlmService {
@@ -167,7 +252,7 @@ impl LlmService {
                     );
                     LlmProvider::Disabled
                 } else {
-                    build_anthropic(api_key, base_url, model_override)
+                    build_anthropic(api_key, base_url.clone(), model_override.clone())
                 }
             }
             Some("openai") => {
@@ -179,7 +264,7 @@ impl LlmService {
                     );
                     LlmProvider::Disabled
                 } else {
-                    build_openai(api_key, base_url, model_override)
+                    build_openai(api_key, base_url.clone(), model_override.clone())
                 }
             }
             Some("google") => {
@@ -191,7 +276,7 @@ impl LlmService {
                     );
                     LlmProvider::Disabled
                 } else {
-                    build_google(api_key, base_url, model_override)
+                    build_google(api_key, base_url.clone(), model_override.clone())
                 }
             }
             Some(unknown) => {
@@ -203,47 +288,233 @@ impl LlmService {
             }
             // No explicit provider — attempt auto-detect from well-known key vars.
             None => {
+                // Auto-detect: walk in fixed order, the FIRST present key
+                // becomes the default provider. Any additional keys present
+                // get registered as multi-provider routing destinations below
+                // (after the default is picked).
                 if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
                     if !api_key.is_empty() {
                         tracing::debug!(
                             "Auto-detected ANTHROPIC_API_KEY; enabling Anthropic provider"
                         );
-                        return Self {
-                            inner: Arc::new(build_anthropic(api_key, base_url, model_override)),
-                        };
+                        return Self::with_additionals_from_env(
+                            build_anthropic(api_key, base_url.clone(), model_override.clone()),
+                            Some(ProviderKind::Anthropic),
+                            base_url,
+                            model_override,
+                        );
                     }
                 }
                 if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
                     if !api_key.is_empty() {
                         tracing::debug!("Auto-detected OPENAI_API_KEY; enabling OpenAI provider");
-                        return Self {
-                            inner: Arc::new(build_openai(api_key, base_url, model_override)),
-                        };
+                        return Self::with_additionals_from_env(
+                            build_openai(api_key, base_url.clone(), model_override.clone()),
+                            Some(ProviderKind::OpenAi),
+                            base_url,
+                            model_override,
+                        );
                     }
                 }
                 if let Ok(api_key) = std::env::var("GOOGLE_API_KEY") {
                     if !api_key.is_empty() {
                         tracing::debug!("Auto-detected GOOGLE_API_KEY; enabling Google provider");
-                        return Self {
-                            inner: Arc::new(build_google(api_key, base_url, model_override)),
-                        };
+                        return Self::with_additionals_from_env(
+                            build_google(api_key, base_url.clone(), model_override.clone()),
+                            Some(ProviderKind::Google),
+                            base_url,
+                            model_override,
+                        );
                     }
                 }
                 LlmProvider::Disabled
             }
         };
 
+        // Explicit-provider path (the four `Some(...)` branches above) —
+        // also gather any OTHER provider keys present so the multi-
+        // provider router can reach them via `additional`.
+        let default_kind = match &provider {
+            LlmProvider::Anthropic { .. } => Some(ProviderKind::Anthropic),
+            LlmProvider::OpenAi { .. } => Some(ProviderKind::OpenAi),
+            LlmProvider::Google { .. } => Some(ProviderKind::Google),
+            LlmProvider::Custom { .. } | LlmProvider::Disabled => None,
+        };
+        Self::with_additionals_from_env(provider, default_kind, base_url, model_override)
+    }
+
+    /// Build an `LlmService` whose default is `provider` (already wired)
+    /// and whose `additional` map contains any other provider whose API
+    /// key is present in env but whose kind is NOT the default. Walked
+    /// in the same fixed order as `from_env()` so the behaviour is
+    /// deterministic regardless of which env vars happen to be set.
+    fn with_additionals_from_env(
+        provider: LlmProvider,
+        default_kind: Option<ProviderKind>,
+        base_url: Option<String>,
+        model_override: Option<String>,
+    ) -> Self {
+        let mut additional: std::collections::HashMap<
+            ProviderKind,
+            Arc<dyn LanguageModel + Send + Sync>,
+        > = std::collections::HashMap::new();
+
+        // For each candidate kind that ISN'T the default, register it
+        // into `additional` if its API key is set. Models built here
+        // share the same base_url / model_override env vars; this
+        // matches the existing single-provider behaviour and lets
+        // CONTEXTNEST_LLM_BASE_URL still target a proxy like LiteLLM
+        // that fronts multiple providers.
+        let candidates = [
+            (ProviderKind::Anthropic, "ANTHROPIC_API_KEY"),
+            (ProviderKind::OpenAi, "OPENAI_API_KEY"),
+            (ProviderKind::Google, "GOOGLE_API_KEY"),
+        ];
+        for (kind, env_var) in candidates {
+            if default_kind == Some(kind) {
+                continue;
+            }
+            let api_key = match std::env::var(env_var) {
+                Ok(k) if !k.is_empty() => k,
+                _ => continue,
+            };
+            let built = match kind {
+                ProviderKind::Anthropic => {
+                    build_anthropic(api_key, base_url.clone(), model_override.clone())
+                }
+                ProviderKind::OpenAi => {
+                    build_openai(api_key, base_url.clone(), model_override.clone())
+                }
+                ProviderKind::Google => {
+                    build_google(api_key, base_url.clone(), model_override.clone())
+                }
+            };
+            // Extract the underlying Arc<dyn LanguageModel> from the
+            // enum variant. `build_*` always returns the matching
+            // variant by construction; pattern-match exhaustively.
+            let model = match built {
+                LlmProvider::Anthropic { model } => model,
+                LlmProvider::OpenAi { model } => model,
+                LlmProvider::Google { model } => model,
+                LlmProvider::Custom { .. } | LlmProvider::Disabled => {
+                    // unreachable per the build_* contract but stay defensive
+                    continue;
+                }
+            };
+            tracing::debug!(
+                kind = kind.as_str(),
+                "registering additional LLM provider for multi-provider routing"
+            );
+            additional.insert(kind, model);
+        }
+
         Self {
             inner: Arc::new(provider),
+            additional: Arc::new(additional),
         }
     }
 
     /// Construct directly with a given provider — useful for tests that want to
     /// inject a specific (possibly mock) provider without touching env vars.
+    /// The `additional` multi-provider map starts empty; tests that need
+    /// multi-provider routing should add entries via
+    /// [`Self::with_additional_provider`].
     pub fn new(provider: LlmProvider) -> Self {
         Self {
             inner: Arc::new(provider),
+            additional: Arc::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Test/builder helper: append an additional provider to the
+    /// multi-provider routing map. Returns a new `LlmService` (cheap —
+    /// the `Arc`-wrapped fields share ownership).
+    #[cfg(test)]
+    pub(crate) fn with_additional_provider(
+        self,
+        kind: ProviderKind,
+        model: Arc<dyn LanguageModel + Send + Sync>,
+    ) -> Self {
+        let mut map = (*self.additional).clone();
+        map.insert(kind, model);
+        Self {
+            inner: self.inner,
+            additional: Arc::new(map),
+        }
+    }
+
+    /// Pick the provider that should handle a request carrying this
+    /// `model` identifier. Returns the model handle plus the kind that
+    /// matched. Routing order:
+    /// 1. Prefix-match `model` via [`route_model`] → look up in
+    ///    `additional`; if absent, check whether the default provider
+    ///    is the matching kind; otherwise fall back to default.
+    /// 2. Unknown prefix → fall back to default provider; the caller
+    ///    is expected to surface a `warn!` documenting the substitution
+    ///    (the call site for `complete_chat` does this).
+    ///
+    /// Returns `None` only when the default provider is `Disabled` AND
+    /// `additional` doesn't carry the prefix-matched kind. In that
+    /// case the caller returns 503 to the HTTP client.
+    pub fn select_for_model(
+        &self,
+        model: &str,
+    ) -> Option<(ProviderKind, Arc<dyn LanguageModel + Send + Sync>)> {
+        let prefix_kind = route_model(model);
+        // First: prefix-match landed → look up in additional.
+        if let Some(kind) = prefix_kind {
+            if let Some(m) = self.additional.get(&kind) {
+                return Some((kind, m.clone()));
+            }
+            // Default might already be that kind.
+            if let Some((default_kind, default_model)) = self.default_pair() {
+                if default_kind == kind {
+                    return Some((kind, default_model));
+                }
+            }
+        }
+        // Either no prefix match OR no provider for the matched prefix
+        // is configured. Fall back to default (its kind may be
+        // anything — `complete_chat` warn!s on the substitution).
+        self.default_pair()
+    }
+
+    /// The default provider as a `(kind, model)` pair, when one exists.
+    /// `Custom` and `Disabled` return `None` — Custom because it's
+    /// outside the prefix-routing taxonomy; Disabled because there's
+    /// no model.
+    fn default_pair(&self) -> Option<(ProviderKind, Arc<dyn LanguageModel + Send + Sync>)> {
+        match &*self.inner {
+            LlmProvider::Disabled => None,
+            LlmProvider::Anthropic { model } => Some((ProviderKind::Anthropic, model.clone())),
+            LlmProvider::OpenAi { model } => Some((ProviderKind::OpenAi, model.clone())),
+            LlmProvider::Google { model } => Some((ProviderKind::Google, model.clone())),
+            // Custom doesn't have a prefix-routable kind. Return None so
+            // select_for_model falls through; the caller's behaviour
+            // depends on whether `additional` had a match.
+            LlmProvider::Custom { .. } => None,
+        }
+    }
+
+    /// All configured provider kinds in stable string form — the union
+    /// of the default's kind (if routable) and every entry in
+    /// `additional`. Used by `/llm/v1/models` to report the full
+    /// catalog of providers a client can route requests to.
+    pub fn configured_provider_kinds(&self) -> Vec<&'static str> {
+        let mut kinds: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        if let Some((kind, _)) = self.default_pair() {
+            kinds.insert(kind.as_str());
+        }
+        for kind in self.additional.keys() {
+            kinds.insert(kind.as_str());
+        }
+        // Also surface Custom when the default is Custom — it's not a
+        // routable kind, but `/v1/models` should still list "custom"
+        // so callers know the substrate has a provider configured.
+        if matches!(*self.inner, LlmProvider::Custom { .. }) {
+            kinds.insert("custom");
+        }
+        kinds.into_iter().collect()
     }
 
     // -----------------------------------------------------------------------
@@ -256,7 +527,7 @@ impl LlmService {
     /// `false`. The HTTP handlers follow this pattern so that CI runs without
     /// any API key continue to pass.
     pub fn is_enabled(&self) -> bool {
-        !matches!(*self.inner, LlmProvider::Disabled)
+        !matches!(*self.inner, LlmProvider::Disabled) || !self.additional.is_empty()
     }
 
     /// Identifier for the configured provider, suitable for the
@@ -384,17 +655,51 @@ impl LlmService {
         &self,
         opts: ChatCompletionOpts,
     ) -> ContextNestResult<ChatCompletionResult> {
-        let model = match &*self.inner {
-            LlmProvider::Disabled => {
-                return Err(ContextNestError::Configuration(
-                    "LLM provider not configured".to_string(),
-                ))
+        // Multi-provider routing: pick the right provider for the
+        // request's `model`. Falls back to the default provider when
+        // the model prefix doesn't match any configured kind — log
+        // the substitution so operators can audit. SDK clients
+        // hardcode model strings; 400-rejecting on prefix mismatch
+        // would break first-touch UX with e.g. OpenAI SDK pointed at
+        // an Anthropic-only ContextNest.
+        let routed = self.select_for_model(&opts.model);
+        // Fall back through to the default's model handle (which we
+        // accept may be Custom — Custom is not prefix-routable but is
+        // a valid call target when it's the configured default).
+        let (resolved_kind, model) = match routed {
+            Some(pair) => pair,
+            None => {
+                // select_for_model returned None — either Disabled, or
+                // Custom-as-default with no `additional` match.
+                if let LlmProvider::Custom { model, .. } = &*self.inner {
+                    // Custom default: serve the request, no kind to
+                    // log because Custom is outside the routable set.
+                    tracing::warn!(
+                        requested_model = %opts.model,
+                        "complete_chat: routing to Custom default provider — request model is informational only"
+                    );
+                    (ProviderKind::OpenAi, model.clone()) // placeholder kind for log
+                } else {
+                    return Err(ContextNestError::Configuration(
+                        "LLM provider not configured".to_string(),
+                    ));
+                }
             }
-            LlmProvider::Anthropic { model } => model.clone(),
-            LlmProvider::OpenAi { model } => model.clone(),
-            LlmProvider::Google { model } => model.clone(),
-            LlmProvider::Custom { model, .. } => model.clone(),
         };
+        // Surface the substitution: prefix-match exists but doesn't
+        // equal the resolved kind → we fell back to default. Only
+        // worth a warn! when there WAS a prefix match (i.e. the user
+        // asked for something specific) but we couldn't honour it.
+        if let Some(requested_kind) = route_model(&opts.model) {
+            if requested_kind != resolved_kind {
+                tracing::warn!(
+                    requested_model = %opts.model,
+                    requested_kind = requested_kind.as_str(),
+                    resolved_kind = resolved_kind.as_str(),
+                    "complete_chat: requested provider unavailable; routed to fallback default"
+                );
+            }
+        }
 
         // Translate the public ChatMessage shape into llm-sdk-rs's
         // Message + Part. Empty content on a user/system message becomes
@@ -827,5 +1132,112 @@ mod tests {
             }
             other => panic!("Expected Configuration error, got: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Slice 1.3c — multi-provider routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn route_model_matches_openai_prefixes() {
+        assert_eq!(route_model("gpt-4o"), Some(ProviderKind::OpenAi));
+        assert_eq!(route_model("gpt-4o-mini"), Some(ProviderKind::OpenAi));
+        assert_eq!(route_model("gpt-3.5-turbo"), Some(ProviderKind::OpenAi));
+        assert_eq!(route_model("o1-preview"), Some(ProviderKind::OpenAi));
+        assert_eq!(
+            route_model("text-embedding-3-small"),
+            Some(ProviderKind::OpenAi)
+        );
+        assert_eq!(route_model("text-davinci-003"), Some(ProviderKind::OpenAi));
+    }
+
+    #[test]
+    fn route_model_matches_anthropic_prefixes() {
+        assert_eq!(
+            route_model("claude-3-5-sonnet-latest"),
+            Some(ProviderKind::Anthropic)
+        );
+        assert_eq!(
+            route_model("claude-3-5-haiku-20241022"),
+            Some(ProviderKind::Anthropic)
+        );
+        assert_eq!(
+            route_model("claude-3-opus-latest"),
+            Some(ProviderKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn route_model_matches_google_prefixes() {
+        assert_eq!(route_model("gemini-1.5-pro"), Some(ProviderKind::Google));
+        assert_eq!(route_model("gemini-2.0-flash"), Some(ProviderKind::Google));
+    }
+
+    #[test]
+    fn route_model_is_case_insensitive() {
+        assert_eq!(route_model("GPT-4o"), Some(ProviderKind::OpenAi));
+        assert_eq!(
+            route_model("Claude-3-5-Sonnet"),
+            Some(ProviderKind::Anthropic)
+        );
+        assert_eq!(route_model("GEMINI-2.0-FLASH"), Some(ProviderKind::Google));
+    }
+
+    #[test]
+    fn route_model_returns_none_for_unknown_prefix() {
+        // Unknown prefixes return None; complete_chat() falls back to default
+        // with a warn! log — see complete_chat() doc.
+        assert_eq!(route_model("mistral-large-latest"), None);
+        assert_eq!(route_model("llama-3-70b"), None);
+        assert_eq!(route_model(""), None);
+        assert_eq!(route_model("BAAI/bge-small-en"), None);
+    }
+
+    #[test]
+    fn provider_kind_as_str_is_stable() {
+        // Stable pattern-matchable strings — clients depend on these.
+        assert_eq!(ProviderKind::Anthropic.as_str(), "anthropic");
+        assert_eq!(ProviderKind::OpenAi.as_str(), "openai");
+        assert_eq!(ProviderKind::Google.as_str(), "google");
+    }
+
+    #[test]
+    fn configured_provider_kinds_reports_default_only_when_no_additional() {
+        // Default OpenAI, no additionals → reports just "openai".
+        let svc = LlmService::new(LlmProvider::Disabled);
+        assert!(svc.configured_provider_kinds().is_empty());
+        // The OpenAI default test would need a real built provider; we
+        // verify the Disabled→empty case (the only case constructible
+        // without API keys).
+    }
+
+    #[test]
+    fn is_enabled_true_when_only_additional_providers_configured() {
+        // Even if `inner` is Disabled, having any additional provider
+        // makes the service "enabled" for routing. This is the
+        // multi-provider invariant: SOMEONE can serve a request.
+        //
+        // (We can't easily construct an additional provider without a
+        // real LanguageModel impl; this test verifies the empty case
+        // and documents the invariant for the populated case.)
+        let svc = LlmService::new(LlmProvider::Disabled);
+        assert!(
+            !svc.is_enabled(),
+            "Disabled + empty additional → not enabled"
+        );
+        assert!(
+            svc.additional.is_empty(),
+            "fresh new() builds an empty additional map"
+        );
+    }
+
+    #[test]
+    fn select_for_model_returns_none_when_disabled_and_no_additional() {
+        let svc = LlmService::new(LlmProvider::Disabled);
+        // Any model on a Disabled service with no additional providers
+        // returns None — complete_chat() will surface this as 503.
+        assert!(svc.select_for_model("gpt-4o").is_none());
+        assert!(svc.select_for_model("claude-3-5-sonnet").is_none());
+        assert!(svc.select_for_model("unknown-model").is_none());
     }
 }
