@@ -61,6 +61,7 @@ async fn store_appends_record_to_wal() {
             assert!((*importance - 0.8).abs() < 1e-6);
             assert_eq!(metadata.get("kind").unwrap(), &json!("user_action"));
         }
+        other => panic!("expected WalRecord::Store, got {other:?}"),
     }
 }
 
@@ -248,6 +249,7 @@ async fn replay_restores_state_visible_to_inbox_endpoint() {
                 .await
                 .expect("replay store_with_id");
             }
+            other => panic!("expected WalRecord::Store during replay, got {other:?}"),
         }
     }
 
@@ -326,6 +328,7 @@ async fn replay_is_idempotent_when_run_twice() {
                     .await
                     .unwrap();
                 }
+                other => panic!("expected WalRecord::Store, got {other:?}"),
             }
         }
     }
@@ -390,6 +393,7 @@ async fn live_hook_ingest_via_services_sink_writes_to_wal() {
             assert_eq!(content, "deploy the WAL gap fix to production");
             assert_eq!(metadata.get("kind").unwrap(), &json!("user_action"));
         }
+        other => panic!("expected WalRecord::Store, got {other:?}"),
     }
 }
 
@@ -600,6 +604,7 @@ async fn migration_rewrites_legacy_session_ids_to_bare_uuid() {
                 session_id,
                 ..
             } => (fragment_id.clone(), session_id.clone()),
+            other => panic!("expected WalRecord::Store, got {other:?}"),
         })
         .collect();
     assert_eq!(by_id["frag-short"], full_uuid);
@@ -613,6 +618,7 @@ async fn migration_rewrites_legacy_session_ids_to_bare_uuid() {
         .iter()
         .map(|r| match r {
             WalRecord::Store { session_id, .. } => session_id.clone(),
+            other => panic!("expected WalRecord::Store, got {other:?}"),
         })
         .collect();
     assert!(after_session_ids.contains(&full_uuid.to_string()));
@@ -634,6 +640,7 @@ async fn migration_rewrites_legacy_session_ids_to_bare_uuid() {
         .iter()
         .map(|r| match r {
             WalRecord::Store { session_id, .. } => session_id.clone(),
+            other => panic!("expected WalRecord::Store, got {other:?}"),
         })
         .collect();
     assert!(bak_session_ids.contains(&"cc-9b8a1f3e".to_string()));
