@@ -18,6 +18,7 @@ pub mod fragment_id;
 pub mod graph;
 pub mod graph_enhanced;
 pub mod llm;
+pub mod llm_cache;
 pub mod parser;
 pub mod session_index;
 pub mod wal;
