@@ -66,6 +66,33 @@ pub enum WalRecord {
         #[serde(default)]
         metadata: HashMap<String, serde_json::Value>,
     },
+    /// LLM proxy cache insert (v0.3 Phase 2 slice 2.5). Persists a
+    /// cached chat-completion response across restarts so the warm-up
+    /// curve doesn't have to be re-paid on every binary deploy.
+    ///
+    /// Stored separately from `Store` because cache entries are NOT
+    /// user memories — mixing them through `process_memories` would
+    /// pollute the substrate's reconstruct / resonate queries with
+    /// cache fragments. Cache replay rebuilds the in-memory map
+    /// directly via `LlmCacheService::replay`.
+    LlmCacheInsert {
+        /// Exact-match prefix fields (replay rebuilds the in-memory
+        /// HashMap key from these without needing to reverse the
+        /// truncated SHA-256).
+        project_id: String,
+        model: String,
+        temperature_bucket: u8,
+        system_prompt_hash: [u8; 8],
+        /// User-prompt embedding for semantic-match lookup.
+        embedding: Vec<f32>,
+        /// Serialised `ChatCompletionsResponse` JSON. Stored as a
+        /// string rather than a typed `Value` so wire-format drift
+        /// in the response shape doesn't break WAL replay.
+        response_json: String,
+        /// Unix timestamp in seconds of the original insert. Used to
+        /// reconstruct entry age for TTL checks after replay.
+        inserted_at_unix_secs: u64,
+    },
 }
 
 /// Append-only WAL writer. Construct via [`Wal::open_for_append`] *after*
@@ -245,6 +272,9 @@ pub fn migrate_legacy_session_ids(
                     metadata,
                 });
             }
+            // Non-`Store` variants pass through untouched — the session-id
+            // migration only applies to user-memory records.
+            other => out.push(other),
         }
     }
 
@@ -313,9 +343,11 @@ mod tests {
         assert_eq!(records.len(), 3);
         match &records[0] {
             WalRecord::Store { fragment_id, .. } => assert_eq!(fragment_id, "a"),
+            other => panic!("expected Store, got {other:?}"),
         }
         match &records[2] {
             WalRecord::Store { fragment_id, .. } => assert_eq!(fragment_id, "c"),
+            other => panic!("expected Store, got {other:?}"),
         }
     }
 

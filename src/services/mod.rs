@@ -211,9 +211,17 @@ impl ContextNestServices {
             );
         }
 
+        // Shared WAL OnceCell — populated post-replay by
+        // `bin/contextnest.rs::bootstrap_wal`. Both the substrate-side
+        // `store` path and the LLM-cache `insert` path append through
+        // the same writer once it's installed.
+        let wal_cell: Arc<tokio::sync::OnceCell<wal::Wal>> = Arc::new(tokio::sync::OnceCell::new());
+
         // LLM proxy response cache — roadmap defaults (threshold 0.92,
-        // TTL 3600s). Shared across all chat-completion handlers via Clone.
-        let llm_cache = LlmCacheService::new();
+        // TTL 3600s). Shares the WAL OnceCell with the substrate so
+        // `WalRecord::LlmCacheInsert` records persist across restarts;
+        // bootstrap replays them before serving traffic.
+        let llm_cache = LlmCacheService::new().with_wal(wal_cell.clone());
 
         Ok(Self {
             context_manager,
@@ -228,7 +236,7 @@ impl ContextNestServices {
             connection_log,
             embeddings_by_id,
             consolidation_queue,
-            wal: Arc::new(tokio::sync::OnceCell::new()),
+            wal: wal_cell,
             llm,
             llm_cache,
         })
