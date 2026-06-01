@@ -5,7 +5,34 @@ import { useQuery } from '@tanstack/react-query';
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
 import { api } from '@/lib/api';
 import { useSessions, useKnownProjects } from '@/hooks/useSessions';
-import type { RetrieveHit } from '@/lib/types';
+import type { FeatureHit, RetrieveHit } from '@/lib/types';
+
+/**
+ * Search modes.
+ *
+ * - `memories` — original behaviour. Fragment-level snippet hits with
+ *   per-row similarity. Best when you want to skim the actual content.
+ * - `sessions` — group fragments by their owning session. Shows one
+ *   card per matching session, ranked by best hit + summed weight,
+ *   with the top snippets nested inside. Best for the daily-driver
+ *   question "WHICH session was I working on X?"
+ * - `features` — substring search across every session's declared
+ *   `delivered_features[].feature` names. Best when you remember
+ *   what you SHIPPED but not which session shipped it.
+ */
+type SearchMode = 'memories' | 'sessions' | 'features';
+const MODE_LABELS: Record<SearchMode, string> = {
+  memories: 'Memories',
+  sessions: 'Sessions',
+  features: 'Features',
+};
+const MODE_HINTS: Record<SearchMode, string> = {
+  memories: 'Per-fragment snippet view — best for skimming raw content.',
+  sessions:
+    'Grouped by session — best for "WHICH session was I working on X?". Each card links to that session.',
+  features:
+    'Substring search over agent-declared feature names — best when you remember what you SHIPPED but not which session shipped it.',
+};
 
 export const Route = createFileRoute('/search')({
   component: SearchPage,
@@ -97,6 +124,7 @@ type SearchResultRow = RetrieveHit & {
 };
 
 function SearchPage() {
+  const [mode, setMode] = useState<SearchMode>('sessions');
   const [q, setQ] = useState('');
   // `qDebounced` is what we hand to React Query as the query key. Keeping
   // it separate from `q` (which drives the input) means the input stays
@@ -283,22 +311,59 @@ function SearchPage() {
     },
   });
 
-  const results: SearchResultRow[] = searchQuery.data ?? [];
+  // `results` is computed from `searchQuery.data` via a memoised
+  // identity so downstream `useMemo` dependency arrays only re-run
+  // when the data array itself changes — not on every render where
+  // the `??` would produce a fresh empty array.
+  const results: SearchResultRow[] = useMemo(
+    () => searchQuery.data ?? [],
+    [searchQuery.data],
+  );
+
+  // Sessions mode rolls up the same `results` array by session_id.
+  // Computed at render time — cheap, deterministic, no extra fetch.
+  const sessionGroups = useMemo(() => groupBySession(results), [results]);
+
+  // Features mode hits its own endpoint. Enabled only when in
+  // features mode AND the user has typed something.
+  const featuresQuery = useQuery({
+    queryKey: ['sessionsByFeature', qDebounced],
+    enabled: mode === 'features' && qDebounced.trim().length > 0,
+    staleTime: 5_000,
+    queryFn: async () => api.sessionsByFeature(qDebounced.trim()),
+  });
+  const featureHits: FeatureHit[] = featuresQuery.data?.hits ?? [];
 
   return (
     <div>
       <div className="page-header">
         <div>
           <h1 className="page-title">Search</h1>
-          <div className="page-sub">
-            Semantic + metadata search across every memory · scoped to one session or cross-session
-          </div>
+          <div className="page-sub">{MODE_HINTS[mode]}</div>
         </div>
         <div className="page-actions">
           <span className="mono dim" style={{ fontSize: 11 }}>
             cmd+/ to focus
           </span>
         </div>
+      </div>
+
+      {/* Mode toggle — the single most important UX upgrade.
+          "Sessions" is the default because that's the daily-driver
+          question ("which session was I working on X?"). The other
+          two modes are one click away. */}
+      <div className="filter-bar" style={{ paddingTop: 0, paddingBottom: 10 }}>
+        {(Object.keys(MODE_LABELS) as SearchMode[]).map((m) => (
+          <button
+            key={m}
+            className={`btn${mode === m ? ' btn-active' : ''}`}
+            onClick={() => setMode(m)}
+            type="button"
+            title={MODE_HINTS[m]}
+          >
+            {MODE_LABELS[m]}
+          </button>
+        ))}
       </div>
 
       <div className="search-input">
@@ -402,10 +467,50 @@ function SearchPage() {
             />
             <div className="empty-title">Search the substrate</div>
             <div className="empty-body">
-              Type a query above, or click a quick search. Add chips to constrain by kind, project,
-              or session.
+              {mode === 'features'
+                ? 'Type the name (or any substring) of a feature you shipped — e.g. "reader summary lens", "cache encryption".'
+                : mode === 'sessions'
+                  ? 'Type a topic you discussed — e.g. "reader summary lenses", "embedding choices". Results grouped by session, newest first.'
+                  : 'Type a query above, or click a quick search. Add chips to constrain by kind, project, or session.'}
             </div>
           </div>
+        ) : mode === 'features' ? (
+          featuresQuery.isLoading ? (
+            <div className="empty">
+              <div className="empty-title">searching feature names…</div>
+            </div>
+          ) : featureHits.length === 0 ? (
+            <div className="empty">
+              <div className="empty-title">No feature names match</div>
+              <div className="empty-body">
+                Try a shorter substring — the search is plain substring,
+                case-insensitive. Or switch to <strong>Sessions</strong> mode
+                to search by topic instead of feature name.
+              </div>
+            </div>
+          ) : (
+            featureHits.map((h, i) => (
+              <FeatureSearchRow key={`${h.session_id}-${i}`} hit={h} query={q} />
+            ))
+          )
+        ) : mode === 'sessions' ? (
+          searchQuery.isLoading ? (
+            <div className="empty">
+              <div className="empty-title">searching sessions…</div>
+            </div>
+          ) : sessionGroups.length === 0 ? (
+            <div className="empty">
+              <div className="empty-title">No sessions match</div>
+              <div className="empty-body">
+                Try removing a filter or broadening the query. Or switch to{' '}
+                <strong>Features</strong> mode if you remember the feature name.
+              </div>
+            </div>
+          ) : (
+            sessionGroups.map((g) => (
+              <SessionGroupRow key={g.session_id} group={g} query={q} />
+            ))
+          )
         ) : results.length === 0 ? (
           <div className="empty">
             <div className="empty-title">No memories match</div>
@@ -714,5 +819,154 @@ function LimitMenu({ value, onChange }: { value: number; onChange: (v: number) =
       title="Max results"
       minWidth={140}
     />
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sessions mode — group retrieve hits by session_id
+//
+// Why this is the daily-driver default: the user's actual question is
+// usually "which session was I working on X?" — not "show me every
+// fragment that mentions X". A session with 20 fragments mentioning the
+// topic is a much stronger answer than 20 individual fragment rows
+// scattered across the result list.
+//
+// Ranking heuristic: `best_similarity + 0.05 * fragment_count` — the
+// best single hit dominates, but a session with many mentions wins a
+// tie. The 0.05 weight is small enough that a 0.9-similarity single
+// hit still beats a 0.7-similarity 4-hit session.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type SessionGroup = {
+  session_id: string;
+  project: string;
+  best_similarity: number;
+  fragment_count: number;
+  rank_score: number;
+  newest_ts: number; // ms since epoch, -Infinity when no fragment carries a ts
+  top_snippets: SearchResultRow[];
+};
+
+function groupBySession(rows: SearchResultRow[]): SessionGroup[] {
+  const byId = new Map<string, SearchResultRow[]>();
+  for (const r of rows) {
+    const arr = byId.get(r.session_id);
+    if (arr) {
+      arr.push(r);
+    } else {
+      byId.set(r.session_id, [r]);
+    }
+  }
+  const groups: SessionGroup[] = [];
+  for (const [session_id, hits] of byId.entries()) {
+    const sorted = hits.slice().sort((a, b) => b.similarity - a.similarity);
+    const best = sorted[0]?.similarity ?? 0;
+    const newest = hits.reduce(
+      (acc, h) => Math.max(acc, tsMs(h.metadata.ts)),
+      -Infinity,
+    );
+    groups.push({
+      session_id,
+      project: hits[0]?.project ?? '?',
+      best_similarity: best,
+      fragment_count: hits.length,
+      rank_score: best + 0.05 * hits.length,
+      newest_ts: newest,
+      top_snippets: sorted.slice(0, 3),
+    });
+  }
+  groups.sort((a, b) => b.rank_score - a.rank_score);
+  return groups;
+}
+
+function SessionGroupRow({ group, query }: { group: SessionGroup; query: string }) {
+  return (
+    <div className="search-result" style={{ alignItems: 'stretch' }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="meta-row" style={{ marginBottom: 6 }}>
+          <SessionPill id={group.session_id} />
+          <ProjBadge p={group.project} />
+          <span className="mono dim" style={{ fontSize: 11 }}>
+            · {group.fragment_count} matching fragment
+            {group.fragment_count === 1 ? '' : 's'}
+          </span>
+          {Number.isFinite(group.newest_ts) && (
+            <span className="mono dim" style={{ fontSize: 11 }}>
+              · newest {shortTs(new Date(group.newest_ts).toISOString())}
+            </span>
+          )}
+        </div>
+        {group.top_snippets.map((s) => (
+          <div key={s.id} style={{ marginTop: 4 }}>
+            <div className="meta-row" style={{ marginBottom: 2 }}>
+              <KindBadge kind={(s.metadata.kind as string | undefined) ?? 'unknown'} />
+              <span className="mono dim" style={{ fontSize: 10.5 }}>
+                sim · {s.similarity.toFixed(2)}
+              </span>
+            </div>
+            <div
+              className="snippet"
+              style={{ paddingLeft: 4, borderLeft: '2px solid var(--border)' }}
+              dangerouslySetInnerHTML={{ __html: highlight(s.content, query) }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="sim">
+        <div className="mono" style={{ fontSize: 10.5 }}>
+          best · {group.best_similarity.toFixed(2)}
+        </div>
+        <div className="sim-bar">
+          <span
+            style={{
+              width: `${Math.max(0, Math.min(1, group.best_similarity)) * 100}%`,
+            }}
+          />
+        </div>
+        <div
+          className="mono"
+          style={{ fontSize: 9.5, color: 'var(--ink-faint)', marginTop: 2 }}
+        >
+          rank · {group.rank_score.toFixed(2)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Features mode — substring search across declared feature names
+// ─────────────────────────────────────────────────────────────────────────────
+
+function FeatureSearchRow({ hit, query }: { hit: FeatureHit; query: string }) {
+  return (
+    <div className="search-result">
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="meta-row" style={{ marginBottom: 4 }}>
+          <SessionPill id={hit.session_id} />
+          {hit.layer && (
+            <span className="mono dim" style={{ fontSize: 11 }}>
+              · {hit.layer}
+            </span>
+          )}
+          {hit.ts && (
+            <span className="mono dim" style={{ fontSize: 11 }}>
+              · {shortTs(hit.ts)}
+            </span>
+          )}
+        </div>
+        <div
+          className="snippet"
+          dangerouslySetInnerHTML={{ __html: highlight(hit.feature, query) }}
+        />
+        {hit.files.length > 0 && (
+          <div className="mono dim" style={{ fontSize: 10.5, marginTop: 4 }}>
+            files:{' '}
+            {hit.files.slice(0, 3).join(' · ')}
+            {hit.files.length > 3 && ` · +${hit.files.length - 3} more`}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
