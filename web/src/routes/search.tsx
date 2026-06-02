@@ -494,6 +494,28 @@ function SearchPage() {
         </span>
       </div>
 
+      {/* Ticket #10 — inline time-window quick presets. The
+          DateRangeMenu dropdown still exists for the "any time"
+          / custom case, but the most-used windows are surfaced
+          as one-click buttons. Active window is highlighted. */}
+      <div className="filter-bar" style={{ paddingTop: 0, paddingBottom: 8, flexWrap: 'wrap' }}>
+        <span className="mono dim" style={{ fontSize: 11, marginRight: 6 }}>
+          when:
+        </span>
+        {(['all', '1h', '24h', '7d', '30d'] as const).map((r) => (
+          <button
+            key={r}
+            className={`btn${dateRange === r ? ' btn-active' : ''}`}
+            type="button"
+            onClick={() => setDateRange(r)}
+            style={{ fontSize: 11, padding: '2px 10px' }}
+            title={`Limit results to the last ${r === 'all' ? '(any time)' : r}`}
+          >
+            {r === 'all' ? 'any time' : `last ${r}`}
+          </button>
+        ))}
+      </div>
+
       <div className="filter-bar" style={{ paddingTop: 0, paddingBottom: 14, flexWrap: 'wrap' }}>
         <SortMenu value={sortMode} onChange={setSortMode} />
         <DateRangeMenu value={dateRange} onChange={setDateRange} />
