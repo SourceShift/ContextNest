@@ -498,3 +498,108 @@ async fn exclude_kinds_supports_multiple_kinds() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["metadata"]["kind"].as_str().unwrap(), "signal");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kind taxonomy (D2) end-to-end tests
+//
+// The kind_registry assigns each ingest kind a SignalClass + default
+// weight. The retrieve handler multiplies similarity by that weight.
+// The compound effect is what these tests assert: boilerplate
+// fragments effectively drop out of ranking WITHOUT the caller
+// passing `exclude_kinds`. The band-aid still works but is no longer
+// required for the common case.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn boilerplate_kinds_are_zero_weighted_at_retrieve() {
+    let server = make_server().await;
+    let session = "test-d2-zero-weight";
+    store(
+        &server,
+        session,
+        "[user turn 1] hello chat about rendering",
+        json!({"kind": "initial_prompt_window"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "decided to render chat via streaming SSE",
+        json!({"kind": "decision"}),
+    )
+    .await;
+
+    // No `exclude_kinds` passed — the kind taxonomy alone must
+    // zero-weight the boilerplate fragment.
+    let body = retrieve_with(&server, session, "chat rendering", json!({})).await;
+    let hits = body["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "at least one hit expected");
+
+    let decision = hits
+        .iter()
+        .find(|h| h["metadata"]["kind"].as_str() == Some("decision"))
+        .expect("decision fragment must appear in results");
+    let dec_sim = decision["similarity"].as_f64().unwrap_or(0.0);
+    assert!(
+        dec_sim > 0.0,
+        "decision fragment must have non-zero similarity (got {dec_sim})"
+    );
+
+    // If boilerplate appears, its similarity must be zero.
+    if let Some(bp) = hits
+        .iter()
+        .find(|h| h["metadata"]["kind"].as_str() == Some("initial_prompt_window"))
+    {
+        let bp_sim = bp["similarity"].as_f64().unwrap_or(-1.0);
+        assert_eq!(
+            bp_sim, 0.0,
+            "boilerplate fragment must score zero via kind_weight (got {bp_sim})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_state_kinds_are_halved() {
+    // SystemState kinds (like `state`) get 0.5× signal. Same text,
+    // different kind tags → 2× score gap.
+    let server = make_server().await;
+    let session = "test-d2-half-weight";
+    store(
+        &server,
+        session,
+        "investigating the chat orchestrator timing bug",
+        json!({"kind": "state"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "investigating the chat orchestrator timing bug",
+        json!({"kind": "decision"}),
+    )
+    .await;
+
+    let body = retrieve_with(&server, session, "chat orchestrator", json!({})).await;
+    let hits = body["hits"].as_array().unwrap();
+    let state = hits
+        .iter()
+        .find(|h| h["metadata"]["kind"].as_str() == Some("state"))
+        .expect("state fragment present");
+    let decision = hits
+        .iter()
+        .find(|h| h["metadata"]["kind"].as_str() == Some("decision"))
+        .expect("decision fragment present");
+    let state_sim = state["similarity"].as_f64().unwrap_or(0.0);
+    let dec_sim = decision["similarity"].as_f64().unwrap_or(0.0);
+    assert!(
+        state_sim < dec_sim,
+        "state ({state_sim}) must rank below decision ({dec_sim}) due to 0.5x SystemState weight"
+    );
+    if dec_sim > 0.001 {
+        let ratio = state_sim / dec_sim;
+        assert!(
+            (0.3..=0.7).contains(&ratio),
+            "ratio state/decision should be ~0.5 (allowing for decay + embed wiggle); got {ratio}"
+        );
+    }
+}

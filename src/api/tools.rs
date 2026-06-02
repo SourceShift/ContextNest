@@ -702,11 +702,22 @@ pub async fn retrieve(
                 .as_ref()
                 .and_then(|m| m.get(&fragment.id).cloned());
             let decay = fragment_meta.map(decay_multiplier).unwrap_or(1.0);
+            // D2 — kind-aware signal weight. UserContent kinds keep
+            // full signal (1.0×); SystemState kinds halve (0.5×);
+            // Boilerplate (initial_prompt_window etc.) zeroes out
+            // (0.0×) — effectively excluded from ranking without
+            // needing every caller to pass `exclude_kinds`. Env
+            // overrides via CONTEXTNEST_KIND_WEIGHT_<KIND_UPPER>.
+            let kind_weight = fragment_meta
+                .and_then(|m| m.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(crate::services::kind_registry::signal_weight)
+                .unwrap_or(1.0);
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
-                similarity: base_similarity * decay,
+                similarity: base_similarity * decay * kind_weight,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
             }
@@ -963,6 +974,22 @@ async fn basin_aware_expand(
             }
             let content = texts.get(sib_id).cloned().unwrap_or_default();
             let meta = metadata.get(sib_id).cloned().unwrap_or_default();
+            // D4 — diversity-aware basin expansion. If a sibling is
+            // Boilerplate (e.g. initial_prompt_window), don't surface
+            // it via expansion regardless of basin membership. Basins
+            // are formed by spatial proximity in embedding space and
+            // boilerplate fragments can land in user-content basins
+            // by shared-token coincidence; without this guard the
+            // expansion pulls noise into the result set.
+            //
+            // The kind_weight applied to base hits at scoring time
+            // already zeroes out direct boilerplate hits; this
+            // ensures basin-expanded ones can't sneak past via the
+            // boosted-similarity branch.
+            let sib_kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::services::kind_registry::is_boilerplate(sib_kind) {
+                continue;
+            }
             let owner = multi_session.as_ref().and_then(|m| m.get(sib_id).cloned());
             additions.push(RetrieveHit {
                 id: sib_id.clone(),
@@ -1066,6 +1093,18 @@ async fn connection_aware_expand(
             }
             let content = texts.get(neighbor_id).cloned().unwrap_or_default();
             let meta = metadata.get(neighbor_id).cloned().unwrap_or_default();
+            // D5 — connection-edge signal-class weighting. A
+            // boilerplate fragment that built high co-occurrence
+            // edges (because it matched everything via shared tokens)
+            // shouldn't propagate that fan-out into result expansion.
+            // Skip Boilerplate-kind neighbors entirely; their direct
+            // hit is already zero-weighted at the scoring step above,
+            // and expanding into them via graph edges would
+            // re-introduce the noise.
+            let nbr_kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::services::kind_registry::is_boilerplate(nbr_kind) {
+                continue;
+            }
             let owner = multi_session
                 .as_ref()
                 .and_then(|m| m.get(neighbor_id).cloned());
