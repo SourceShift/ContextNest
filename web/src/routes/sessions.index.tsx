@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import { Icon, UrgencyDot } from '@/components/atoms';
 import { useSessions } from '@/hooks/useSessions';
@@ -100,6 +100,14 @@ function SessionsPage() {
         </div>
       </div>
 
+      {/* Topic-search callout — the existing filter input only
+          matches project/id substrings, so a user looking for
+          "the session where I worked on X" lands here and gets
+          nothing useful. This callout punts to /search with the
+          topic pre-filled, deep-linking into the Sessions-grouped
+          mode that answers exactly that question. */}
+      <SessionTopicSearchCallout />
+
       <div className="filter-bar">
         <div className="search-input" style={{ width: 280, padding: '6px 12px' }}>
           <Icon.Search className="icon" />
@@ -107,6 +115,7 @@ function SessionsPage() {
             placeholder="filter by project or id…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
+            title="Substring match against project_cwd basename or session_id. For topic / content searches, use the 'Search by topic' callout above."
           />
         </div>
         <div className="tabs">
@@ -221,6 +230,82 @@ function SessionsPage() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SessionTopicSearchCallout
+//
+// One-line topic-search input + button → deep-links to /search?mode=
+// sessions&q=<text>. Sits above the existing project/id filter because
+// "which session was I working on X" is the most common reason a user
+// lands on this page — and the existing filter (project/id substring)
+// answers a different question.
+//
+// We don't run the topic search inline because /search already owns
+// that view (with mode toggles, snippets, deep-linkable URLs). One
+// search surface, multiple entry points.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function SessionTopicSearchCallout() {
+  const navigate = useNavigate();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [q, setQ] = useState('');
+
+  const submit = () => {
+    const trimmed = q.trim();
+    if (!trimmed) {
+      inputRef.current?.focus();
+      return;
+    }
+    void navigate({
+      to: '/search',
+      search: { q: trimmed, mode: 'sessions' },
+    });
+  };
+
+  return (
+    <div
+      className="card"
+      style={{
+        padding: '10px 14px',
+        marginBottom: 12,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        flexWrap: 'wrap',
+      }}
+    >
+      <Icon.Search style={{ color: 'var(--accent)' }} />
+      <div style={{ minWidth: 0, flex: '1 1 280px' }}>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>Search by topic</div>
+        <div className="dim" style={{ fontSize: 11.5 }}>
+          Looking for "the session where I worked on X"? Type the topic or
+          feature name — opens results grouped by session.
+        </div>
+      </div>
+      <div
+        className="search-input"
+        style={{
+          width: 320,
+          padding: '6px 12px',
+          flex: '0 1 320px',
+        }}
+      >
+        <input
+          ref={inputRef}
+          placeholder="e.g. reader summary lenses, cache encryption…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') submit();
+          }}
+        />
+      </div>
+      <button className="btn" onClick={submit} type="button" title="Open /search with this query in Sessions mode">
+        Search sessions
+      </button>
     </div>
   );
 }

@@ -34,8 +34,32 @@ const MODE_HINTS: Record<SearchMode, string> = {
     'Substring search over agent-declared feature names — best when you remember what you SHIPPED but not which session shipped it.',
 };
 
+/**
+ * URL search params for the search page. Both fields optional so
+ * a bare `/search` visit still works.
+ *
+ * Deep-links from elsewhere in the dashboard (e.g. the /sessions
+ * page's topic-search callout) populate these so the user lands
+ * on a pre-filled, mode-correct view.
+ */
+type SearchParams = {
+  q?: string;
+  mode?: SearchMode;
+};
+
 export const Route = createFileRoute('/search')({
   component: SearchPage,
+  validateSearch: (raw: Record<string, unknown>): SearchParams => {
+    const out: SearchParams = {};
+    if (typeof raw.q === 'string' && raw.q.length > 0) out.q = raw.q;
+    if (
+      typeof raw.mode === 'string' &&
+      (raw.mode === 'memories' || raw.mode === 'sessions' || raw.mode === 'features')
+    ) {
+      out.mode = raw.mode;
+    }
+    return out;
+  },
 });
 
 type Chip = { k: string; v: string };
@@ -124,8 +148,12 @@ type SearchResultRow = RetrieveHit & {
 };
 
 function SearchPage() {
-  const [mode, setMode] = useState<SearchMode>('sessions');
-  const [q, setQ] = useState('');
+  // Pre-fill from URL search params on first render so deep-links
+  // from elsewhere in the dashboard (e.g. /sessions topic-search
+  // callout) land on the right mode + query without an extra click.
+  const params = Route.useSearch();
+  const [mode, setMode] = useState<SearchMode>(params.mode ?? 'sessions');
+  const [q, setQ] = useState(params.q ?? '');
   // `qDebounced` is what we hand to React Query as the query key. Keeping
   // it separate from `q` (which drives the input) means the input stays
   // snappy while the actual retrieve fires at most once per ~250ms.
