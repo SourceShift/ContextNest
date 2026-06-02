@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
+import { FragmentInspectorModal } from '@/components/FragmentInspectorModal';
 import { api } from '@/lib/api';
 import { useSessions, useKnownProjects } from '@/hooks/useSessions';
 import type { FeatureHit, FileMatch, RetrieveHit } from '@/lib/types';
@@ -189,6 +190,10 @@ function SearchPage() {
   const [limit, setLimit] = useState<number>(50);
   const [dateRange, setDateRange] = useState<DateRange>('all');
   const [focused, setFocused] = useState(0);
+  // Fragment inspector modal — null means closed. Holds the full hit
+  // so the modal renders without re-fetching; survives mode changes
+  // but not full page navigations.
+  const [inspecting, setInspecting] = useState<RetrieveHit | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const sessions = useSessions();
   const knownProjects = useKnownProjects();
@@ -666,6 +671,17 @@ function SearchPage() {
                 key={r.id}
                 className={`search-result${focused === i ? ' focused' : ''}`}
                 onMouseEnter={() => setFocused(i)}
+                onClick={() => setInspecting(r)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setInspecting(r);
+                  }
+                }}
+                style={{ cursor: 'pointer' }}
+                title="Click to inspect — full content, all metadata, basin context"
               >
                 <div>
                   <div className="meta-row">
@@ -710,6 +726,8 @@ function SearchPage() {
           .
         </span>
       </div>
+
+      <FragmentInspectorModal hit={inspecting} onClose={() => setInspecting(null)} />
     </div>
   );
 }
