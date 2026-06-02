@@ -17,6 +17,7 @@ pub mod embedding_providers;
 pub mod fragment_id;
 pub mod graph;
 pub mod graph_enhanced;
+pub mod kind_registry;
 pub mod llm;
 pub mod llm_cache;
 pub mod llm_cache_crypto;
