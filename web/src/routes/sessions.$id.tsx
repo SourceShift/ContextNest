@@ -125,6 +125,21 @@ function SessionDetailPage() {
           {currentPhase ?? (isLoading ? 'loading…' : 'no phase recorded')}
         </span>
         <span className="when">last activity · {lastActivity}</span>
+        {/* Ticket #11 — download session as markdown. Composes from
+            the SessionDetail that's already loaded; no extra fetch.
+            Disabled while still loading. */}
+        <button
+          className="btn btn-ghost sm"
+          type="button"
+          disabled={isLoading || !d}
+          onClick={() =>
+            downloadSessionMarkdown(session?.id ?? id, project, lastActivity, d)
+          }
+          title="Download all loaded sections as a single markdown file"
+          style={{ marginLeft: 'auto', fontSize: 11 }}
+        >
+          <Icon.Send /> Download .md
+        </button>
       </div>
 
       <div className="grid-3" style={{ marginBottom: 18 }}>
@@ -608,4 +623,88 @@ function Stat({
       </div>
     </div>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ticket #11 — session-to-markdown export
+//
+// Composes the SessionDetail (already loaded for the detail page render)
+// into a single markdown document and triggers a browser download.
+// FE-side composition so no new BE endpoint needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { SessionDetail as SessionDetailFromHook } from '@/hooks/useSessionDetail';
+
+function fmtSection(title: string, hits: RetrieveHit[]): string {
+  if (!hits || hits.length === 0) return '';
+  const lines: string[] = [];
+  lines.push(`## ${title}`);
+  lines.push('');
+  for (const h of hits) {
+    const ts = (h.metadata.ts as string | undefined) ?? '';
+    const importance =
+      typeof h.importance === 'number' ? ` · importance ${h.importance.toFixed(2)}` : '';
+    const head = ts ? `### ${ts}${importance}` : `### (no timestamp)${importance}`;
+    lines.push(head);
+    lines.push('');
+    lines.push(h.content || '_(empty)_');
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function composeMarkdown(
+  sessionId: string,
+  project: string,
+  lastActivity: string,
+  d: SessionDetailFromHook | undefined,
+): string {
+  const out: string[] = [];
+  out.push(`# Session ${sessionId}`);
+  out.push('');
+  out.push(`- **Project**: \`${project}\``);
+  out.push(`- **Last activity**: ${lastActivity}`);
+  if (d?.trajectory) {
+    out.push(`- **Trajectory phases**: ${d.trajectory.trajectory_count ?? 0}`);
+  }
+  out.push('');
+  out.push('---');
+  out.push('');
+
+  if (d) {
+    out.push(fmtSection('Goal phases', d.goalPhases));
+    out.push(fmtSection('User actions', d.userActions));
+    out.push(fmtSection('Decisions', d.decisions));
+    out.push(fmtSection('Blockers', d.blockers));
+    out.push(fmtSection('Todos', d.todos));
+    out.push(fmtSection('Accomplishments', d.accomplishments));
+    out.push(fmtSection('Learnings', d.learnings));
+  }
+  out.push('');
+  out.push(`_Exported from ContextNest dashboard — ${new Date().toISOString()}_`);
+  out.push('');
+  return out.filter((s) => s !== '').join('\n');
+}
+
+function downloadSessionMarkdown(
+  sessionId: string,
+  project: string,
+  lastActivity: string,
+  d: SessionDetailFromHook | null | undefined,
+): void {
+  const md = composeMarkdown(sessionId, project, lastActivity, d ?? undefined);
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  // Filename: cn-session-<first-8>-<yyyymmdd>.md — readable + uniquely
+  // identifiable by both session and export date.
+  const short = sessionId.slice(0, 8);
+  const yyyymmdd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  a.download = `cn-session-${short}-${yyyymmdd}.md`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Free the blob memory after the click navigation has consumed it.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
