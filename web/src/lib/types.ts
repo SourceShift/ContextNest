@@ -96,6 +96,19 @@ export type SubstrateConfigResponse = {
   };
 };
 
+/** Body of `GET /llm/v1/cache/stats` — LLM proxy cache counters.
+ * Used by /llm-cache dashboard page (Ticket #5) to answer
+ * "is the cache actually saving us money?". Field names mirror
+ * `CacheStats` in `src/services/llm_cache.rs` exactly so Prometheus
+ * JSON scrapers don't need a translator. */
+export type LlmCacheStats = {
+  total_entries: number;
+  total_hits: number;
+  total_misses: number;
+  /** hits / (hits + misses), or 0.0 when no lookups have happened. */
+  hit_rate: number;
+};
+
 export type SessionListItem = {
   id: string;
   fragment_count: number;
