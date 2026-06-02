@@ -416,6 +416,100 @@ body {
   flex: 1;
 }
 
+.scope-picker {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.scope-picker-label {
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.scope-picker-input {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  padding: 6px 28px 6px 10px;
+  font-size: 12px;
+  outline: none;
+}
+.scope-picker-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-faint);
+}
+.scope-picker-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.scope-picker-clear {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: 0;
+  color: var(--ink-faint);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 5px;
+}
+.scope-picker-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  box-shadow: var(--shadow-pop);
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 4px;
+  z-index: 60;
+}
+.scope-picker-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+.scope-picker-row span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scope-picker-row.highlighted {
+  background: var(--surface-2);
+}
+.scope-picker-row.selected {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.scope-picker-meta {
+  color: var(--ink-faint);
+  flex-shrink: 0;
+  font-size: 10.5px;
+}
+.scope-picker-empty {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  font-style: italic;
+  padding: 14px 8px;
+}
+
 .tabs {
   display: inline-flex;
   background: var(--surface-1);
@@ -2086,7 +2180,9 @@ body {
   padding: 8px 10px;
   gap: 4px;
   cursor: pointer;
-  transition: border-color 120ms ease, background 120ms ease;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
 }
 .field-query-hit:hover {
   border-color: var(--accent);
@@ -2244,7 +2340,10 @@ body {
   font-family: var(--font-mono);
   font-size: 11px;
   cursor: pointer;
-  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    color 120ms ease;
 }
 .btn-chip:hover {
   background: var(--surface-2);

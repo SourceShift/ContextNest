@@ -92,6 +92,40 @@ async fn basins_endpoint_returns_project_fallback_before_consolidation() {
 }
 
 #[tokio::test]
+async fn basins_endpoint_filters_project_fallback_by_project_and_session() {
+    let (services, server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+    sink.store(&rec("alpha one", "cn-test-alpha-a", "/home/u/alpha"))
+        .await
+        .unwrap();
+    sink.store(&rec("alpha two", "cn-test-alpha-b", "/home/u/alpha"))
+        .await
+        .unwrap();
+    sink.store(&rec("beta one", "cn-test-beta", "/home/u/beta"))
+        .await
+        .unwrap();
+
+    let res = server.get("/api/v1/field/basins?project=alpha").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let basins = body["basins"].as_array().expect("basins array");
+    assert_eq!(basins.len(), 1);
+    assert_eq!(basins[0]["label"], "alpha");
+    assert_eq!(basins[0]["mass"], 2);
+
+    let res = server
+        .get("/api/v1/field/basins?project=alpha&session_id=cn-test-alpha-a")
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let basins = body["basins"].as_array().expect("basins array");
+    assert_eq!(basins.len(), 1);
+    assert_eq!(basins[0]["label"], "alpha");
+    assert_eq!(basins[0]["mass"], 1);
+    assert_eq!(basins[0]["sessions"], json!(["cn-test-alpha-a"]));
+}
+
+#[tokio::test]
 async fn basins_endpoint_returns_real_attractors_after_consolidation() {
     let (services, server) = make_setup().await;
     let sink = ServicesSink::new(services.clone());

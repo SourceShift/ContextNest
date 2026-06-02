@@ -114,12 +114,23 @@ export const api = {
     );
   },
 
-  basins: () =>
-    request<BasinsResponse>('/api/v1/field/basins', { method: 'GET' }),
+  basins: (params: { project?: string; session_id?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.project) q.set('project', params.project);
+    if (params.session_id) q.set('session_id', params.session_id);
+    const qs = q.toString();
+    return request<BasinsResponse>(
+      `/api/v1/field/basins${qs ? `?${qs}` : ''}`,
+      { method: 'GET' },
+    );
+  },
 
-  connections: (params: { session_id?: string; limit?: number } = {}) => {
+  connections: (
+    params: { session_id?: string; project?: string; limit?: number } = {},
+  ) => {
     const q = new URLSearchParams();
     if (params.session_id) q.set('session_id', params.session_id);
+    if (params.project) q.set('project', params.project);
     if (params.limit) q.set('limit', String(params.limit));
     const qs = q.toString();
     return request<ConnectionsResponse>(
