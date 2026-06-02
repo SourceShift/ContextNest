@@ -160,3 +160,97 @@ async fn basin_avg_mass_reflects_real_membership() {
         assert!(max >= 1);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `GET /api/v1/substrate/config` — Ticket #6 from the coverage epic
+// (docs/todos/20260602-1230-cn-value-prop-coverage-epic.md).
+//
+// Pins the read-only config-snapshot endpoint that lets operators answer
+// "what's actually configured at runtime?" without grepping `config.toml`.
+// The shape is contract-stable because the dashboard's /config page reads
+// it directly — renaming any field here would break the FE silently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn substrate_config_endpoint_returns_snapshot_with_expected_field_names() {
+    let (_services, server) = make_setup().await;
+    let res = server.get("/api/v1/substrate/config").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    // Top-level shape — these field names are the wire contract.
+    for field in ["version", "git_commit", "embedding", "llm", "llm_cache"] {
+        assert!(
+            body.get(field).is_some(),
+            "top-level field `{field}` must be present"
+        );
+    }
+
+    // version is a non-empty string from CARGO_PKG_VERSION (currently 0.1.0).
+    let v = body["version"].as_str().expect("version is a string");
+    assert!(!v.is_empty(), "version must be non-empty");
+
+    // git_commit defaults to "unknown" when CONTEXTNEST_GIT_COMMIT is unset
+    // at build time. Either case is valid wire-shape.
+    assert!(
+        body["git_commit"].is_string(),
+        "git_commit must be a string"
+    );
+
+    // Embedding block.
+    let model = body["embedding"]["model"]
+        .as_str()
+        .expect("embedding.model is a string");
+    assert!(!model.is_empty(), "embedding.model must be non-empty");
+
+    // LLM block.
+    assert!(body["llm"]["enabled"].is_boolean());
+    assert!(body["llm"]["configured_providers"].is_array());
+    // default_provider is nullable.
+    let dp = &body["llm"]["default_provider"];
+    assert!(
+        dp.is_null() || dp.is_string(),
+        "llm.default_provider must be null or string"
+    );
+
+    // LLM cache block — all four required.
+    for field in [
+        "encryption_enabled",
+        "similarity_threshold",
+        "default_ttl_secs",
+        "total_entries",
+    ] {
+        assert!(
+            body["llm_cache"].get(field).is_some(),
+            "llm_cache.{field} must be present"
+        );
+    }
+    assert!(body["llm_cache"]["encryption_enabled"].is_boolean());
+    assert!(body["llm_cache"]["similarity_threshold"].is_number());
+    // Default TTL from kind_registry/llm_cache is 3600 secs.
+    assert_eq!(
+        body["llm_cache"]["default_ttl_secs"].as_u64().unwrap(),
+        3600,
+        "default_ttl_secs must match the substrate's documented default"
+    );
+}
+
+#[tokio::test]
+async fn substrate_config_endpoint_reflects_disabled_llm_in_mock_mode() {
+    // Default mock-mode setup has no LLM provider configured.
+    // The config snapshot should reflect that honestly so operators
+    // immediately see "summarize will fall through to stats-only".
+    let (_services, server) = make_setup().await;
+    let res = server.get("/api/v1/substrate/config").await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    let enabled = body["llm"]["enabled"].as_bool().unwrap();
+    let providers = body["llm"]["configured_providers"].as_array().unwrap();
+    if !enabled {
+        assert!(
+            providers.is_empty(),
+            "configured_providers must be empty when llm.enabled = false"
+        );
+    }
+}

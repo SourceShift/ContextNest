@@ -15,7 +15,8 @@ type NavKey =
   | 'features'
   | 'field'
   | 'tools'
-  | 'substrate';
+  | 'substrate'
+  | 'config';
 
 type NavItem = {
   k: NavKey;
@@ -28,7 +29,8 @@ type NavItem = {
     | '/features'
     | '/field'
     | '/tools'
-    | '/substrate';
+    | '/substrate'
+    | '/config';
   label: string;
   icon: React.ReactNode;
   kbd: string;
@@ -131,6 +133,13 @@ export function Sidebar() {
       label: 'Substrate',
       icon: <Icon.Cpu className="nav-icon" />,
       kbd: 'g o',
+    },
+    {
+      k: 'config',
+      to: '/config',
+      label: 'Config',
+      icon: <Icon.Filter className="nav-icon" />,
+      kbd: 'g c',
     },
   ];
 
