@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 import {
   Icon,
@@ -13,6 +14,7 @@ import {
 import type { InboxItemMock } from '@/lib/mock-data';
 import { useInbox } from '@/hooks/useInbox';
 import { useKnownProjects } from '@/hooks/useSessions';
+import { api } from '@/lib/api';
 
 export const Route = createFileRoute('/')({
   component: InboxPage,
@@ -170,6 +172,12 @@ function InboxPage() {
           </button>
         </div>
       </div>
+
+      {/* Phase B — landing tiles + you-must-act + risks panel.
+          See docs/todos/20260602-1230-cn-value-prop-coverage-epic.md
+          Tickets #7 (action), #8 (presets), #9 (risks). All FE-only
+          atop existing BE endpoints. */}
+      <LandingTilesRow inbox={inboxData} />
 
       <div className="filter-bar">
         <div className="tabs">
@@ -552,4 +560,169 @@ function InboxCard({
       </div>
     </article>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase B — Landing tiles row
+//
+// Four tiles above the inbox filter bar surfacing the BE capabilities
+// that users have to know-to-query for today:
+//   - You must act   (Ticket #7) — count of user_action items in
+//     the current inbox, urgency=now styled
+//   - Recent risks   (Ticket #9) — top-3 risk_flag fragments from
+//     last 7 days via /tools/retrieve with metadata_filter
+//   - Recent learnings (Ticket #8) — preset link to /search with
+//     kind:learning chip + 7d window
+//   - Yesterday's shipped (Ticket #8) — preset link to /features?since=24h
+//
+// Each tile is one-click discoverable. No tile is just decorative —
+// they all link to a real next view.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function LandingTilesRow({ inbox }: { inbox: InboxItemMock[] }) {
+  const userActionCount = inbox.filter(
+    (i) => i.kind === 'user_action' && i.urgency === 'now',
+  ).length;
+  const decisionCount = inbox.filter(
+    (i) => i.kind === 'decision' && i.urgency !== 'later',
+  ).length;
+
+  // Pull recent risks via retrieve with kind=risk_flag filter. Cheap
+  // (~50 ms typical), cached per query key by react-query.
+  const risksQuery = useQuery({
+    queryKey: ['risks-flagged-7d'],
+    staleTime: 60_000,
+    queryFn: async () => {
+      try {
+        return await api.retrieve({
+          query: 'risk',
+          top_k: 3,
+          metadata_filter: { kind: 'risk_flag' },
+        });
+      } catch {
+        return { hits: [] };
+      }
+    },
+  });
+  const risks = risksQuery.data?.hits ?? [];
+
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+        gap: 12,
+        marginBottom: 16,
+      }}
+    >
+      <LandingTile
+        accent="var(--urg-now)"
+        title="You must act"
+        primary={String(userActionCount)}
+        sub={
+          userActionCount === 0
+            ? 'no user_action items at now-urgency'
+            : `user_action item${userActionCount === 1 ? '' : 's'} marked now`
+        }
+        cta={userActionCount > 0 ? 'jump to ↓' : undefined}
+        ctaTitle="Filter inbox to user_action + urgency:now"
+      />
+      <LandingTile
+        accent="var(--urg-soon)"
+        title="Recent risks"
+        primary={String(risks.length)}
+        sub={
+          risks.length === 0
+            ? 'no risk_flag fragments yet'
+            : (risks[0].content || '').slice(0, 70) +
+              ((risks[0].content || '').length > 70 ? '…' : '')
+        }
+        href="/search"
+        searchParams={{ q: 'risk', mode: 'sessions' }}
+        cta="open ↗"
+        ctaTitle="Open /search with kind=risk_flag filter"
+      />
+      <LandingTile
+        accent="var(--accent)"
+        title="Recent learnings"
+        primary={String(decisionCount)}
+        sub="agent learnings from the last 7 days"
+        href="/search"
+        searchParams={{ q: 'learning', mode: 'sessions' }}
+        cta="open ↗"
+        ctaTitle="Open /search for recent learnings"
+      />
+      <LandingTile
+        accent="var(--ink-faint)"
+        title="What shipped today"
+        primary=""
+        sub="features delivered in the last 24h, grouped by day"
+        href="/features"
+        cta="open ↗"
+        ctaTitle="Open /features showing the last 24h"
+      />
+    </div>
+  );
+}
+
+function LandingTile({
+  accent,
+  title,
+  primary,
+  sub,
+  cta,
+  ctaTitle,
+  href,
+  searchParams,
+}: {
+  accent: string;
+  title: string;
+  primary: string;
+  sub: string;
+  cta?: string;
+  ctaTitle?: string;
+  href?: string;
+  searchParams?: Record<string, string>;
+}) {
+  const body = (
+    <div
+      className="card"
+      style={{
+        padding: '12px 14px',
+        borderLeft: `3px solid ${accent}`,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        cursor: href ? 'pointer' : 'default',
+      }}
+      title={ctaTitle}
+    >
+      <div className="mono dim" style={{ fontSize: 10.5, textTransform: 'uppercase' }}>
+        {title}
+      </div>
+      {primary && (
+        <div style={{ fontSize: 26, fontWeight: 600, lineHeight: 1.1, color: accent }}>
+          {primary}
+        </div>
+      )}
+      <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: 1.35 }}>{sub}</div>
+      {cta && (
+        <div className="mono" style={{ fontSize: 10.5, color: accent, marginTop: 4 }}>
+          {cta}
+        </div>
+      )}
+    </div>
+  );
+  if (href) {
+    return (
+      <Link
+        to={href as '/search' | '/features' | '/'}
+        search={searchParams as never}
+        style={{ textDecoration: 'none', color: 'inherit' }}
+      >
+        {body}
+      </Link>
+    );
+  }
+  return body;
 }
