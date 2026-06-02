@@ -9,6 +9,8 @@ import type {
   RetrieveResponse,
   SessionListResponse,
   SessionsByFeatureResponse,
+  SessionsByFileResponse,
+  SessionSummaryResponse,
   StatsResponse,
   StatusResponse,
   TrajectoryResponse,
@@ -157,6 +159,33 @@ export const api = {
   sessionsByFeature: (q: string) =>
     request<SessionsByFeatureResponse>(
       `/api/v1/sessions/by-feature?q=${encodeURIComponent(q)}`,
+      { method: 'GET' },
+    ),
+
+  /**
+   * Substring search across every session's `files_touched` list.
+   * Use this when you remember the file you edited but not WHICH
+   * SESSION edited it. Substring is case-insensitive — pass a
+   * basename like `AgentStreamRail.tsx` or a partial path. Backed by
+   * `GET /api/v1/sessions/by-file?path=<substr>`. Note the BE query
+   * param is `path=` (legacy naming) even though the matching is
+   * substring not exact.
+   */
+  sessionsByFile: (q: string) =>
+    request<SessionsByFileResponse>(
+      `/api/v1/sessions/by-file?path=${encodeURIComponent(q)}`,
+      { method: 'GET' },
+    ),
+
+  /**
+   * One-paragraph LLM-generated summary of a session. Cheap to call —
+   * the substrate caches summaries server-side and regenerates only
+   * when stale. Used by the search-result inline preview (ticket #2)
+   * and the session detail page header.
+   */
+  sessionSummary: (sessionId: string) =>
+    request<SessionSummaryResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/summary`,
       { method: 'GET' },
     ),
 };
