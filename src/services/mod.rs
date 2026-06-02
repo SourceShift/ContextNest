@@ -4,6 +4,31 @@
 //! the plugin SDK.
 
 use crate::config::{EmbeddingServicesConfig, ParserConfig};
+
+/// One entry in the session-intent embedding cache. The `text_hash`
+/// fingerprints the input string used to generate `embedding` so we
+/// can detect when the underlying session intent has drifted (new
+/// goal_phase fragment, topics changed) without storing the full
+/// text twice. Cheap (~8 bytes for the hash, +384 floats for a
+/// typical embedding) compared to re-embedding on every query.
+#[derive(Debug, Clone)]
+pub struct SessionIntentEntry {
+    /// Stable fingerprint of the intent text that produced
+    /// `embedding`. Compare against a freshly-computed intent text's
+    /// hash to decide cache hit vs miss.
+    pub text_hash: u64,
+    /// The intent text itself, retained so the cached embedding can
+    /// be explained to the operator ("we embedded X to rank this
+    /// session"). Bounded by the session-summary projection (a few
+    /// hundred bytes typical, low single-digit KB worst case).
+    pub intent_text: String,
+    /// Cached embedding vector. Same dim as the configured embedder.
+    pub embedding: Vec<f32>,
+    /// Domain field (e.g. "research", "backend") if the session's
+    /// summary aggregation found one. Stored so the by-intent
+    /// endpoint can filter without re-aggregating per query.
+    pub domain: Option<String>,
+}
 use crate::error::ContextNestResult;
 use crate::memory::attractors::{MemoryAttractorConfig, MemoryAttractorManager};
 use crate::Config;
@@ -104,6 +129,23 @@ pub struct ContextNestServices {
     /// reads. Soft-capped at 20k entries (drops oldest-ish on
     /// overflow). Lost on restart.
     pub embeddings_by_id: Arc<tokio::sync::RwLock<HashMap<String, Vec<f32>>>>,
+    /// Per-session **intent-text** embedding cache (Option C from the
+    /// retrieve-architecture upgrade). Key = session_id; value =
+    /// (intent_text_hash, embedding). The intent text is a
+    /// concatenation of the session's `domain`, `topics`, `goal`, and
+    /// `current_state` summary fields — the load-bearing "what was
+    /// this session ABOUT" signal that lets `/sessions/by-intent`
+    /// rank sessions on semantic intent rather than fragment-token
+    /// overlap.
+    ///
+    /// The hash lets us detect when intent text has changed
+    /// (new fragments shifted the goal/topics) without storing the
+    /// full text twice. On cache hit AND hash match we skip the
+    /// EmbeddingService call entirely. Lost on restart; the first
+    /// `/by-intent` query post-restart re-embeds every active
+    /// session's intent (typically O(N) bounded concurrent embeddings,
+    /// then steady-state cache hits).
+    pub session_intent_embeddings: Arc<tokio::sync::RwLock<HashMap<String, SessionIntentEntry>>>,
     /// Write-ahead log handle, populated **after** any startup replay so
     /// that replaying records doesn't re-trigger WAL appends (a classic
     /// double-log bug). `None` (uninitialised OnceCell) means no
@@ -200,6 +242,11 @@ impl ContextNestServices {
         let fragment_metadata = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let connection_log = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let embeddings_by_id = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        // Option C — session-intent embedding cache. Empty on boot;
+        // populated lazily by the first /sessions/by-intent query
+        // post-restart. Each entry holds (text_hash, intent_text,
+        // embedding, domain) for one session.
+        let session_intent_embeddings = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let consolidation_queue = Arc::new(consolidation::ConsolidationQueue::new());
 
         // Construct the LLM service from environment. Returns Disabled when no
@@ -262,6 +309,7 @@ impl ContextNestServices {
             fragment_metadata,
             connection_log,
             embeddings_by_id,
+            session_intent_embeddings,
             consolidation_queue,
             wal: wal_cell,
             llm,
