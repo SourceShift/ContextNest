@@ -335,6 +335,103 @@ pub async fn admin_merge_nearby_basins(
     }))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/substrate/config — read-only snapshot of what's actually
+// configured at runtime.
+//
+// Ticket #6 from docs/todos/20260602-1230-cn-value-prop-coverage-epic.md.
+//
+// Solves the recurring "is the latest binary actually running?" question
+// that bit the operator multiple times during the v0.3 epic: the dashboard
+// showed expected output, but the substrate was on a stale binary that
+// predated kind taxonomy / encryption / Qwen3 embedder swaps. With this
+// endpoint, a single curl tells you exactly which embedder is live, which
+// LLM provider is configured, whether the LLM cache is encrypted, and
+// what binary version is serving the request.
+//
+// All fields are derived from the running ContextNestServices — no
+// secrets, no env-var values, no API keys. Safe to expose without auth.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct SubstrateConfigResponse {
+    /// Compile-time package version (CARGO_PKG_VERSION).
+    pub version: &'static str,
+    /// Compile-time git commit short SHA when available (set via the
+    /// CONTEXTNEST_GIT_COMMIT env var at build time), else "unknown".
+    /// Lets the operator confirm which binary is running.
+    pub git_commit: &'static str,
+    pub embedding: EmbeddingConfigView,
+    pub llm: LlmConfigView,
+    pub llm_cache: LlmCacheConfigView,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingConfigView {
+    /// Model identifier the substrate is configured to use. Local
+    /// TF-IDF fallback reports "local"; remote providers report the
+    /// model id ("Qwen/Qwen3-Embedding-0.6B", "text-embedding-3-small", etc).
+    pub model: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmConfigView {
+    /// `true` when at least one LLM provider has been configured (env
+    /// var present + parsed). When `false`, summarize / chat-proxy
+    /// endpoints degrade to statistics-only / 503.
+    pub enabled: bool,
+    /// Default provider kind: "anthropic" / "openai" / "google" / "custom".
+    /// `None` when no provider is configured.
+    pub default_provider: Option<&'static str>,
+    /// Every configured provider kind (default + additional providers
+    /// for multi-provider routing per v0.3 slice 1.3c). Empty when
+    /// `enabled == false`.
+    pub configured_providers: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmCacheConfigView {
+    /// `true` when AES-256-GCM encryption is wired (v0.3 slice 3.1).
+    /// Driven by the `CONTEXTNEST_LLM_CACHE_ENCRYPTION_KEY` env var at
+    /// startup; flipping it requires restart.
+    pub encryption_enabled: bool,
+    /// Cosine-similarity threshold for semantic-match cache hits.
+    /// Default 0.92 per roadmap; tunable via builder.
+    pub similarity_threshold: f32,
+    /// Default TTL seconds for cache entries. Default 3600s; per-request
+    /// override via `x-cn-cache-max-age` header still wins.
+    pub default_ttl_secs: u64,
+    /// Live entry count in the in-memory store. Zero on a fresh start
+    /// before any chat-completion is cached.
+    pub total_entries: usize,
+}
+
+/// `GET /api/v1/substrate/config` — read-only config snapshot.
+pub async fn get_substrate_config(
+    State(services): State<ContextNestServices>,
+) -> Json<SubstrateConfigResponse> {
+    let stats = services.llm_cache.stats();
+    let configured_providers = services.llm.configured_provider_kinds();
+    Json(SubstrateConfigResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        git_commit: option_env!("CONTEXTNEST_GIT_COMMIT").unwrap_or("unknown"),
+        embedding: EmbeddingConfigView {
+            model: services.embedding.configured_model_name().to_string(),
+        },
+        llm: LlmConfigView {
+            enabled: services.llm.is_enabled(),
+            default_provider: services.llm.provider_kind(),
+            configured_providers,
+        },
+        llm_cache: LlmCacheConfigView {
+            encryption_enabled: services.llm_cache.encryption_enabled(),
+            similarity_threshold: services.llm_cache.similarity_threshold(),
+            default_ttl_secs: services.llm_cache.default_ttl().as_secs(),
+            total_entries: stats.total_entries,
+        },
+    })
+}
+
 pub fn create_substrate_router() -> Router<ContextNestServices> {
     Router::new()
         .route(
@@ -342,6 +439,7 @@ pub fn create_substrate_router() -> Router<ContextNestServices> {
             get(get_consolidation_status),
         )
         .route("/api/v1/substrate/health", get(get_substrate_health))
+        .route("/api/v1/substrate/config", get(get_substrate_config))
         .route(
             "/api/v1/admin/merge-nearby-basins",
             post(admin_merge_nearby_basins),

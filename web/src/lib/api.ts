@@ -13,6 +13,7 @@ import type {
   SessionSummaryResponse,
   StatsResponse,
   StatusResponse,
+  SubstrateConfigResponse,
   TrajectoryResponse,
 } from './types';
 
@@ -53,6 +54,17 @@ export const api = {
   health: () => request<HealthResponse>('/api/health', { method: 'GET' }),
 
   status: () => request<StatusResponse>('/api/status', { method: 'GET' }),
+
+  /**
+   * Read-only snapshot of the substrate's runtime config: embedder
+   * model, LLM provider, cache encryption/threshold/TTL, build info.
+   * Used by /config (Ticket #6) to surface "what's actually live?"
+   * without grepping config.toml.
+   */
+  substrateConfig: () =>
+    request<SubstrateConfigResponse>('/api/v1/substrate/config', {
+      method: 'GET',
+    }),
 
   retrieve: (params: {
     query: string;

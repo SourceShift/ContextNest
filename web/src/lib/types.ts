@@ -64,6 +64,38 @@ export type StatusResponse = {
   description: string;
 };
 
+/** Body of `GET /api/v1/substrate/config` — read-only runtime config
+ * snapshot. Used by /config dashboard page (Ticket #6) to answer
+ * "what's actually configured on the running binary?" without
+ * shelling into the host or grepping config.toml. */
+export type SubstrateConfigResponse = {
+  /** Compile-time CARGO_PKG_VERSION. */
+  version: string;
+  /** Build-time git commit short SHA (via CONTEXTNEST_GIT_COMMIT env)
+   * or "unknown" when not provided to the compiler. */
+  git_commit: string;
+  embedding: {
+    /** Configured embedding model identifier. "local" for the TF-IDF
+     * fallback; otherwise the HuggingFace path like
+     * "Qwen/Qwen3-Embedding-0.6B" or OpenAI's "text-embedding-3-small". */
+    model: string;
+  };
+  llm: {
+    /** false when no API key is set; summarize falls back to stats-only. */
+    enabled: boolean;
+    /** "anthropic" / "openai" / "google" / "custom" / null. */
+    default_provider: string | null;
+    /** Union of default + multi-provider routing kinds. */
+    configured_providers: string[];
+  };
+  llm_cache: {
+    encryption_enabled: boolean;
+    similarity_threshold: number;
+    default_ttl_secs: number;
+    total_entries: number;
+  };
+};
+
 export type SessionListItem = {
   id: string;
   fragment_count: number;
