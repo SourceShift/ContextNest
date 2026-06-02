@@ -62,6 +62,12 @@ export const api = {
      * `session_id`. `session_id` (singular) is ignored when this is set. */
     session_ids?: string[];
     metadata_filter?: Record<string, unknown>;
+    /** Drop fragments whose `metadata.kind` is in this list. Pair with
+     * `metadata_filter` (inclusion) — both must pass for a fragment to
+     * land in results. Use for noise classes like `initial_prompt_window`
+     * that every session has and that dominate topic queries via
+     * shared substrings under the TF-IDF embedder. */
+    exclude_kinds?: string[];
   }) =>
     request<RetrieveResponse>('/api/v1/tools/retrieve', {
       method: 'POST',

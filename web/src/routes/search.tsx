@@ -147,6 +147,19 @@ type SearchResultRow = RetrieveHit & {
   project: string;
 };
 
+/**
+ * Fragment kinds that every session has and which contain boilerplate
+ * substrings ("[user turn N] ..." etc.) that systematically dominate
+ * topic queries via shared tokens under the TF-IDF embedder.
+ *
+ * Excluded by default in topic-search modes (`sessions`). Memories
+ * mode keeps everything because that's the explicit "show me every
+ * fragment" view. Users can re-include via the
+ * `Include boilerplate` toggle when they specifically WANT to find a
+ * session by its opening user prompt.
+ */
+const NOISE_KINDS_FOR_TOPIC_SEARCH = ['initial_prompt_window'];
+
 function SearchPage() {
   // Pre-fill from URL search params on first render so deep-links
   // from elsewhere in the dashboard (e.g. /sessions topic-search
@@ -154,6 +167,10 @@ function SearchPage() {
   const params = Route.useSearch();
   const [mode, setMode] = useState<SearchMode>(params.mode ?? 'sessions');
   const [q, setQ] = useState(params.q ?? '');
+  // ON by default: noise kinds are dropped server-side in topic-search
+  // modes. The "search is garbage" rage came from these dominating
+  // Sessions-mode results. Power users can flip OFF to opt back in.
+  const [hideBoilerplate, setHideBoilerplate] = useState(true);
   // `qDebounced` is what we hand to React Query as the query key. Keeping
   // it separate from `q` (which drives the input) means the input stays
   // snappy while the actual retrieve fires at most once per ~250ms.
@@ -296,6 +313,10 @@ function SearchPage() {
       dateRange,
       sortMode,
       limit,
+      // Mode + hideBoilerplate change the BE request (exclude_kinds),
+      // so they must be part of the cache key.
+      mode,
+      hideBoilerplate,
     ],
     enabled:
       qDebounced.trim().length > 0 &&
@@ -313,6 +334,13 @@ function SearchPage() {
         dateRange !== 'all';
       const top_k = Math.min(200, clientSideActive ? Math.max(limit * 3, 100) : limit);
 
+      // Default-drop noise kinds in topic-search modes. The Memories
+      // mode user explicitly asked for the raw-fragment view so we
+      // never strip there — keep that behaviour for power-users.
+      const excludeKinds =
+        hideBoilerplate && mode !== 'memories'
+          ? NOISE_KINDS_FOR_TOPIC_SEARCH
+          : undefined;
       const res = await api.retrieve({
         query: qDebounced,
         top_k,
@@ -323,6 +351,7 @@ function SearchPage() {
             : {}),
         metadata_filter:
           Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
+        exclude_kinds: excludeKinds,
       });
       const fallbackSession = singleSession ?? '';
       const rows: SearchResultRow[] = res.hits.map((hit) => {
@@ -452,6 +481,30 @@ function SearchPage() {
         <SortMenu value={sortMode} onChange={setSortMode} />
         <DateRangeMenu value={dateRange} onChange={setDateRange} />
         <LimitMenu value={limit} onChange={setLimit} />
+        {/* Topic-search modes default-drop noise kinds; Memories mode
+            keeps the toggle hidden because that mode is the explicit
+            "show me every fragment" view and stripping there would
+            contradict the mode's contract. */}
+        {mode !== 'memories' && (
+          <button
+            className="btn"
+            type="button"
+            onClick={() => setHideBoilerplate((v) => !v)}
+            title={
+              hideBoilerplate
+                ? `Boilerplate kinds (${NOISE_KINDS_FOR_TOPIC_SEARCH.join(
+                    ', ',
+                  )}) dropped from results. Click to include them.`
+                : 'Boilerplate kinds are being included — these dominate topic queries via shared tokens. Click to hide them.'
+            }
+          >
+            <Icon.Filter className="ic" />
+            <span>
+              boilerplate:{' '}
+              <span className="mono">{hideBoilerplate ? 'hidden' : 'shown'}</span>
+            </span>
+          </button>
+        )}
         <div className="grow" />
         {(chipsByKey.kind.length > 1 ||
           chipsByKey.urgency.length > 1 ||
