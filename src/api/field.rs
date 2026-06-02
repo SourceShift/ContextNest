@@ -80,6 +80,23 @@ fn default_limit() -> usize {
     250
 }
 
+fn project_basename(cwd: &str) -> &str {
+    cwd.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("unknown")
+}
+
+fn meta_matches_project(
+    meta: Option<&HashMap<String, serde_json::Value>>,
+    filter_project: &str,
+) -> bool {
+    meta.and_then(|m| m.get("project_cwd"))
+        .and_then(|v| v.as_str())
+        .map(|cwd| project_basename(cwd) == filter_project)
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Serialize)]
 pub struct FragmentRow {
     pub id: String,
@@ -145,18 +162,7 @@ pub async fn list_fragments(
         // /api/v1/field/basins, which is also a basename, so the
         // comparison is symmetric.
         if let Some(filter_project) = &q.project {
-            let project_match = meta
-                .get("project_cwd")
-                .and_then(|v| v.as_str())
-                .map(|cwd| {
-                    cwd.trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .map(|b| b == filter_project)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !project_match {
+            if !meta_matches_project(Some(&meta), filter_project) {
                 continue;
             }
         }
@@ -308,8 +314,20 @@ pub struct BasinsResponse {
     pub basins: Vec<BasinSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BasinsQuery {
+    /// Optional project basename filter, matching `metadata.project_cwd`.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Optional session filter. When both project and session are set,
+    /// both must match.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 pub async fn list_basins(
     State(services): State<ContextNestServices>,
+    Query(q): Query<BasinsQuery>,
 ) -> Result<Json<BasinsResponse>, StatusCode> {
     // Phase 3 of the neural-field epic
     // (docs/roadmap/epics/neural-field-real.md): prefer real basins
@@ -331,11 +349,22 @@ pub async fn list_basins(
             let mut active_mass = 0usize;
             for fid in &snap.fragment_ids {
                 if let Some(session_id) = active.get(fid) {
+                    if let Some(filter_session) = &q.session_id {
+                        if session_id != filter_session {
+                            continue;
+                        }
+                    }
+                    let meta = metadata.get(fid);
+                    if let Some(filter_project) = &q.project {
+                        if !meta_matches_project(meta, filter_project) {
+                            continue;
+                        }
+                    }
                     active_mass += 1;
                     if !sessions.contains(session_id) {
                         sessions.push(session_id.clone());
                     }
-                    if let Some(meta) = metadata.get(fid) {
+                    if let Some(meta) = meta {
                         if let Some(kind) = meta.get("kind").and_then(|v| v.as_str()) {
                             *by_kind.entry(kind.to_string()).or_insert(0) += 1;
                         }
@@ -384,7 +413,17 @@ pub async fn list_basins(
 
     let mut by_project: HashMap<String, BasinSummary> = HashMap::new();
     for (frag_id, session_id) in &active {
+        if let Some(filter_session) = &q.session_id {
+            if session_id != filter_session {
+                continue;
+            }
+        }
         let meta = metadata.get(frag_id);
+        if let Some(filter_project) = &q.project {
+            if !meta_matches_project(meta, filter_project) {
+                continue;
+            }
+        }
         let project_raw = meta
             .and_then(|m| m.get("project_cwd"))
             .and_then(|v| v.as_str())
@@ -392,12 +431,7 @@ pub async fn list_basins(
             .to_string();
         // Normalize to basename so e.g. `/Users/me/code/ratchet` and
         // `~/code/ratchet` cluster together.
-        let label = project_raw
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
+        let label = project_basename(&project_raw).to_string();
         let id = format!("proj-{label}");
         let entry = by_project
             .entry(label.clone())
@@ -440,6 +474,9 @@ pub struct ConnectionsQuery {
     /// in this session.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Optional project basename filter, matching `metadata.project_cwd`.
+    #[serde(default)]
+    pub project: Option<String>,
     #[serde(default = "default_conn_limit")]
     pub limit: usize,
 }
@@ -469,14 +506,19 @@ pub async fn list_connections(
 ) -> Result<Json<ConnectionsResponse>, StatusCode> {
     let log = services.connection_log.read().await;
     let active = services.session_index.active_fragments_session_map().await;
+    let metadata = services.fragment_metadata.read().await;
 
-    // Filter by session if requested.
+    // Filter by session/project if requested.
     let in_session = |frag_id: &str| -> bool {
         if let Some(sess) = &q.session_id {
-            active.get(frag_id).map(|s| s == sess).unwrap_or(false)
-        } else {
-            true
+            if !active.get(frag_id).map(|s| s == sess).unwrap_or(false) {
+                return false;
+            }
         }
+        if let Some(project) = &q.project {
+            return meta_matches_project(metadata.get(frag_id), project);
+        }
+        active.contains_key(frag_id)
     };
 
     let mut entries: Vec<ConnectionRow> = log

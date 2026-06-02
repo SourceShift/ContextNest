@@ -5,12 +5,7 @@ import { api } from '@/lib/api';
 import { pca2d } from '@/lib/pca';
 import { useSessions } from './useSessions';
 import { useStats } from './useStats';
-import type {
-  BasinSummary,
-  ConnectionRow,
-  FragmentRow,
-  SessionListItem,
-} from '@/lib/types';
+import type { BasinSummary, ConnectionRow, FragmentRow, SessionListItem } from '@/lib/types';
 
 /**
  * Field-view data. With T1+T2+T3+T4 in place this hook returns:
@@ -72,6 +67,8 @@ function ageDaysFrom(ts: string | null | undefined): number | null {
 const FIELD_FRAGMENT_LIMIT = 250;
 
 export type UseFieldOptions = {
+  /** Gate expensive field calls until the user has chosen a scope. */
+  enabled?: boolean;
   /** Optional session filter — narrows to one session's fragments. */
   sessionId?: string;
   /** Optional project filter — narrows to one folder/project's fragments.
@@ -84,11 +81,8 @@ export function useFieldData(opts: UseFieldOptions = {}) {
   const stats = useStats();
 
   const fragmentsQuery = useQuery({
-    queryKey: [
-      'field/fragments',
-      opts.sessionId ?? null,
-      opts.project ?? null,
-    ],
+    queryKey: ['field/fragments', opts.sessionId ?? null, opts.project ?? null],
+    enabled: opts.enabled ?? true,
     refetchInterval: 30_000,
     staleTime: 10_000,
     queryFn: () =>
@@ -101,15 +95,26 @@ export function useFieldData(opts: UseFieldOptions = {}) {
   });
 
   const basinsQuery = useQuery({
-    queryKey: ['field/basins'],
+    queryKey: ['field/basins', opts.project ?? null, opts.sessionId ?? null],
+    enabled: opts.enabled ?? true,
     refetchInterval: 30_000,
-    queryFn: () => api.basins(),
+    queryFn: () =>
+      api.basins({
+        project: opts.project,
+        session_id: opts.sessionId,
+      }),
   });
 
   const connectionsQuery = useQuery({
-    queryKey: ['field/connections', opts.sessionId ?? null],
+    queryKey: ['field/connections', opts.project ?? null, opts.sessionId ?? null],
+    enabled: opts.enabled ?? true,
     refetchInterval: 15_000,
-    queryFn: () => api.connections({ session_id: opts.sessionId, limit: 200 }),
+    queryFn: () =>
+      api.connections({
+        project: opts.project,
+        session_id: opts.sessionId,
+        limit: 200,
+      }),
   });
 
   // Memoise enriched fragments. We add ageDays and project basename so
@@ -117,13 +122,12 @@ export function useFieldData(opts: UseFieldOptions = {}) {
   const fragments: FieldFragment[] = useMemo(() => {
     const rows = fragmentsQuery.data?.fragments ?? [];
     return rows.map((f) => {
-      const ts =
-        typeof f.metadata.ts === 'string' ? (f.metadata.ts as string) : null;
+      const ts = typeof f.metadata.ts === 'string' ? (f.metadata.ts as string) : null;
       const project = basename(
         (f.metadata.project_cwd as string | undefined) ??
           // Fallback: derive from session listing.
-          (sessions.data.find((s: SessionListItem) => s.id === f.session_id)
-            ?.project_cwd ?? undefined),
+          sessions.data.find((s: SessionListItem) => s.id === f.session_id)?.project_cwd ??
+          undefined,
       );
       return {
         ...f,
@@ -146,12 +150,9 @@ export function useFieldData(opts: UseFieldOptions = {}) {
       };
     }
     const dim =
-      fragments.find((f) => f.embedding && f.embedding.length > 0)?.embedding
-        ?.length ?? 256;
+      fragments.find((f) => f.embedding && f.embedding.length > 0)?.embedding?.length ?? 256;
     const matrix = fragments.map((f) =>
-      f.embedding && f.embedding.length === dim
-        ? f.embedding
-        : new Array<number>(dim).fill(0),
+      f.embedding && f.embedding.length === dim ? f.embedding : new Array<number>(dim).fill(0),
     );
     const result = pca2d(matrix);
     return { xy: result.coords, varianceRatio: result.varianceRatio };
@@ -177,15 +178,14 @@ export function useFieldData(opts: UseFieldOptions = {}) {
 
   return {
     data,
-    isLoading:
-      sessions.isLoading || fragmentsQuery.isLoading || basinsQuery.isLoading,
-    isError:
-      sessions.isError || fragmentsQuery.isError || basinsQuery.isError,
+    isLoading: sessions.isLoading || fragmentsQuery.isLoading || basinsQuery.isLoading,
+    isError: sessions.isError || fragmentsQuery.isError || basinsQuery.isError,
     totalFragments: stats.data?.total_fragments ?? null,
     totalSessions: stats.data?.total_sessions ?? null,
     truncated: fragmentsQuery.data?.truncated ?? false,
     refetch: () => {
       sessions.refetch();
+      if (opts.enabled === false) return;
       void fragmentsQuery.refetch();
       void basinsQuery.refetch();
       void connectionsQuery.refetch();
