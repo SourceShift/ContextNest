@@ -1,24 +1,23 @@
-import { useEffect, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import type { RetrieveHit } from '@/lib/types';
 
 /**
- * Read-only fragment inspector (Ticket #3 from the coverage epic).
+ * Fragment inspector (Tickets #3 + #4 from the coverage epic).
  *
  * Search rows render the snippet + meta-row but truncate aggressively
  * and only show kind + ts. When the user needs the WHY ("which exact
  * fragment matched? what other metadata does it carry? which basin?"),
  * they click → this modal opens with the full payload.
  *
- * Avoids inline expansion because metadata can be wide (timestamps,
- * tool params, refs) and full content can be paragraphs. A modal
- * keeps the search results scrollable beneath.
- *
- * Reads only — promote/discard live on a separate ticket so this
- * stays a pure observability surface.
+ * Ticket #4 adds bounded mutation: importance is editable inline, and
+ * a confirm-gated discard button removes the fragment (soft by default).
+ * Content edits are intentionally NOT exposed yet because BE `update`
+ * doesn't re-embed on content change — semantic re-anchoring would
+ * silently break and the FE would have no way to surface it.
  */
 export function FragmentInspectorModal({
   hit,
@@ -27,6 +26,20 @@ export function FragmentInspectorModal({
   hit: RetrieveHit | null;
   onClose: () => void;
 }) {
+  const queryClient = useQueryClient();
+  // Local edit state — diff against `hit.importance` to know when to
+  // enable the Save button. Reset whenever a new hit is opened.
+  const [importanceDraft, setImportanceDraft] = useState<number | null>(null);
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  const [discardReason, setDiscardReason] = useState('');
+  const [mutationError, setMutationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setImportanceDraft(hit?.importance ?? null);
+    setConfirmingDiscard(false);
+    setDiscardReason('');
+    setMutationError(null);
+  }, [hit?.id, hit?.importance]);
   // Escape closes the modal. Re-binds when `hit` becomes non-null so
   // we don't keep a stale listener around on background renders.
   useEffect(() => {
@@ -61,6 +74,41 @@ export function FragmentInspectorModal({
     // are multiple. Most sessions resolve to a single dominant basin.
     return all.length > 0 ? all : null;
   }, [basinsQuery.data, hit]);
+
+  // Mutations are declared unconditionally so React's hook order is
+  // stable across the early-return below. The `enabled`/guard logic
+  // lives in the buttons' onClick handlers, not here.
+  const updateMutation = useMutation({
+    mutationFn: (importance: number) =>
+      api.updateFragment({
+        attractor_id: hit?.id ?? '',
+        session_id: hit?.session_id ?? '',
+        importance,
+      }),
+    onSuccess: () => {
+      // Search results are stale after a successful update; let any
+      // open queries re-fetch on next access.
+      queryClient.invalidateQueries({ queryKey: ['retrieve'] });
+    },
+    onError: (err) =>
+      setMutationError(err instanceof ApiError ? err.message : String(err)),
+  });
+
+  const discardMutation = useMutation({
+    mutationFn: () =>
+      api.discardFragment({
+        attractor_id: hit?.id ?? '',
+        session_id: hit?.session_id ?? '',
+        soft_delete: true,
+        reason: discardReason || undefined,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['retrieve'] });
+      onClose();
+    },
+    onError: (err) =>
+      setMutationError(err instanceof ApiError ? err.message : String(err)),
+  });
 
   if (!hit) return null;
 
@@ -182,7 +230,22 @@ export function FragmentInspectorModal({
             }}
           >
             <ScoreTile label="similarity" value={hit.similarity.toFixed(3)} />
-            <ScoreTile label="importance" value={hit.importance.toFixed(3)} />
+            <ImportanceEditor
+              current={hit.importance}
+              draft={importanceDraft ?? hit.importance}
+              setDraft={setImportanceDraft}
+              dirty={
+                importanceDraft !== null &&
+                Math.abs(importanceDraft - hit.importance) > 0.001
+              }
+              saving={updateMutation.isPending}
+              onSave={() => {
+                if (importanceDraft === null) return;
+                setMutationError(null);
+                updateMutation.mutate(importanceDraft);
+              }}
+              disabled={!hit.session_id}
+            />
           </div>
 
           <SectionLabel>Metadata ({metaRows.length})</SectionLabel>
@@ -283,19 +346,75 @@ export function FragmentInspectorModal({
           )}
         </div>
 
-        {/* Footer — esc hint. */}
+        {/* Footer — actions + error surface + esc hint. */}
         <div
           style={{
-            padding: '8px 14px',
+            padding: '10px 14px',
             borderTop: '1px solid var(--border)',
-            fontSize: 11,
-            color: 'var(--ink-faint)',
             display: 'flex',
-            justifyContent: 'space-between',
+            flexDirection: 'column',
+            gap: 8,
           }}
         >
-          <span>Read-only — promote / discard live on tickets #4 + #5</span>
-          <span className="mono">Esc to close</span>
+          {mutationError && (
+            <div
+              className="mono"
+              style={{
+                fontSize: 11.5,
+                color: 'var(--urg-now, #c33)',
+                padding: '6px 8px',
+                background: 'rgba(220, 50, 50, 0.08)',
+                borderRadius: 4,
+                border: '1px solid rgba(220, 50, 50, 0.25)',
+              }}
+            >
+              {mutationError}
+            </div>
+          )}
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: 8,
+              flexWrap: 'wrap',
+            }}
+          >
+            {confirmingDiscard ? (
+              <DiscardConfirm
+                reason={discardReason}
+                setReason={setDiscardReason}
+                onCancel={() => {
+                  setConfirmingDiscard(false);
+                  setDiscardReason('');
+                  setMutationError(null);
+                }}
+                onConfirm={() => {
+                  setMutationError(null);
+                  discardMutation.mutate();
+                }}
+                pending={discardMutation.isPending}
+              />
+            ) : (
+              <button
+                className="btn btn-ghost sm"
+                onClick={() => setConfirmingDiscard(true)}
+                type="button"
+                disabled={!hit.session_id}
+                title={
+                  hit.session_id
+                    ? 'Soft-delete this fragment (recoverable from WAL)'
+                    : 'No session_id — discard requires ownership check'
+                }
+                style={{ color: 'var(--urg-now, #c33)' }}
+              >
+                <Icon.X /> Discard
+              </button>
+            )}
+            <span className="mono" style={{ fontSize: 11, color: 'var(--ink-faint)' }}>
+              Esc to close
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -334,6 +453,170 @@ function ScoreTile({ label, value }: { label: string; value: string }) {
       <div className="mono" style={{ fontSize: 16, color: 'var(--ink)' }}>
         {value}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Importance editor — clamped [0, 1] number input + Save button that
+ * activates only when the draft diverges from `current`. Saving runs
+ * the parent's `onSave` callback; the parent owns the mutation and
+ * loading state so this stays presentational.
+ */
+function ImportanceEditor({
+  current,
+  draft,
+  setDraft,
+  dirty,
+  saving,
+  onSave,
+  disabled,
+}: {
+  current: number;
+  draft: number;
+  setDraft: (n: number) => void;
+  dirty: boolean;
+  saving: boolean;
+  onSave: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: '8px 10px',
+        background: 'var(--bg-soft)',
+        border: `1px solid ${dirty ? 'var(--accent)' : 'var(--border)'}`,
+        borderRadius: 6,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+      }}
+    >
+      <div
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}
+      >
+        <div className="mono dim" style={{ fontSize: 10.5 }}>
+          importance
+        </div>
+        {dirty && (
+          <div className="mono dim" style={{ fontSize: 9.5 }}>
+            was {current.toFixed(3)}
+          </div>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <input
+          type="number"
+          min={0}
+          max={1}
+          step={0.05}
+          value={draft.toFixed(3)}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            if (Number.isNaN(v)) return;
+            setDraft(Math.max(0, Math.min(1, v)));
+          }}
+          disabled={disabled || saving}
+          className="mono"
+          style={{
+            width: '100%',
+            fontSize: 14,
+            background: 'transparent',
+            border: '1px solid var(--border)',
+            borderRadius: 4,
+            padding: '2px 6px',
+            color: 'var(--ink)',
+          }}
+        />
+        <button
+          className="btn sm"
+          type="button"
+          onClick={onSave}
+          disabled={!dirty || saving || disabled}
+          title={
+            disabled
+              ? 'Fragment has no session_id — cannot mutate'
+              : !dirty
+                ? 'No changes to save'
+                : 'Save new importance value'
+          }
+        >
+          {saving ? '…' : 'Save'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Discard confirmation inline-row. Replaces the Discard button while
+ * the user fills in a reason and clicks Confirm. Cancel restores the
+ * original button state.
+ */
+function DiscardConfirm({
+  reason,
+  setReason,
+  onCancel,
+  onConfirm,
+  pending,
+}: {
+  reason: string;
+  setReason: (s: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+  pending: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 6,
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        flex: 1,
+      }}
+    >
+      <input
+        type="text"
+        placeholder="reason (optional)"
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        autoFocus
+        disabled={pending}
+        className="mono"
+        style={{
+          fontSize: 12,
+          background: 'transparent',
+          border: '1px solid var(--border)',
+          borderRadius: 4,
+          padding: '4px 8px',
+          color: 'var(--ink)',
+          flex: 1,
+          minWidth: 200,
+        }}
+      />
+      <button
+        className="btn sm"
+        type="button"
+        onClick={onConfirm}
+        disabled={pending}
+        style={{
+          background: 'var(--urg-now, #c33)',
+          color: 'white',
+          borderColor: 'var(--urg-now, #c33)',
+        }}
+        title="Soft-delete this fragment (recoverable from WAL)"
+      >
+        {pending ? '…' : 'Confirm discard'}
+      </button>
+      <button
+        className="btn btn-ghost sm"
+        type="button"
+        onClick={onCancel}
+        disabled={pending}
+      >
+        Cancel
+      </button>
     </div>
   );
 }

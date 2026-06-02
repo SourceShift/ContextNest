@@ -162,6 +162,42 @@ export const api = {
       json: params,
     }),
 
+  /**
+   * Mutate an existing fragment's importance and/or content. The BE
+   * checks ownership via `session_index` — passing the wrong session_id
+   * returns 404 not 403. Re-embedding on content change is NOT wired
+   * through this path; for semantic re-anchoring, prefer `discard` +
+   * `store`. See `update` BE doc in src/api/tools.rs.
+   */
+  updateFragment: (params: {
+    attractor_id: string;
+    session_id: string;
+    importance?: number;
+    content?: string;
+    metadata?: Record<string, unknown>;
+  }) =>
+    request<{ updated: boolean }>('/api/v1/tools/update', {
+      method: 'POST',
+      json: params,
+    }),
+
+  /**
+   * Remove a fragment. `soft_delete: true` (default) keeps the row in
+   * the WAL marked deleted — recoverable via direct WAL inspection.
+   * `soft_delete: false` is destructive. `reason` is a free-form audit
+   * string (e.g. "noise / boilerplate", "outdated").
+   */
+  discardFragment: (params: {
+    attractor_id: string;
+    session_id: string;
+    soft_delete?: boolean;
+    reason?: string;
+  }) =>
+    request<{ discarded: boolean; soft_delete: boolean }>('/api/v1/tools/discard', {
+      method: 'POST',
+      json: params,
+    }),
+
   features: (params: { since?: string; layer?: string } = {}) => {
     const q = new URLSearchParams();
     if (params.since) q.set('since', params.since);
