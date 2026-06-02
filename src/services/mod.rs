@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod consolidation;
+pub mod content_density;
 pub mod context;
 pub mod embedding;
 pub mod embedding_providers;
