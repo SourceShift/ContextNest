@@ -137,13 +137,38 @@ pub struct RetrieveRequest {
     /// matches the pre-existing behaviour exactly.
     #[serde(default)]
     pub exclude_kinds: Option<Vec<String>>,
+    /// Optional result grouping. Currently the only supported value is
+    /// `"session"`, which switches the response into **session-rollup
+    /// mode**: in addition to the standard `hits` array, the response
+    /// gets a `session_groups` field with one entry per matched session,
+    /// scored by `Σ(hit.similarity) × log(1 + n_unique_kinds)`.
+    ///
+    /// Designed for "WHICH session was about X?" queries where the
+    /// answer is a *session id*, not a fragment id. Fragment-level
+    /// retrieve mode (the default) still ranks individual fragments,
+    /// which is the right shape for "what's the exact decision we
+    /// made about X?". Together with `content_density` (Option A)
+    /// and the upcoming `/by-intent` endpoint (Option C), this gives
+    /// callers three retrieval shapes targeting three different
+    /// operator questions.
+    ///
+    /// Implementation note: enabling `group_by` is purely additive
+    /// — `hits` stays populated exactly as it would have been without
+    /// the param. Callers that ignore `session_groups` see no change.
+    ///
+    /// Unknown values are silently ignored (treated as None). We
+    /// don't error because the param is forward-evolving (e.g. future
+    /// `"basin"` mode); silent ignore is wire-friendly for old
+    /// servers seeing new clients.
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
 fn default_top_k() -> usize {
     5
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RetrieveHit {
     pub id: String,
     pub content: String,
@@ -161,6 +186,38 @@ pub struct RetrieveHit {
     pub session_id: Option<String>,
 }
 
+/// One entry in the `session_groups` rollup. Returned only when the
+/// caller passes `group_by: "session"` on the retrieve request.
+///
+/// Ranking: sessions are sorted by `score` descending. The score
+/// formula is `Σ(hit.similarity) × log(1 + n_unique_kinds)`. The log
+/// term gives diminishing returns for kind diversity (1 kind → 0.69×,
+/// 2 → 1.10×, 5 → 1.79×) so a session with 50 nearly-identical
+/// `evidence_ref` hits doesn't beat a session with 5 varied hits
+/// across `todo`/`accomplishment`/`decision`/`learning`/`verification`.
+///
+/// Note: per-hit `similarity` already includes Option-A's content
+/// density multiplier and the kind_weight, so the rollup score
+/// inherits both attenuations naturally without re-multiplying.
+#[derive(Debug, Serialize)]
+pub struct SessionGroup {
+    pub session_id: String,
+    pub score: f32,
+    /// Number of fragments from this session that landed in the
+    /// post-scoring hit set. Surfaces "how strong was the match" at
+    /// the session level.
+    pub hit_count: usize,
+    /// Distinct values of `metadata.kind` across this session's hits.
+    /// Drives the diversity term in the score formula and lets
+    /// callers see *which* kinds matched without iterating
+    /// `top_fragments`.
+    pub unique_kinds: Vec<String>,
+    /// Top-3 fragments from this session by similarity. Lets the FE
+    /// render a session card without a second round-trip. Order is
+    /// similarity-descending within the session.
+    pub top_fragments: Vec<RetrieveHit>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RetrieveResponse {
     pub hits: Vec<RetrieveHit>,
@@ -172,6 +229,12 @@ pub struct RetrieveResponse {
     /// `hits` array they always have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconstruction: Option<ReconstructResponse>,
+    /// Session-rollup view of the same hits. Populated only when the
+    /// caller passes `group_by: "session"` on the request. Omitted
+    /// from the wire when absent so legacy clients see exactly the
+    /// `hits` (+ optional `reconstruction`) array they always have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_groups: Option<Vec<SessionGroup>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,6 +618,7 @@ pub async fn retrieve(
                 Json(RetrieveResponse {
                     hits: Vec::new(),
                     reconstruction: None,
+                    session_groups: None,
                 }),
             );
         }
@@ -575,6 +639,7 @@ pub async fn retrieve(
             Json(RetrieveResponse {
                 hits: Vec::new(),
                 reconstruction: None,
+                session_groups: None,
             }),
         );
     }
@@ -642,6 +707,7 @@ pub async fn retrieve(
             Json(RetrieveResponse {
                 hits: Vec::new(),
                 reconstruction: None,
+                session_groups: None,
             }),
         );
     }
@@ -890,13 +956,101 @@ pub async fn retrieve(
             None
         };
 
+    // Option B — session rollup. Build session_groups when the caller
+    // passed `group_by: "session"`. Computed AFTER all scoring is done
+    // (decay × kind_weight × density × basin/connection expansion) so
+    // session-level scores inherit every per-fragment attenuation
+    // automatically. The rollup is a pure post-processing pass over
+    // `scored`; no extra index lookups, no extra lock acquisitions.
+    let session_groups = if matches!(req.group_by.as_deref(), Some("session")) {
+        Some(rollup_session_groups(&scored, req.top_k))
+    } else {
+        None
+    };
+
     (
         StatusCode::OK,
         Json(RetrieveResponse {
             hits: scored,
             reconstruction,
+            session_groups,
         }),
     )
+}
+
+/// Roll up a flat list of hits into per-session groups, scored by
+/// `Σ(hit.similarity) × log(1 + n_unique_kinds)`.
+///
+/// Returns at most `top_n` groups, sorted by score descending. Hits
+/// without a `session_id` (single-session retrieve mode) are skipped —
+/// the rollup is only meaningful when each hit carries its origin.
+/// `top_fragments` per group is capped at 3 so the response stays
+/// bounded regardless of how many fragments matched.
+fn rollup_session_groups(hits: &[RetrieveHit], top_n: usize) -> Vec<SessionGroup> {
+    use std::collections::BTreeSet;
+
+    // Bucket hits by session_id. Skip hits without session_id (the
+    // single-session mode never populates it, and a session-rollup of
+    // a single session is degenerate). BTreeMap → deterministic order
+    // for testing.
+    let mut by_session: std::collections::BTreeMap<String, Vec<&RetrieveHit>> =
+        std::collections::BTreeMap::new();
+    for h in hits {
+        if let Some(sid) = &h.session_id {
+            by_session.entry(sid.clone()).or_default().push(h);
+        }
+    }
+
+    let mut groups: Vec<SessionGroup> = by_session
+        .into_iter()
+        .map(|(session_id, mut hits)| {
+            // Sort hits within a session by similarity desc so
+            // top_fragments[0] is always the best match for that
+            // session. Stable sort by partial-cmp with NaN-safe
+            // fallback (NaN sorts to the end).
+            hits.sort_by(|a, b| {
+                b.similarity
+                    .partial_cmp(&a.similarity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let sum_sim: f32 = hits.iter().map(|h| h.similarity).sum();
+            let kind_set: BTreeSet<String> = hits
+                .iter()
+                .filter_map(|h| h.metadata.get("kind"))
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect();
+            let n_kinds = kind_set.len() as f32;
+            // log(1 + n) so 1 kind contributes ~0.69, 2 → 1.10, 5 → 1.79.
+            // Avoids the all-or-nothing of a linear `n_unique_kinds`
+            // multiplier (a session with 10 evidence_ref hits at
+            // sim=0.5 wouldn't trivially beat a session with 2 varied
+            // hits at sim=0.5 under linear scaling, but log makes the
+            // diminishing return explicit and bounded).
+            let diversity = (1.0 + n_kinds).ln();
+            let score = sum_sim * diversity;
+            let top_fragments: Vec<RetrieveHit> =
+                hits.iter().take(3).map(|h| (*h).clone()).collect();
+            SessionGroup {
+                session_id,
+                score,
+                hit_count: hits.len(),
+                unique_kinds: kind_set.into_iter().collect(),
+                top_fragments,
+            }
+        })
+        .collect();
+
+    // Final sort by session score desc, then truncate. Stable sort so
+    // ties resolve to insertion order (BTreeMap iteration order = lex
+    // session_id), which keeps test assertions deterministic.
+    groups.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    groups.truncate(top_n);
+    groups
 }
 
 /// Basin-aware retrieval expansion — Phase 4 of the neural-field epic
