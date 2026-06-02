@@ -300,3 +300,201 @@ async fn nested_value_filter_works_for_simple_types() {
     assert_eq!(hits.len(), 1);
     assert!(hits[0]["content"].as_str().unwrap().contains("awaiting"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// exclude_kinds tests
+//
+// Pins the false-positive defence built after a real-world incident where
+// every Claude Code session has a fragment of kind `initial_prompt_window`
+// containing literal `[user turn N] <user text>` — which then matched every
+// topic query containing "user" via the TF-IDF embedder. The fix is the
+// new `exclude_kinds` knob; these tests ensure the semantics stay correct
+// across future refactors.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn retrieve_with(server: &TestServer, session: &str, query: &str, extra: Value) -> Value {
+    let mut body = json!({
+        "query": query,
+        "top_k": 50,
+        "session_id": session,
+    });
+    if let Some(obj) = extra.as_object() {
+        for (k, v) in obj {
+            body[k] = v.clone();
+        }
+    }
+    let res = server.post("/api/v1/tools/retrieve").json(&body).await;
+    res.assert_status_ok();
+    res.json()
+}
+
+#[tokio::test]
+async fn exclude_kinds_filters_out_named_kinds() {
+    let server = make_server().await;
+    let session = "test-exclude-kinds";
+    store(
+        &server,
+        session,
+        "[user turn 1] tell me about chat rendering",
+        json!({"kind": "initial_prompt_window"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "shipped chat orchestrator phase 2",
+        json!({"kind": "accomplishment"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "decided to use SSE for chat streaming",
+        json!({"kind": "decision"}),
+    )
+    .await;
+
+    // Baseline: no exclusion → all 3 come back.
+    let body = retrieve_with(&server, session, "chat", json!({})).await;
+    assert_eq!(body["hits"].as_array().unwrap().len(), 3);
+
+    // With exclude_kinds=["initial_prompt_window"] → only the 2 real
+    // work fragments remain.
+    let body = retrieve_with(
+        &server,
+        session,
+        "chat",
+        json!({"exclude_kinds": ["initial_prompt_window"]}),
+    )
+    .await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    for h in hits {
+        assert_ne!(
+            h["metadata"]["kind"].as_str().unwrap_or(""),
+            "initial_prompt_window",
+            "excluded kind must NEVER appear in results"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exclude_kinds_empty_list_is_no_op() {
+    // Empty list ≡ no filter — preserves backward compat for callers
+    // that always send the parameter even when not filtering.
+    let server = make_server().await;
+    let session = "test-exclude-empty";
+    store(
+        &server,
+        session,
+        "noise",
+        json!({"kind": "initial_prompt_window"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "real content",
+        json!({"kind": "accomplishment"}),
+    )
+    .await;
+
+    let body = retrieve_with(&server, session, "content", json!({"exclude_kinds": []})).await;
+    assert_eq!(body["hits"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn exclude_kinds_keeps_fragments_with_no_kind_field() {
+    // "Excluding requires a positive match" — a fragment without a
+    // `kind` metadata field is never excluded.
+    let server = make_server().await;
+    let session = "test-exclude-no-kind";
+    store(&server, session, "fragment without kind", json!({})).await;
+    store(
+        &server,
+        session,
+        "boilerplate",
+        json!({"kind": "initial_prompt_window"}),
+    )
+    .await;
+
+    let body = retrieve_with(
+        &server,
+        session,
+        "fragment",
+        json!({"exclude_kinds": ["initial_prompt_window"]}),
+    )
+    .await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("fragment without kind"));
+}
+
+#[tokio::test]
+async fn exclude_kinds_composes_with_metadata_filter() {
+    // Both filters must pass — fragment included only if it passes
+    // `metadata_filter` AND is not in `exclude_kinds`.
+    let server = make_server().await;
+    let session = "test-exclude-compose";
+    store(
+        &server,
+        session,
+        "matches both",
+        json!({"kind": "decision", "project": "p1"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "wrong project",
+        json!({"kind": "decision", "project": "p2"}),
+    )
+    .await;
+    store(
+        &server,
+        session,
+        "right project but excluded kind",
+        json!({"kind": "initial_prompt_window", "project": "p1"}),
+    )
+    .await;
+
+    let body = retrieve_with(
+        &server,
+        session,
+        "project",
+        json!({
+            "metadata_filter": {"project": "p1"},
+            "exclude_kinds": ["initial_prompt_window"]
+        }),
+    )
+    .await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("matches both"));
+}
+
+#[tokio::test]
+async fn exclude_kinds_supports_multiple_kinds() {
+    let server = make_server().await;
+    let session = "test-exclude-multi";
+    store(&server, session, "frag a", json!({"kind": "noise_a"})).await;
+    store(&server, session, "frag b", json!({"kind": "noise_b"})).await;
+    store(&server, session, "frag c", json!({"kind": "signal"})).await;
+
+    let body = retrieve_with(
+        &server,
+        session,
+        "frag",
+        json!({"exclude_kinds": ["noise_a", "noise_b"]}),
+    )
+    .await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["metadata"]["kind"].as_str().unwrap(), "signal");
+}

@@ -111,6 +111,32 @@ pub struct RetrieveRequest {
     /// filtered set, not the pre-filter universe.
     #[serde(default)]
     pub metadata_filter: Option<HashMap<String, serde_json::Value>>,
+    /// Optional list of `kind` values to exclude from results.
+    ///
+    /// Designed for topic-search queries where boilerplate kinds
+    /// systematically dominate the result set. The canonical example
+    /// is `initial_prompt_window`: every Claude Code session ingests
+    /// one (containing the literal `[user turn N] <text>` prefix),
+    /// so any topic query that mentions "user", "turn", or any common
+    /// English token matches every session at near-uniform similarity
+    /// under the TF-IDF embedder. That's a false-positive class, not
+    /// signal.
+    ///
+    /// Semantics:
+    /// - Fragments WITH `metadata.kind` matching any value in this list
+    ///   are dropped at prefilter time (before hydration).
+    /// - Fragments with no `kind` field are kept — exclusion requires a
+    ///   positive match, not "missing field == suspicious".
+    /// - Composes with `metadata_filter`: a fragment must pass BOTH the
+    ///   inclusion filter AND the exclusion list to land in results.
+    /// - Basin/connection expansion (`basin_aware_expand` /
+    ///   `connection_aware_expand`) inherits the exclusion automatically
+    ///   because expansion only adds siblings already in `candidate_ids`.
+    ///
+    /// Backward compat: `None` or empty `Some(vec![])` is no-op —
+    /// matches the pre-existing behaviour exactly.
+    #[serde(default)]
+    pub exclude_kinds: Option<Vec<String>>,
 }
 
 fn default_top_k() -> usize {
@@ -563,13 +589,47 @@ pub async fn retrieve(
     // Semantics preserved exactly: a fragment with no metadata entry never
     // matches a non-empty filter (same conservative rule as the original
     // post-hydration filter in `metadata_filter_matches`).
-    let candidate_ids: Vec<String> = if let Some(filter) = req.metadata_filter.as_ref() {
+    // Build the exclusion set up front so the per-id loop is a cheap
+    // HashSet probe. Empty `exclude_kinds` collapses to a `None`-shaped
+    // path so the no-exclusion case pays no overhead.
+    let exclude_kinds_set: Option<HashSet<&str>> = req
+        .exclude_kinds
+        .as_ref()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.iter().map(String::as_str).collect());
+
+    let candidate_ids: Vec<String> = if req.metadata_filter.is_some() || exclude_kinds_set.is_some()
+    {
         let metadata = services.fragment_metadata.read().await;
         active_ids
             .into_iter()
-            .filter(|id| match metadata.get(id) {
-                Some(meta) => metadata_filter_matches(filter, meta),
-                None => filter.is_empty(),
+            .filter(|id| {
+                let meta = metadata.get(id);
+                // Existing inclusion filter — semantics unchanged.
+                let passes_inclusion = match req.metadata_filter.as_ref() {
+                    Some(filter) => match meta {
+                        Some(m) => metadata_filter_matches(filter, m),
+                        None => filter.is_empty(),
+                    },
+                    None => true,
+                };
+                if !passes_inclusion {
+                    return false;
+                }
+                // New exclusion filter — drop frags whose `kind`
+                // is in the caller-supplied list. Frags with no
+                // `kind` field are never excluded by this
+                // mechanism (excluding requires a positive match).
+                if let Some(set) = exclude_kinds_set.as_ref() {
+                    if let Some(m) = meta {
+                        if let Some(serde_json::Value::String(k)) = m.get("kind") {
+                            if set.contains(k.as_str()) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
             })
             .collect()
     } else {
