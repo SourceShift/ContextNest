@@ -16,7 +16,8 @@ type NavKey =
   | 'field'
   | 'tools'
   | 'substrate'
-  | 'config';
+  | 'config'
+  | 'llm-cache';
 
 type NavItem = {
   k: NavKey;
@@ -30,7 +31,8 @@ type NavItem = {
     | '/field'
     | '/tools'
     | '/substrate'
-    | '/config';
+    | '/config'
+    | '/llm-cache';
   label: string;
   icon: React.ReactNode;
   kbd: string;
@@ -140,6 +142,13 @@ export function Sidebar() {
       label: 'Config',
       icon: <Icon.Filter className="nav-icon" />,
       kbd: 'g c',
+    },
+    {
+      k: 'llm-cache',
+      to: '/llm-cache',
+      label: 'LLM cache',
+      icon: <Icon.Refresh className="nav-icon" />,
+      kbd: 'g l',
     },
   ];
 

@@ -5,6 +5,7 @@ import type {
   FragmentsResponse,
   HealthResponse,
   InboxResponse,
+  LlmCacheStats,
   PromptPreviewResponse,
   RetrieveResponse,
   SessionListResponse,
@@ -65,6 +66,15 @@ export const api = {
     request<SubstrateConfigResponse>('/api/v1/substrate/config', {
       method: 'GET',
     }),
+
+  /**
+   * LLM proxy cache counters. Mirrors `CacheStats` from
+   * `src/services/llm_cache.rs` verbatim — total_entries, total_hits,
+   * total_misses, hit_rate. Note the path lives under the proxy mount
+   * `/llm/v1/...` not `/api/v1/...`. Used by /llm-cache (Ticket #5).
+   */
+  llmCacheStats: () =>
+    request<LlmCacheStats>('/llm/v1/cache/stats', { method: 'GET' }),
 
   retrieve: (params: {
     query: string;
