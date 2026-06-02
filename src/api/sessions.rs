@@ -21,7 +21,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::api::inbox::is_inbox_eligible;
-use crate::services::ContextNestServices;
+use crate::services::{ContextNestServices, SessionIntentEntry};
 
 pub(crate) const TRAJECTORY_KINDS: &[&str] = &[
     "read_context",
@@ -2559,6 +2559,326 @@ pub async fn find_sessions(
     }))
 }
 
+// =============================================================================
+// `GET /api/v1/sessions/by-intent?q=<text>&domain=<optional>&top_k=<10>`
+//
+// Option C from the three-part retrieve-architecture upgrade. Where
+// `/retrieve` ranks fragments by token-level semantic similarity, this
+// endpoint ranks **sessions** by *intent-text* similarity — the
+// "what was this session ABOUT" projection (domain + topics + goal +
+// current_state). Closes the gap that motivated this work: queries
+// like "which session was about chapter-summary lenses?" need to
+// match against session intent, not fragment-level token overlap, to
+// avoid drowning in terminology-coincident noise.
+//
+// Mechanics:
+//
+// 1. For every active session, build an intent string by concatenating
+//    its summary fields (domain · topics · goal · current_state).
+// 2. Hash the intent string. If the cache (`services
+//    .session_intent_embeddings`) has a matching hash for this
+//    session_id, reuse the stored embedding. Otherwise call the
+//    EmbeddingService and store the result for next time.
+// 3. Embed the query string (once per call).
+// 4. Compute cosine similarity between query embedding and each
+//    session's intent embedding. Apply optional `domain` filter.
+// 5. Sort descending, truncate to `top_k`, return.
+//
+// Cost: first call after restart is O(N_sessions) embedder calls
+// (bounded by the embedder's concurrency; typically a few hundred ms
+// total). Subsequent calls are 1 embedder call (the query) + O(N)
+// cosine sims (~microseconds). The cache invalidates per-session
+// when the intent-text hash drifts (new goal_phase fragment, topics
+// changed).
+// =============================================================================
+
+/// Query params for `GET /api/v1/sessions/by-intent`.
+#[derive(Debug, Deserialize)]
+pub struct SessionsByIntentQuery {
+    /// Natural-language query to match against session intent.
+    /// E.g. "summarization of chapters from different lenses".
+    pub q: String,
+    /// Optional domain filter — only return sessions whose summary
+    /// `domain` field matches (e.g. "research", "backend", "docs").
+    /// Case-insensitive substring match.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Max sessions to return. Default 10.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+/// One ranked session in the by-intent response.
+#[derive(Debug, Serialize)]
+pub struct SessionIntentHit {
+    pub session_id: String,
+    /// Cosine similarity between the query embedding and this
+    /// session's intent embedding. `[0.0, 1.0]` for unit-normalised
+    /// embeddings; the embedder used may not normalize, so values
+    /// can exceed 1.0 — sort order is what matters.
+    pub score: f32,
+    /// The actual intent text the substrate embedded for this
+    /// session. Returned so callers can render "we ranked this
+    /// session because its intent reads X" without a second fetch.
+    pub intent_text: String,
+    /// Session's `domain` field if available — useful for client-
+    /// side filtering or display.
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionsByIntentResponse {
+    pub query: String,
+    /// Echo of the resolved domain filter (None when unset).
+    pub domain_filter: Option<String>,
+    /// Number of sessions whose intent text was non-empty and
+    /// considered for ranking. Hint to the caller about coverage —
+    /// if this is unexpectedly low, the substrate likely hasn't
+    /// ingested enough goal/state fragments to support intent search.
+    pub considered: usize,
+    pub hits: Vec<SessionIntentHit>,
+}
+
+/// Build the intent text for a single session by aggregating its
+/// `domain`/`topics`/`goal`/`current_state` fragments. Returns
+/// `(intent_text, domain)` where `intent_text` may be empty if the
+/// session has none of these structured fields — empty intents are
+/// dropped from the ranking by the caller.
+async fn compute_intent_text(
+    services: &ContextNestServices,
+    session_id: &str,
+) -> (String, Option<String>) {
+    let metadata = services.fragment_metadata.read().await;
+    let texts = services.fragment_texts.read().await;
+    let frag_ids = services.session_index.list_active(session_id).await;
+
+    let mut domain_text: Option<String> = None;
+    let mut domain_ts: Option<String> = None;
+    let mut topics: Vec<String> = Vec::new();
+    let mut goals: Vec<(String, String)> = Vec::new();
+    let mut states: Vec<(String, String)> = Vec::new();
+
+    for fid in &frag_ids {
+        let Some(meta) = metadata.get(fid) else {
+            continue;
+        };
+        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        match kind {
+            "domain" => {
+                if let Some(t) = texts.get(fid) {
+                    if !t.is_empty() {
+                        let take = match (&domain_ts, &ts) {
+                            (None, _) => true,
+                            (Some(_), None) => false,
+                            (Some(prev), Some(cur)) => cur > prev,
+                        };
+                        if take {
+                            domain_text = Some(t.clone());
+                            domain_ts = ts.clone();
+                            topics = meta
+                                .get("topics")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            "goal_phase" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(fid), &ts) {
+                    if !t.is_empty() {
+                        goals.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            "state" => {
+                if let (Some(t), Some(ts_str)) = (texts.get(fid), &ts) {
+                    if !t.is_empty() {
+                        states.push((ts_str.clone(), t.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    goals.sort_by(|a, b| b.0.cmp(&a.0));
+    states.sort_by(|a, b| b.0.cmp(&a.0));
+    let goal = goals.into_iter().next().map(|(_, t)| t);
+    let current_state = states.into_iter().next().map(|(_, t)| t);
+
+    // Concatenate the four fields into one intent string. The order
+    // matches operator priority — domain first (highest-level), then
+    // topic vocabulary, then the latest goal, then state.
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &domain_text {
+        parts.push(format!("domain: {d}"));
+    }
+    if !topics.is_empty() {
+        parts.push(format!("topics: {}", topics.join(", ")));
+    }
+    if let Some(g) = goal {
+        parts.push(format!("goal: {g}"));
+    }
+    if let Some(s) = current_state {
+        parts.push(format!("state: {s}"));
+    }
+    (parts.join(" · "), domain_text)
+}
+
+/// FNV-1a 64 hash — cheap, stable across processes, sufficient for
+/// "did the intent text change?" cache invalidation. No
+/// cryptographic-quality required; just collision-resistant enough
+/// that two different intent strings don't accidentally share a
+/// hash.
+fn fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0
+/// for length mismatch or either-zero magnitude. Same shape as the
+/// llm_cache's cosine helper, but locally scoped to avoid a public
+/// dependency.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut ma = 0.0f32;
+    let mut mb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        ma += x * x;
+        mb += y * y;
+    }
+    let ma = ma.sqrt();
+    let mb = mb.sqrt();
+    if ma == 0.0 || mb == 0.0 {
+        0.0
+    } else {
+        dot / (ma * mb)
+    }
+}
+
+pub async fn sessions_by_intent(
+    State(services): State<ContextNestServices>,
+    Query(params): Query<SessionsByIntentQuery>,
+) -> Result<Json<SessionsByIntentResponse>, StatusCode> {
+    let q = params.q.trim();
+    if q.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let top_k = params.top_k.unwrap_or(10).clamp(1, 100);
+
+    // Embed the query first — fails fast if the embedder is down,
+    // avoiding wasted work on the per-session loop below.
+    let query_embedding = services
+        .embedding
+        .generate_embedding(q)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    // Iterate every active session. session_index's
+    // active_fragments_session_map is the canonical "all sessions"
+    // enumeration; deduping by inserting session_ids into a set.
+    let frag_to_sess = services.session_index.active_fragments_session_map().await;
+    let mut session_ids: Vec<String> = frag_to_sess.into_values().collect();
+    session_ids.sort();
+    session_ids.dedup();
+
+    let mut hits: Vec<SessionIntentHit> = Vec::with_capacity(session_ids.len());
+    let mut considered: usize = 0;
+
+    for sid in &session_ids {
+        let (intent_text, domain) = compute_intent_text(&services, sid).await;
+        if intent_text.is_empty() {
+            // No structured intent fields — skip. The session may
+            // still be retrievable via the fragment-level /retrieve
+            // endpoint; by-intent just doesn't have a signal to rank
+            // on. This is the dominant cause of "low considered"
+            // counts on a fresh substrate.
+            continue;
+        }
+        considered += 1;
+
+        let hash = fnv1a_64(&intent_text);
+
+        // Cache lookup: hit on (session_id, same hash) → reuse
+        // embedding. Miss → compute, store.
+        let cached: Option<SessionIntentEntry> = {
+            let cache = services.session_intent_embeddings.read().await;
+            cache.get(sid).cloned()
+        };
+        let entry = match cached {
+            Some(e) if e.text_hash == hash => e,
+            _ => {
+                // Cache miss or stale. Embed and store.
+                let embedding = match services.embedding.generate_embedding(&intent_text).await {
+                    Ok(e) => e,
+                    Err(_) => continue, // Embedder hiccup; skip this session, don't fail the whole query.
+                };
+                let entry = SessionIntentEntry {
+                    text_hash: hash,
+                    intent_text: intent_text.clone(),
+                    embedding,
+                    domain: domain.clone(),
+                };
+                services
+                    .session_intent_embeddings
+                    .write()
+                    .await
+                    .insert(sid.clone(), entry.clone());
+                entry
+            }
+        };
+
+        // Optional domain filter (case-insensitive substring).
+        if let Some(want) = params.domain.as_deref() {
+            let want_lc = want.to_ascii_lowercase();
+            let got = entry.domain.as_deref().unwrap_or("").to_ascii_lowercase();
+            if !got.contains(&want_lc) {
+                continue;
+            }
+        }
+
+        let score = cosine(&query_embedding, &entry.embedding);
+        hits.push(SessionIntentHit {
+            session_id: sid.clone(),
+            score,
+            intent_text: entry.intent_text,
+            domain: entry.domain,
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(top_k);
+
+    Ok(Json(SessionsByIntentResponse {
+        query: q.to_string(),
+        domain_filter: params.domain,
+        considered,
+        hits,
+    }))
+}
+
 /// Build the sessions router. Mounted alongside the tools and cc_hooks routers
 /// in `create_simple_app`.
 ///
@@ -2573,6 +2893,7 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
         .route("/api/v1/sessions/find", axum::routing::post(find_sessions))
         .route("/api/v1/sessions/by-file", get(sessions_by_file))
         .route("/api/v1/sessions/by-feature", get(sessions_by_feature))
+        .route("/api/v1/sessions/by-intent", get(sessions_by_intent))
         .route(
             "/api/v1/sessions/:id/top-feature",
             get(top_feature_for_session),
