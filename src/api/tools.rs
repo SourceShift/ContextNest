@@ -713,11 +713,30 @@ pub async fn retrieve(
                 .and_then(|v| v.as_str())
                 .map(crate::services::kind_registry::signal_weight)
                 .unwrap_or(1.0);
+            // Option A — content_density multiplier. Computed at
+            // consolidation time and stored in metadata as
+            // `_cn_content_density` (f64 ∈ [0,1]). Discriminates
+            // terminology-bearing fragments ("arxiv:2603.16131" → ~0.2)
+            // from content-bearing ones ("Pulled 200 May 2026 papers
+            // through jina ranker" → ~0.7). Legacy fragments without
+            // the field fall back to neutral 1.0 — they get a fair
+            // ranking until the next consolidation pass populates the
+            // density. Weight knob:
+            //   CONTEXTNEST_RETRIEVE_DENSITY_WEIGHT (default 1.0).
+            // A value of 0.0 turns the multiplier off entirely
+            // (returns neutral 1.0 regardless of stored density) —
+            // useful for A/B verification.
+            let density = fragment_meta
+                .and_then(|m| m.get("_cn_content_density"))
+                .and_then(|v| v.as_f64())
+                .map(|d| d as f32)
+                .map(|d| apply_density_weight(d, *density_weight_cached()))
+                .unwrap_or(1.0);
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
-                similarity: base_similarity * decay * kind_weight,
+                similarity: base_similarity * decay * kind_weight * density,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
             }
@@ -1290,6 +1309,79 @@ fn decay_multiplier(metadata: &HashMap<String, serde_json::Value>) -> f32 {
     let age_days = age_secs / 86_400.0;
     let lambda = std::f64::consts::LN_2 / half_life_days;
     (-lambda * age_days).exp() as f32
+}
+
+/// Cached density-weight knob read from environment exactly once per
+/// process. Env vars don't change at runtime, so paying the `getenv`
+/// cost per retrieve hit (called O(n) times per request) is wasteful.
+///
+/// Read from `CONTEXTNEST_RETRIEVE_DENSITY_WEIGHT`. Default `1.0` =
+/// full density multiplier in effect. Value of `0.0` disables the
+/// multiplier entirely (every fragment scores 1.0 regardless of
+/// stored density, restoring pre-Option-A behavior — useful for
+/// A/B verification). Values in `(0, 1)` partially attenuate.
+fn density_weight_cached() -> &'static f32 {
+    static CACHED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("CONTEXTNEST_RETRIEVE_DENSITY_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Apply the configured density weight to a raw `[0,1]` density value.
+///
+/// - `weight = 1.0` (default) → returns the density as-is.
+/// - `weight = 0.0` → returns 1.0 (multiplier is off, every fragment
+///   scores neutrally regardless of stored density).
+/// - `weight ∈ (0, 1)` → linear interpolation between neutral 1.0 and
+///   the raw density: `1 - weight + weight * density`. Lets operators
+///   dial in a softer demotion for noise hits without all-or-nothing.
+fn apply_density_weight(raw_density: f32, weight: f32) -> f32 {
+    let raw = raw_density.clamp(0.0, 1.0);
+    let w = weight.clamp(0.0, 1.0);
+    (1.0 - w) + w * raw
+}
+
+#[cfg(test)]
+mod density_weight_tests {
+    use super::apply_density_weight;
+
+    #[test]
+    fn full_weight_passes_density_through() {
+        assert!((apply_density_weight(0.7, 1.0) - 0.7).abs() < 1e-6);
+        assert!((apply_density_weight(0.0, 1.0)).abs() < 1e-6);
+        assert!((apply_density_weight(1.0, 1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_weight_disables_multiplier() {
+        // Density multiplier off → every fragment scores neutral 1.0
+        // regardless of stored density. Used for A/B verification.
+        assert!((apply_density_weight(0.2, 0.0) - 1.0).abs() < 1e-6);
+        assert!((apply_density_weight(0.7, 0.0) - 1.0).abs() < 1e-6);
+        assert!((apply_density_weight(0.0, 0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn half_weight_interpolates() {
+        // weight=0.5 → halfway between neutral 1.0 and raw density
+        let half = apply_density_weight(0.4, 0.5);
+        let expected = 1.0 - 0.5 + 0.5 * 0.4;
+        assert!((half - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clamps_out_of_range_inputs() {
+        // Defensive: raw density should be in [0, 1], but if the
+        // sidecar got corrupted we don't want to score-amplify by
+        // accident.
+        assert!((apply_density_weight(1.5, 1.0) - 1.0).abs() < 1e-6);
+        assert!((apply_density_weight(-0.5, 1.0)).abs() < 1e-6);
+        assert!((apply_density_weight(0.5, 2.0) - 0.5).abs() < 1e-6);
+    }
 }
 
 /// True iff every `(key, value)` pair in `filter` is present in

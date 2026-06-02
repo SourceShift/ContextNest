@@ -67,6 +67,13 @@ use std::time::{Duration, Instant};
 
 const CONSOLIDATED_FLAG: &str = "_cn_consolidated";
 const CONSOLIDATED_AT_FIELD: &str = "_cn_consolidated_at";
+/// Per-fragment content_density scalar (0-1), computed at consolidation
+/// time and read by `retrieve` to multiply into the final score. See
+/// `services::content_density` for the formula. Storing in metadata
+/// keeps `retrieve` lock-free for the scoring pass (no per-hit text
+/// re-tokenization). Backwards-compatible: legacy fragments without
+/// this field fall back to neutral (1.0) at retrieve time.
+const CONTENT_DENSITY_FIELD: &str = "_cn_content_density";
 
 /// Tunable knobs read from environment at worker startup. Each one has
 /// a sensible default so out-of-the-box behavior is "consolidate
@@ -378,6 +385,13 @@ async fn consolidate_one(
         .await
         .map_err(|e| format!("process_memories: {e}"))?;
 
+    // Compute content density from the raw text once, before flipping
+    // the consolidated flag. Cheap (microseconds, pure function), but
+    // we still do it inside the same critical section as the flag
+    // write so a concurrent retrieve never sees the consolidated flag
+    // without the density paired alongside it.
+    let density = crate::services::content_density::content_density(&text);
+
     // Flip the flag on success. Preserves any pre-existing metadata
     // (kind, ts, src_session, project_cwd, etc.) by updating the
     // entry in place rather than replacing it.
@@ -388,6 +402,10 @@ async fn consolidate_one(
         entry.insert(
             CONSOLIDATED_AT_FIELD.to_string(),
             Value::String(now.to_rfc3339()),
+        );
+        entry.insert(
+            CONTENT_DENSITY_FIELD.to_string(),
+            Value::from(density as f64),
         );
     }
 
