@@ -169,6 +169,37 @@ export type SessionsByFeatureResponse = {
   hits: FeatureHit[];
 };
 
+/** One match from `GET /api/v1/sessions/by-file?path=<substring>`. */
+export type FileMatch = {
+  session_id: string;
+  /** Subset of the session's files_touched list that contained the query
+   * substring. Useful when the query is a partial basename and several
+   * files in the session could plausibly match. */
+  matched_files: string[];
+  /** Size of the session's full files_touched list. Disambiguates
+   * "session that surgically created this file" (total ≈ 1) from
+   * "session that touched it as part of a broader run" (total in dozens). */
+  total_files: number;
+};
+
+export type SessionsByFileResponse = {
+  query: string;
+  matches: FileMatch[];
+};
+
+/** Body of `GET /api/v1/sessions/:id/summary`. Markdown string body
+ * cached by the substrate; regenerated on demand when stale. */
+export type SessionSummaryResponse = {
+  session_id: string;
+  /** Single paragraph (LLM-generated when LLM provider is configured,
+   * statistics-only fallback otherwise). May be empty when the
+   * session has no fragments yet. */
+  summary: string;
+  /** Timestamp the summary was generated. Lets clients know if it's
+   * stale relative to recent session activity. */
+  generated_at: string | null;
+};
+
 export type TrajectoryRecord = {
   id: string;
   kind: string;

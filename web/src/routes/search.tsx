@@ -5,7 +5,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
 import { api } from '@/lib/api';
 import { useSessions, useKnownProjects } from '@/hooks/useSessions';
-import type { FeatureHit, RetrieveHit } from '@/lib/types';
+import type { FeatureHit, FileMatch, RetrieveHit } from '@/lib/types';
 
 /**
  * Search modes.
@@ -20,11 +20,12 @@ import type { FeatureHit, RetrieveHit } from '@/lib/types';
  *   `delivered_features[].feature` names. Best when you remember
  *   what you SHIPPED but not which session shipped it.
  */
-type SearchMode = 'memories' | 'sessions' | 'features';
+type SearchMode = 'memories' | 'sessions' | 'features' | 'files';
 const MODE_LABELS: Record<SearchMode, string> = {
   memories: 'Memories',
   sessions: 'Sessions',
   features: 'Features',
+  files: 'Files',
 };
 const MODE_HINTS: Record<SearchMode, string> = {
   memories: 'Per-fragment snippet view — best for skimming raw content.',
@@ -32,6 +33,8 @@ const MODE_HINTS: Record<SearchMode, string> = {
     'Grouped by session — best for "WHICH session was I working on X?". Each card links to that session.',
   features:
     'Substring search over agent-declared feature names — best when you remember what you SHIPPED but not which session shipped it.',
+  files:
+    'Substring search over files_touched across every session — best when you remember the FILE you edited but not which session edited it. Sessions with the file as their only edit (total=1) are likely the surgical authoring sessions.',
 };
 
 /**
@@ -54,7 +57,10 @@ export const Route = createFileRoute('/search')({
     if (typeof raw.q === 'string' && raw.q.length > 0) out.q = raw.q;
     if (
       typeof raw.mode === 'string' &&
-      (raw.mode === 'memories' || raw.mode === 'sessions' || raw.mode === 'features')
+      (raw.mode === 'memories' ||
+        raw.mode === 'sessions' ||
+        raw.mode === 'features' ||
+        raw.mode === 'files')
     ) {
       out.mode = raw.mode;
     }
@@ -391,6 +397,17 @@ function SearchPage() {
   });
   const featureHits: FeatureHit[] = featuresQuery.data?.hits ?? [];
 
+  // Files mode — substring search across files_touched across every
+  // session. Enabled only in files mode + non-empty query. Backend
+  // already substring-matches case-insensitively.
+  const filesQuery = useQuery({
+    queryKey: ['sessionsByFile', qDebounced],
+    enabled: mode === 'files' && qDebounced.trim().length > 0,
+    staleTime: 5_000,
+    queryFn: async () => api.sessionsByFile(qDebounced.trim()),
+  });
+  const fileMatches: FileMatch[] = filesQuery.data?.matches ?? [];
+
   return (
     <div>
       <div className="page-header">
@@ -550,11 +567,32 @@ function SearchPage() {
             <div className="empty-body">
               {mode === 'features'
                 ? 'Type the name (or any substring) of a feature you shipped — e.g. "reader summary lens", "cache encryption".'
-                : mode === 'sessions'
-                  ? 'Type a topic you discussed — e.g. "reader summary lenses", "embedding choices". Results grouped by session, newest first.'
-                  : 'Type a query above, or click a quick search. Add chips to constrain by kind, project, or session.'}
+                : mode === 'files'
+                  ? 'Type a file path or basename — e.g. "AgentStreamRail.tsx", "src/services/embedding". Substring, case-insensitive.'
+                  : mode === 'sessions'
+                    ? 'Type a topic you discussed — e.g. "reader summary lenses", "embedding choices". Results grouped by session, newest first.'
+                    : 'Type a query above, or click a quick search. Add chips to constrain by kind, project, or session.'}
             </div>
           </div>
+        ) : mode === 'files' ? (
+          filesQuery.isLoading ? (
+            <div className="empty">
+              <div className="empty-title">searching file paths…</div>
+            </div>
+          ) : fileMatches.length === 0 ? (
+            <div className="empty">
+              <div className="empty-title">No files match</div>
+              <div className="empty-body">
+                Try a shorter substring — match is case-insensitive on
+                any path containing the query. Sessions with no
+                files_touched metadata won't appear (older ingest path).
+              </div>
+            </div>
+          ) : (
+            fileMatches.map((m) => (
+              <FileSearchRow key={m.session_id} match={m} query={q} />
+            ))
+          )
         ) : mode === 'features' ? (
           featuresQuery.isLoading ? (
             <div className="empty">
@@ -961,6 +999,17 @@ function groupBySession(rows: SearchResultRow[]): SessionGroup[] {
 }
 
 function SessionGroupRow({ group, query }: { group: SessionGroup; query: string }) {
+  // Ticket #2 — inline session-summary preview. Lazy-fetch on demand
+  // when the user clicks the "Summary" toggle. Cached server-side so
+  // repeated opens are free.
+  const [showSummary, setShowSummary] = useState(false);
+  const summaryQuery = useQuery({
+    queryKey: ['session-summary', group.session_id],
+    enabled: showSummary,
+    staleTime: 60_000,
+    queryFn: () => api.sessionSummary(group.session_id),
+  });
+
   return (
     <div className="search-result" style={{ alignItems: 'stretch' }}>
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -976,7 +1025,40 @@ function SessionGroupRow({ group, query }: { group: SessionGroup; query: string 
               · newest {shortTs(new Date(group.newest_ts).toISOString())}
             </span>
           )}
+          <button
+            className="btn btn-ghost sm"
+            type="button"
+            onClick={() => setShowSummary((v) => !v)}
+            title={
+              showSummary
+                ? 'Hide the LLM-generated one-paragraph summary'
+                : 'Show a one-paragraph summary of this session (lazy-fetched, server-cached)'
+            }
+            style={{ fontSize: 10.5, marginLeft: 'auto' }}
+          >
+            {showSummary ? 'hide summary' : 'show summary'}
+          </button>
         </div>
+        {showSummary && (
+          <div
+            className="snippet"
+            style={{
+              marginTop: 4,
+              marginBottom: 6,
+              paddingLeft: 6,
+              borderLeft: '2px solid var(--accent)',
+              fontSize: 11.5,
+              color: 'var(--ink-muted)',
+              fontStyle: 'italic',
+            }}
+          >
+            {summaryQuery.isLoading
+              ? 'loading summary…'
+              : summaryQuery.isError
+                ? '(summary unavailable — endpoint failed)'
+                : summaryQuery.data?.summary || '(no summary yet — try again after the session has more fragments)'}
+          </div>
+        )}
         {group.top_snippets.map((s) => (
           <div key={s.id} style={{ marginTop: 4 }}>
             <div className="meta-row" style={{ marginBottom: 2 }}>
@@ -1047,6 +1129,77 @@ function FeatureSearchRow({ hit, query }: { hit: FeatureHit; query: string }) {
             {hit.files.length > 3 && ` · +${hit.files.length - 3} more`}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Files mode — substring search across files_touched
+//
+// total_files==1 is the strong signal: session touched ONLY this file → it's
+// the surgical authoring session. Anything bigger = the file was edited as
+// part of a broader run. Render that distinction prominently because it's
+// the most useful disambiguator for "who created this".
+// ─────────────────────────────────────────────────────────────────────────────
+
+function FileSearchRow({ match, query }: { match: FileMatch; query: string }) {
+  const isAuthoringSession = match.total_files === 1;
+  return (
+    <div className="search-result">
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="meta-row" style={{ marginBottom: 4 }}>
+          <SessionPill id={match.session_id} />
+          <span
+            className="mono dim"
+            style={{ fontSize: 11 }}
+            title={
+              isAuthoringSession
+                ? 'Session touched ONLY this file — likely the surgical authoring session.'
+                : `Session touched ${match.total_files} files total; this one matched the query.`
+            }
+          >
+            · {match.matched_files.length} matched / {match.total_files} total
+          </span>
+          {isAuthoringSession && (
+            <span
+              className="mono"
+              style={{
+                fontSize: 10.5,
+                color: 'var(--accent)',
+                background: 'var(--surface-2)',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                padding: '0 6px',
+              }}
+            >
+              authoring
+            </span>
+          )}
+        </div>
+        <ul
+          className="mono"
+          style={{
+            margin: 0,
+            paddingLeft: 4,
+            listStyle: 'none',
+            borderLeft: '2px solid var(--border)',
+            fontSize: 11.5,
+          }}
+        >
+          {match.matched_files.slice(0, 5).map((p) => (
+            <li
+              key={p}
+              style={{ padding: '2px 8px', wordBreak: 'break-all' }}
+              dangerouslySetInnerHTML={{ __html: highlight(p, query) }}
+            />
+          ))}
+          {match.matched_files.length > 5 && (
+            <li className="dim" style={{ padding: '2px 8px' }}>
+              · +{match.matched_files.length - 5} more
+            </li>
+          )}
+        </ul>
       </div>
     </div>
   );
