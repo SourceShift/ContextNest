@@ -25,6 +25,7 @@
 //! When usage proves a field needs typed validation, narrow it from
 //! `Value` to a concrete type in a follow-up PR.
 
+pub mod cache_delete;
 pub mod cache_stats;
 pub mod embeddings;
 pub mod handler;
@@ -32,7 +33,7 @@ pub mod models;
 pub mod openai_shapes;
 
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 
@@ -46,4 +47,8 @@ pub fn create_llm_proxy_router() -> Router<ContextNestServices> {
         .route("/llm/v1/models", get(models::list_models))
         .route("/llm/v1/embeddings", post(embeddings::embeddings))
         .route("/llm/v1/cache/stats", get(cache_stats::cache_stats))
+        .route(
+            "/llm/v1/cache/entries/:fingerprint",
+            delete(cache_delete::discard_entry),
+        )
 }

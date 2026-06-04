@@ -92,6 +92,41 @@ pub enum WalRecord {
         /// + response_json. See [`CachePayload`].
         payload: CachePayload,
     },
+    /// LLM proxy cache hard-delete (v0.3 Phase 3 slice 3.3). The
+    /// `DELETE /llm/v1/cache/entries/<fingerprint>` HTTP handler
+    /// writes this record so the bucket doesn't return on restart.
+    ///
+    /// "Hard" means the bucket leaves both the in-memory store AND
+    /// the WAL's effective state. The original `LlmCacheInsert`
+    /// records stay on disk (we never rewrite the WAL mid-flight),
+    /// but the replay path skips any bucket whose fingerprint has a
+    /// corresponding `LlmCacheDiscard` record at a later
+    /// position. Standard tombstone pattern; a future WAL compactor
+    /// reclaims the bytes.
+    ///
+    /// Deletion is bucket-level by exact-prefix fingerprint —
+    /// multiple entries within one bucket (same project + model +
+    /// temperature + system_prompt) are deleted together. The GDPR
+    /// + project-purge shapes are both bucket-shaped, so this
+    /// covers v0.3's load-bearing cases. Per-entry addressing
+    /// (embedding-hash suffix) lands as a follow-up if real usage
+    /// surfaces the need.
+    LlmCacheDiscard {
+        /// 32-byte `ExactKeyPrefix::fingerprint()`. Stored as raw
+        /// bytes so the replay loop doesn't re-decode per record.
+        /// The HTTP handler accepts URL-safe base64 over the wire
+        /// and decodes at the edge.
+        prefix_fingerprint: [u8; 32],
+        /// Unix timestamp of the delete operation. Lets the replay
+        /// pipeline enforce strict insert-before-discard ordering
+        /// when the WAL contains both for the same fingerprint.
+        deleted_at_unix_secs: u64,
+        /// Free-form audit reason from the `?reason=` query param.
+        /// Stored so the WAL itself doubles as the audit trail
+        /// without a separate log-shipping pipeline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// Either a plaintext or AEAD-sealed envelope of the embedding +
