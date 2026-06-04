@@ -47,6 +47,7 @@ pub mod kind_registry;
 pub mod llm;
 pub mod llm_cache;
 pub mod llm_cache_crypto;
+pub mod llm_cache_redactor;
 pub mod parser;
 pub mod session_index;
 pub mod wal;

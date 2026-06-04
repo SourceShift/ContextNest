@@ -373,6 +373,18 @@ pub struct LlmCacheService {
     /// In both directions the substrate continues to serve cached
     /// responses for entries it can still read.
     encryption: Option<Arc<ring::aead::LessSafeKey>>,
+    /// PII redactor applied to response choices **before** the WAL
+    /// write. Defaults to enabled with email/phone/Luhn-CC patterns;
+    /// the operator can disable via
+    /// `CONTEXTNEST_LLM_CACHE_REDACTOR_ENABLED=false` (forward-only
+    /// mode) or layer additional regex via
+    /// `CONTEXTNEST_LLM_CACHE_REDACTOR_EXTRA_PATTERNS`. See
+    /// [`crate::services::llm_cache_redactor`] for the full rule set.
+    ///
+    /// The redactor mutates the in-memory and WAL-stored response.
+    /// The upstream LLM provider still receives the un-redacted
+    /// prompt — this only protects what lands in long-term storage.
+    redactor: Arc<crate::services::llm_cache_redactor::Redactor>,
 }
 
 impl LlmCacheService {
@@ -386,7 +398,27 @@ impl LlmCacheService {
             default_ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             wal: None,
             encryption: None,
+            redactor: Arc::new(crate::services::llm_cache_redactor::Redactor::from_env()),
         }
+    }
+
+    /// Replace the default env-derived redactor with a custom one.
+    /// Tests use `Redactor::disabled()` to avoid host-env leakage;
+    /// future per-project wiring will pass project-specific extras
+    /// through here.
+    pub fn with_redactor(
+        mut self,
+        redactor: crate::services::llm_cache_redactor::Redactor,
+    ) -> Self {
+        self.redactor = Arc::new(redactor);
+        self
+    }
+
+    /// Snapshot the redactor state (enabled + rule count) for
+    /// `/api/v1/substrate/config`. Returning a tuple keeps the
+    /// substrate.rs caller from having to know the Redactor type.
+    pub fn redactor_state(&self) -> (bool, usize) {
+        (self.redactor.enabled(), self.redactor.rule_count())
     }
 
     /// Attach an AES-256-GCM encryption key. When set, every WAL
@@ -627,7 +659,15 @@ impl LlmCacheService {
     /// write cost; switching one to async would be inconsistent).
     /// WAL failure is logged at `warn!` but does NOT fail the
     /// in-memory insert — cache durability is best-effort by design.
-    pub fn insert(&self, key: CacheKey, response: ChatCompletionsResponse) {
+    pub fn insert(&self, key: CacheKey, mut response: ChatCompletionsResponse) {
+        // v0.3 Phase 3 slice 3.2 — apply PII redactor to every
+        // assistant choice's text content BEFORE the in-memory store
+        // and BEFORE the WAL serialise. The upstream provider already
+        // received the un-redacted prompt; this protects what lands
+        // in long-term storage. Cheap (regex over usually-short
+        // response strings); the cost is paid once per insert, never
+        // on lookups.
+        redact_response_in_place(&mut response, &self.redactor);
         // Capture the WAL record fields BEFORE moving key + response
         // into the in-memory entry, so we don't pay a clone cost when
         // WAL is disabled.
@@ -752,6 +792,52 @@ impl std::fmt::Debug for LlmCacheService {
 /// need a response_json length prefix because it's the tail.
 /// Format version is implicit in the WAL `CachePayload::AesGcm`
 /// variant tag — bumping it means adding a new variant.
+/// Walk a chat-completions response and apply the redactor to every
+/// assistant-message string fragment in-place. Handles both the
+/// `MessageContent::Text(String)` shape (the common case) and the
+/// `MessageContent::Parts(Vec<ContentPart>)` shape used by
+/// multimodal responses — the latter scrubs only `ContentPart::Text`
+/// entries and leaves image/audio/file parts untouched.
+///
+/// Tool-call arguments are intentionally NOT redacted in this slice:
+/// the OpenAI spec encodes them as a JSON string inside
+/// `ToolCall.function.arguments`, and indiscriminately running PII
+/// regexes over JSON breaks well-formedness in confusing ways. A
+/// follow-up slice will add a JSON-aware redactor for tool-call
+/// arguments if real usage shows PII landing there.
+fn redact_response_in_place(
+    response: &mut crate::api::llm_proxy::openai_shapes::ChatCompletionsResponse,
+    redactor: &crate::services::llm_cache_redactor::Redactor,
+) {
+    if !redactor.enabled() {
+        return;
+    }
+    use crate::api::llm_proxy::openai_shapes::{ContentPart, MessageContent};
+    for choice in &mut response.choices {
+        let Some(content) = choice.message.content.as_mut() else {
+            continue;
+        };
+        match content {
+            MessageContent::Text(s) => {
+                let redacted = redactor.redact(s);
+                if &redacted != s {
+                    *s = redacted;
+                }
+            }
+            MessageContent::Parts(parts) => {
+                for p in parts {
+                    if let ContentPart::Text { text } = p {
+                        let redacted = redactor.redact(text);
+                        if &redacted != text {
+                            *text = redacted;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn encode_encrypted_payload(embedding: &[f32], response_json: &str) -> Vec<u8> {
     let emb_byte_len = std::mem::size_of_val(embedding);
     let mut out = Vec::with_capacity(4 + emb_byte_len + response_json.len());
