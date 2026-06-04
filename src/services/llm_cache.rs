@@ -482,6 +482,25 @@ impl LlmCacheService {
         let mut restored = 0usize;
         let mut guard = self.inner.write().expect("llm_cache lock poisoned");
 
+        // Slice 3.3 tombstones: pre-scan the record stream for
+        // LlmCacheDiscard entries and record (fingerprint ->
+        // deleted_at_unix_secs). During the main replay loop we
+        // skip any LlmCacheInsert whose fingerprint has a tombstone
+        // with `deleted_at >= inserted_at`. This is the standard
+        // WAL tombstone pattern: the original insert record stays
+        // on disk but its effective state is erased.
+        let tombstones: std::collections::HashMap<[u8; 32], u64> = records
+            .iter()
+            .filter_map(|r| match r {
+                WalRecord::LlmCacheDiscard {
+                    prefix_fingerprint,
+                    deleted_at_unix_secs,
+                    ..
+                } => Some((*prefix_fingerprint, *deleted_at_unix_secs)),
+                _ => None,
+            })
+            .collect();
+
         for record in records {
             let WalRecord::LlmCacheInsert {
                 project_id,
@@ -508,6 +527,17 @@ impl LlmCacheService {
                 temperature_bucket: *temperature_bucket,
                 system_prompt_hash: *system_prompt_hash,
             };
+
+            // Tombstone check: if this fingerprint was hard-deleted
+            // AFTER this insert, skip the restore. Equal timestamps
+            // are treated as "delete wins" so a delete-then-insert-
+            // at-same-second sequence still gets dropped (rare in
+            // practice; WAL granularity is seconds).
+            if let Some(&deleted_at) = tombstones.get(&prefix.fingerprint()) {
+                if deleted_at >= *inserted_at_unix_secs {
+                    continue;
+                }
+            }
 
             let (embedding, response): (Vec<f32>, ChatCompletionsResponse) = match payload {
                 CachePayload::Plaintext {
@@ -744,6 +774,93 @@ impl LlmCacheService {
         }
     }
 
+    /// Linear-scan the in-memory bucket keys for one whose
+    /// `fingerprint()` matches `target`. Returns the cloned key on
+    /// hit, `None` on miss. O(N_buckets) — typically dozens-to-low-
+    /// thousands. Used by the DELETE handler to recover an
+    /// `ExactKeyPrefix` from a 32-byte fingerprint passed in the URL.
+    pub fn find_prefix_by_fingerprint(&self, target: &[u8; 32]) -> Option<ExactKeyPrefix> {
+        let guard = self.inner.read().expect("llm_cache lock poisoned");
+        guard
+            .by_prefix
+            .keys()
+            .find(|k| k.fingerprint() == *target)
+            .cloned()
+    }
+
+    /// Hard-delete every entry in the bucket keyed by `prefix`
+    /// (v0.3 Phase 3 slice 3.3). Returns the number of in-memory
+    /// entries that were removed.
+    ///
+    /// Mechanics:
+    /// 1. Drop the bucket from the in-memory store. Future lookups
+    ///    for any embedding under this prefix will miss.
+    /// 2. Append a `WalRecord::LlmCacheDiscard` tombstone so the
+    ///    bucket doesn't return on restart. Existing
+    ///    `LlmCacheInsert` records for this fingerprint stay on
+    ///    disk; the replay path filters them out by comparing the
+    ///    tombstone's `deleted_at_unix_secs` against each insert's
+    ///    `inserted_at_unix_secs`.
+    /// 3. Emit a `tracing::info!` at `target = "cache_audit"` so
+    ///    the deletion is captured in operator logs even if a
+    ///    centralised audit pipeline isn't wired. Fields: prefix
+    ///    fingerprint (hex), removed-row count, reason.
+    ///
+    /// WAL append failure is best-effort + warn — matches the
+    /// `insert` path's contract (cache durability is best-effort
+    /// by design; a write hiccup doesn't fail the operator's
+    /// delete intent).
+    pub fn discard_prefix(&self, prefix: &ExactKeyPrefix, reason: Option<String>) -> usize {
+        let removed = {
+            let mut guard = self.inner.write().expect("llm_cache lock poisoned");
+            guard.by_prefix.remove(prefix).map(|v| v.len()).unwrap_or(0)
+        };
+
+        let deleted_at_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let fingerprint = prefix.fingerprint();
+
+        // Audit log — separate target so operators can pipe just
+        // cache audit events to a dedicated log sink (`RUST_LOG=
+        // contextnest=warn,cache_audit=info`).
+        tracing::info!(
+            target: "cache_audit",
+            fingerprint = %hex_encode_32(&fingerprint),
+            project_id = %prefix.project_id,
+            model = %prefix.model,
+            temperature_bucket = prefix.temperature_bucket,
+            removed_rows = removed,
+            reason = reason.as_deref().unwrap_or(""),
+            "llm_cache discard"
+        );
+
+        // WAL tombstone — survives restart so replay drops the
+        // bucket. Skip when WAL isn't configured (in-memory-only
+        // mode, matching the `insert` path).
+        if let Some(wal_arc) = self.wal.as_ref() {
+            if let Some(wal) = wal_arc.get() {
+                let record = crate::services::wal::WalRecord::LlmCacheDiscard {
+                    prefix_fingerprint: fingerprint,
+                    deleted_at_unix_secs,
+                    reason,
+                };
+                if let Err(e) = wal.append(&record) {
+                    tracing::warn!(
+                        error = %e,
+                        "llm_cache: WAL append failed for discard tombstone — \
+                         in-memory delete succeeded but entry will return on \
+                         next restart"
+                    );
+                }
+            }
+        }
+
+        removed
+    }
+
     /// Snapshot of current counters.
     pub fn stats(&self) -> CacheStats {
         let guard = self.inner.read().expect("llm_cache lock poisoned");
@@ -835,6 +952,48 @@ fn redact_response_in_place(
                 }
             }
         }
+    }
+}
+
+/// Hex-encode a 32-byte fingerprint to a 64-char lowercase string.
+/// Used in audit logs + as the HTTP path segment for the discard
+/// endpoint. Inlined locally because dragging in a `hex` crate
+/// dependency for one call site is overkill; the loop is bounded
+/// to 32 iterations and the format-string allocation is one-shot.
+fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = vec![0u8; 64];
+    for (i, b) in bytes.iter().enumerate() {
+        out[i * 2] = TABLE[(b >> 4) as usize];
+        out[i * 2 + 1] = TABLE[(b & 0x0f) as usize];
+    }
+    // SAFETY: the table is ASCII, so the buffer is valid UTF-8.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Inverse of [`hex_encode_32`]. Returns `None` on any non-hex byte
+/// or wrong length. Used by the discard handler to decode the
+/// fingerprint path segment.
+pub fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1708,5 +1867,171 @@ mod tests {
             dbg.contains("encryption_enabled: true"),
             "Debug must reflect encryption state; got: {dbg}"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Slice 3.3 — tombstone-replay tests for `LlmCacheDiscard`
+    // ────────────────────────────────────────────────────────────
+
+    fn cache_discard_record(prefix_fingerprint: [u8; 32], age_secs: u64) -> WalRecord {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        WalRecord::LlmCacheDiscard {
+            prefix_fingerprint,
+            deleted_at_unix_secs: now.saturating_sub(age_secs),
+            reason: Some("test-tombstone".to_string()),
+        }
+    }
+
+    #[test]
+    fn replay_skips_inserts_with_later_tombstone() {
+        // Insert at t-100s, then tombstone at t-50s.
+        // Replay should see the tombstone has `deleted_at >=
+        // inserted_at` and skip the insert.
+        let cache = LlmCacheService::new();
+        let prefix_hash = hash_system_prompt("sys");
+        let prefix = ExactKeyPrefix {
+            project_id: "p".into(),
+            model: "m".into(),
+            temperature_bucket: 14,
+            system_prompt_hash: prefix_hash,
+        };
+        let records = vec![
+            cache_insert_record(
+                "p",
+                "m",
+                14,
+                prefix_hash,
+                vec![1.0, 0.0],
+                "should-be-gone",
+                100,
+            ),
+            cache_discard_record(prefix.fingerprint(), 50),
+        ];
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let restored = cache.replay(&records, now);
+        assert_eq!(restored, 0, "tombstone after insert should skip the insert");
+
+        // Verify the cache really is empty for this prefix.
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", vec![1.0, 0.0]);
+        assert!(
+            cache.lookup(&key, None).is_none(),
+            "tombstoned entry must not be retrievable post-replay"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_inserts_with_earlier_tombstone_only_for_other_fingerprint() {
+        // Tombstone for prefix A; insert for prefix B. The
+        // tombstone must NOT affect prefix B.
+        let cache = LlmCacheService::new();
+        let prefix_a_hash = hash_system_prompt("sys-a");
+        let prefix_b_hash = hash_system_prompt("sys-b");
+        let prefix_a = ExactKeyPrefix {
+            project_id: "p".into(),
+            model: "m".into(),
+            temperature_bucket: 14,
+            system_prompt_hash: prefix_a_hash,
+        };
+        let records = vec![
+            cache_discard_record(prefix_a.fingerprint(), 50),
+            cache_insert_record("p", "m", 14, prefix_b_hash, vec![1.0, 0.0], "kept", 100),
+        ];
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let restored = cache.replay(&records, now);
+        assert_eq!(
+            restored, 1,
+            "prefix B's insert must survive prefix A's tombstone"
+        );
+
+        let key_b = derive_cache_key("p", "m", Some(0.7), "sys-b", vec![1.0, 0.0]);
+        assert_eq!(
+            cache.lookup(&key_b, None).map(|r| r.id),
+            Some("kept".to_string()),
+            "prefix B must be retrievable post-replay"
+        );
+    }
+
+    #[test]
+    fn discard_prefix_returns_removed_row_count() {
+        // In-memory test (no WAL): insert two entries into the
+        // same bucket, then discard. Returned count must equal 2.
+        let cache = LlmCacheService::new();
+        let prefix = ExactKeyPrefix {
+            project_id: "p".into(),
+            model: "m".into(),
+            temperature_bucket: 14,
+            system_prompt_hash: hash_system_prompt("sys"),
+        };
+        cache.insert(
+            CacheKey {
+                exact: prefix.clone(),
+                semantic_embedding: vec![1.0, 0.0],
+            },
+            dummy_response("r1"),
+        );
+        cache.insert(
+            CacheKey {
+                exact: prefix.clone(),
+                semantic_embedding: vec![0.0, 1.0],
+            },
+            dummy_response("r2"),
+        );
+
+        let removed = cache.discard_prefix(&prefix, Some("test".into()));
+        assert_eq!(removed, 2, "two entries in bucket must both be removed");
+
+        // Bucket must be gone.
+        let key = derive_cache_key("p", "m", Some(0.7), "sys", vec![1.0, 0.0]);
+        assert!(
+            cache.lookup(&key, None).is_none(),
+            "post-discard lookup must miss"
+        );
+    }
+
+    #[test]
+    fn discard_unknown_prefix_returns_zero() {
+        let cache = LlmCacheService::new();
+        let prefix = ExactKeyPrefix {
+            project_id: "never".into(),
+            model: "inserted".into(),
+            temperature_bucket: 0,
+            system_prompt_hash: [0u8; 8],
+        };
+        let removed = cache.discard_prefix(&prefix, None);
+        assert_eq!(removed, 0, "discard of never-inserted bucket is no-op");
+    }
+
+    #[test]
+    fn hex_encode_decode_roundtrip() {
+        let fp: [u8; 32] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb,
+            0xdc, 0xed, 0xfe, 0x0f,
+        ];
+        let encoded = hex_encode_32(&fp);
+        assert_eq!(encoded.len(), 64);
+        assert!(encoded.chars().all(|c| c.is_ascii_hexdigit()));
+        let decoded = hex_decode_32(&encoded).expect("roundtrip must decode");
+        assert_eq!(decoded, fp);
+    }
+
+    #[test]
+    fn hex_decode_rejects_wrong_length_and_non_hex() {
+        assert!(hex_decode_32("").is_none());
+        assert!(hex_decode_32("abc").is_none());
+        assert!(hex_decode_32(&"x".repeat(64)).is_none());
+        assert!(hex_decode_32(&"0".repeat(63)).is_none());
+        assert!(hex_decode_32(&"0".repeat(65)).is_none());
     }
 }

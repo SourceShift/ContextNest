@@ -1267,9 +1267,11 @@ async fn replay_full(
                     );
                 }
             },
-            // Cache-insert records were already restored in bootstrap_wal
-            // via `LlmCacheService::replay` before this loop. Skip silently.
-            WalRecord::LlmCacheInsert { .. } => {}
+            // Cache-insert + cache-discard records were already
+            // applied in bootstrap_wal via `LlmCacheService::replay`
+            // (which handles tombstone-vs-insert ordering) before
+            // this loop. Skip silently here.
+            WalRecord::LlmCacheInsert { .. } | WalRecord::LlmCacheDiscard { .. } => {}
         }
         if (idx + 1) % 100 == 0 {
             tracing::info!(
