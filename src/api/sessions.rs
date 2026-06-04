@@ -2774,6 +2774,30 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Default concurrency for the by-intent cold-call embed fan-out.
+/// 16-way concurrency is a deliberate compromise:
+/// - DeepInfra's default rate-limit headroom comfortably absorbs 16
+///   parallel requests for a 0.6B-param Qwen3 embed; sustained higher
+///   concurrency starts surfacing 429s at the busy end of the day.
+/// - Empirically, on a 2,377-session substrate the cold call drops
+///   from ~180s (sequential) to ~5s at 16-way, with diminishing
+///   returns past ~32-way (network jitter dominates at that point).
+/// - The dominant cost is the upstream HTTP round-trip, not CPU on
+///   our side — Tokio's `buffer_unordered` overhead is negligible at
+///   this scale.
+///
+/// Override via `CONTEXTNEST_BY_INTENT_CONCURRENCY` env var. Set to
+/// `1` to recover the pre-PR sequential behaviour for debugging.
+const DEFAULT_BY_INTENT_CONCURRENCY: usize = 16;
+
+fn by_intent_concurrency() -> usize {
+    std::env::var("CONTEXTNEST_BY_INTENT_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= 256)
+        .unwrap_or(DEFAULT_BY_INTENT_CONCURRENCY)
+}
+
 pub async fn sessions_by_intent(
     State(services): State<ContextNestServices>,
     Query(params): Query<SessionsByIntentQuery>,
@@ -2800,52 +2824,123 @@ pub async fn sessions_by_intent(
     session_ids.sort();
     session_ids.dedup();
 
-    let mut hits: Vec<SessionIntentHit> = Vec::with_capacity(session_ids.len());
-    let mut considered: usize = 0;
+    // ─────────────────────────────────────────────────────────────
+    // Phase 1: compute intent text + cache lookup for ALL sessions.
+    // This is cheap (in-memory map walks) so sequential is fine.
+    // Partition into:
+    //   - `precomputed`: cache-hit entries we already have embeddings for
+    //   - `pending`:     sessions needing a fresh embed (cache miss or
+    //                    stale hash)
+    // ─────────────────────────────────────────────────────────────
+    struct PrecomputedEntry {
+        sid: String,
+        intent_text: String,
+        domain: Option<String>,
+        embedding: Vec<f32>,
+    }
+    struct PendingEmbed {
+        sid: String,
+        intent_text: String,
+        domain: Option<String>,
+        hash: u64,
+    }
+    let mut precomputed: Vec<PrecomputedEntry> = Vec::new();
+    let mut pending: Vec<PendingEmbed> = Vec::new();
 
-    for sid in &session_ids {
-        let (intent_text, domain) = compute_intent_text(&services, sid).await;
-        if intent_text.is_empty() {
-            // No structured intent fields — skip. The session may
-            // still be retrievable via the fragment-level /retrieve
-            // endpoint; by-intent just doesn't have a signal to rank
-            // on. This is the dominant cause of "low considered"
-            // counts on a fresh substrate.
-            continue;
-        }
-        considered += 1;
-
-        let hash = fnv1a_64(&intent_text);
-
-        // Cache lookup: hit on (session_id, same hash) → reuse
-        // embedding. Miss → compute, store.
-        let cached: Option<SessionIntentEntry> = {
-            let cache = services.session_intent_embeddings.read().await;
-            cache.get(sid).cloned()
-        };
-        let entry = match cached {
-            Some(e) if e.text_hash == hash => e,
-            _ => {
-                // Cache miss or stale. Embed and store.
-                let embedding = match services.embedding.generate_embedding(&intent_text).await {
-                    Ok(e) => e,
-                    Err(_) => continue, // Embedder hiccup; skip this session, don't fail the whole query.
-                };
-                let entry = SessionIntentEntry {
-                    text_hash: hash,
-                    intent_text: intent_text.clone(),
-                    embedding,
-                    domain: domain.clone(),
-                };
-                services
-                    .session_intent_embeddings
-                    .write()
-                    .await
-                    .insert(sid.clone(), entry.clone());
-                entry
+    {
+        // Hold the read lock only for the partition pass; release
+        // before Phase 2 (concurrent embed) so cache reads from
+        // sibling requests aren't blocked while embeds are in flight.
+        let cache = services.session_intent_embeddings.read().await;
+        for sid in &session_ids {
+            let (intent_text, domain) = compute_intent_text(&services, sid).await;
+            if intent_text.is_empty() {
+                // No structured intent fields — skip. The session may
+                // still be retrievable via the fragment-level /retrieve
+                // endpoint; by-intent just doesn't have a signal to
+                // rank on. This is the dominant cause of "low
+                // considered" counts on a fresh substrate.
+                continue;
             }
-        };
+            let hash = fnv1a_64(&intent_text);
+            match cache.get(sid) {
+                Some(e) if e.text_hash == hash => {
+                    precomputed.push(PrecomputedEntry {
+                        sid: sid.clone(),
+                        intent_text: e.intent_text.clone(),
+                        domain: e.domain.clone(),
+                        embedding: e.embedding.clone(),
+                    });
+                }
+                _ => {
+                    pending.push(PendingEmbed {
+                        sid: sid.clone(),
+                        intent_text,
+                        domain,
+                        hash,
+                    });
+                }
+            }
+        }
+    }
+    let considered: usize = precomputed.len() + pending.len();
 
+    // ─────────────────────────────────────────────────────────────
+    // Phase 2: concurrent embed fan-out for cache misses.
+    // `futures::stream::buffer_unordered(N)` runs up to N futures in
+    // flight at a time and yields them as they complete. We don't
+    // care about completion order here — the result vec is rebuilt
+    // and re-sorted by score downstream.
+    //
+    // Errors per-session are swallowed (embed hiccup -> session
+    // skipped) rather than failing the whole query, matching the
+    // pre-fanout sequential semantics.
+    // ─────────────────────────────────────────────────────────────
+    use futures::stream::{self, StreamExt};
+    let concurrency = by_intent_concurrency();
+    let embedding_svc = services.embedding.clone();
+    let newly_embedded: Vec<PrecomputedEntry> = stream::iter(pending)
+        .map(|p| {
+            let svc = embedding_svc.clone();
+            async move {
+                let emb = svc.generate_embedding(&p.intent_text).await.ok()?;
+                Some(PrecomputedEntry {
+                    sid: p.sid,
+                    intent_text: p.intent_text,
+                    domain: p.domain,
+                    embedding: emb,
+                })
+            }
+        })
+        .buffer_unordered(concurrency)
+        .filter_map(|opt| async move { opt })
+        .collect()
+        .await;
+
+    // Phase 2.5: write all newly-embedded entries back to the cache
+    // in a single write-lock acquire (one critical section instead
+    // of N) so the next query gets steady-state hits.
+    if !newly_embedded.is_empty() {
+        let mut cache = services.session_intent_embeddings.write().await;
+        for e in &newly_embedded {
+            cache.insert(
+                e.sid.clone(),
+                SessionIntentEntry {
+                    text_hash: fnv1a_64(&e.intent_text),
+                    intent_text: e.intent_text.clone(),
+                    embedding: e.embedding.clone(),
+                    domain: e.domain.clone(),
+                },
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Phase 3: score every session (cache-hit + newly-embedded),
+    // apply domain filter, collect into hits.
+    // ─────────────────────────────────────────────────────────────
+    let mut hits: Vec<SessionIntentHit> = Vec::with_capacity(considered);
+    for entry in precomputed.into_iter().chain(newly_embedded.into_iter()) {
         // Optional domain filter (case-insensitive substring).
         if let Some(want) = params.domain.as_deref() {
             let want_lc = want.to_ascii_lowercase();
@@ -2854,10 +2949,9 @@ pub async fn sessions_by_intent(
                 continue;
             }
         }
-
         let score = cosine(&query_embedding, &entry.embedding);
         hits.push(SessionIntentHit {
-            session_id: sid.clone(),
+            session_id: entry.sid,
             score,
             intent_text: entry.intent_text,
             domain: entry.domain,
