@@ -404,6 +404,14 @@ pub struct LlmCacheConfigView {
     /// Live entry count in the in-memory store. Zero on a fresh start
     /// before any chat-completion is cached.
     pub total_entries: usize,
+    /// `true` when the v0.3 slice 3.2 PII redactor is active.
+    /// Defaults to true; flipped off via
+    /// `CONTEXTNEST_LLM_CACHE_REDACTOR_ENABLED=false` (forward-only mode).
+    pub redactor_enabled: bool,
+    /// Number of compiled redaction rules (defaults + extras from
+    /// `CONTEXTNEST_LLM_CACHE_REDACTOR_EXTRA_PATTERNS`). Returns 0
+    /// when the redactor is disabled.
+    pub redactor_rule_count: usize,
 }
 
 /// `GET /api/v1/substrate/config` — read-only config snapshot.
@@ -423,11 +431,16 @@ pub async fn get_substrate_config(
             default_provider: services.llm.provider_kind(),
             configured_providers,
         },
-        llm_cache: LlmCacheConfigView {
-            encryption_enabled: services.llm_cache.encryption_enabled(),
-            similarity_threshold: services.llm_cache.similarity_threshold(),
-            default_ttl_secs: services.llm_cache.default_ttl().as_secs(),
-            total_entries: stats.total_entries,
+        llm_cache: {
+            let (redactor_enabled, redactor_rule_count) = services.llm_cache.redactor_state();
+            LlmCacheConfigView {
+                encryption_enabled: services.llm_cache.encryption_enabled(),
+                similarity_threshold: services.llm_cache.similarity_threshold(),
+                default_ttl_secs: services.llm_cache.default_ttl().as_secs(),
+                total_entries: stats.total_entries,
+                redactor_enabled,
+                redactor_rule_count,
+            }
         },
     })
 }
