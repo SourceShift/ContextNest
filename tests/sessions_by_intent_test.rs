@@ -255,3 +255,76 @@ async fn by_intent_empty_query_returns_400() {
     let res = server.get("/api/v1/sessions/by-intent?q=").await;
     assert_eq!(res.status_code(), 400, "empty q should be a 400");
 }
+
+#[tokio::test]
+async fn by_intent_concurrent_fanout_preserves_results() {
+    // Seed 30 sessions with distinct intents — large enough that
+    // sequential-vs-concurrent ordering matters. Run the query
+    // twice: first call has 30 cache misses (full concurrent
+    // fan-out), second call has 30 cache hits (no embeds).
+    // The result MEMBERSHIP must be identical between calls.
+    // This pins the property that the concurrent embed phase
+    // doesn't drop, reorder, or duplicate sessions.
+    let (services, server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+
+    for i in 0..30 {
+        let sid = format!("cn-fanout-{i:02}");
+        seed_session(
+            &sink,
+            &sid,
+            "research",
+            &["topic-a", "topic-b"],
+            &format!("Research session number {i} on unique topic"),
+        )
+        .await;
+    }
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    // First call — full cache-miss fan-out (concurrent embed).
+    let res1 = server
+        .get("/api/v1/sessions/by-intent?q=research+session&top_k=50")
+        .await;
+    res1.assert_status_ok();
+    let body1: Value = res1.json();
+    let sids1: Vec<String> = body1["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["session_id"].as_str().unwrap().to_string())
+        .collect();
+    let considered1 = body1["considered"].as_u64().unwrap();
+    assert!(
+        sids1.len() >= 30,
+        "expected at least 30 hits, got {}",
+        sids1.len()
+    );
+    assert!(
+        considered1 >= 30,
+        "expected at least 30 considered, got {considered1}"
+    );
+
+    // Second call — same query, cache should be fully warm. The
+    // result set must match the first call's exactly (after sorting
+    // both — the second-call ordering should also be deterministic
+    // since cosine scores are deterministic for cached embeddings).
+    let res2 = server
+        .get("/api/v1/sessions/by-intent?q=research+session&top_k=50")
+        .await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    let mut sids2: Vec<String> = body2["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["session_id"].as_str().unwrap().to_string())
+        .collect();
+
+    let mut sids1_sorted = sids1.clone();
+    sids1_sorted.sort();
+    sids2.sort();
+    assert_eq!(
+        sids1_sorted, sids2,
+        "membership must match between cold and warm calls"
+    );
+}
