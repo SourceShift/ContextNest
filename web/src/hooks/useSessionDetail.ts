@@ -57,6 +57,48 @@ async function fetchKind(
   }
 }
 
+/**
+ * Fan out across multiple kind names and merge, deduplicating by id.
+ *
+ * The extractor emits two parallel taxonomies that share UI buckets:
+ *
+ * - Decisions: legacy `decision` + trajectory-style `decision_made`
+ * - Blockers : legacy `blocker` + trajectory-style `failure` + `risk_flag`
+ *
+ * Older sessions only carry the legacy kind; newer sessions only carry the
+ * trajectory kinds (see `src/ingest/claude_code/extractor.rs` —
+ * `MemoryKind::Decision` vs `MemoryKind::DecisionMade`). Querying only one
+ * name dropped every non-empty bucket for sessions written under the other
+ * taxonomy — the UI then showed "no decisions / no blockers" while the DB
+ * had hundreds. Merge here so both populations render. Sort by `ts` desc
+ * after the merge so the section reads chronologically regardless of which
+ * kind dominated.
+ */
+async function fetchKinds(
+  sessionId: string,
+  kinds: string[],
+  extraFilter?: Record<string, unknown>,
+): Promise<RetrieveHit[]> {
+  const buckets = await Promise.all(
+    kinds.map((k) => fetchKind(sessionId, k, extraFilter)),
+  );
+  const seen = new Set<string>();
+  const merged: RetrieveHit[] = [];
+  for (const bucket of buckets) {
+    for (const hit of bucket) {
+      if (seen.has(hit.id)) continue;
+      seen.add(hit.id);
+      merged.push(hit);
+    }
+  }
+  merged.sort((a, b) => {
+    const at = typeof a.metadata.ts === 'string' ? a.metadata.ts : '';
+    const bt = typeof b.metadata.ts === 'string' ? b.metadata.ts : '';
+    return bt.localeCompare(at);
+  });
+  return merged;
+}
+
 async function fetchTrajectory(sessionId: string): Promise<TrajectoryResponse | null> {
   try {
     return await api.sessionTrajectory(sessionId);
@@ -95,8 +137,8 @@ export function useSessionDetail(sessionId: string) {
         fetchKind(sessionId, 'accomplishment'),
         fetchKind(sessionId, 'learning'),
         fetchKind(sessionId, 'todo'),
-        fetchKind(sessionId, 'decision'),
-        fetchKind(sessionId, 'blocker'),
+        fetchKinds(sessionId, ['decision', 'decision_made']),
+        fetchKinds(sessionId, ['blocker', 'failure', 'risk_flag']),
         fetchKind(sessionId, 'user_action'),
         fetchTrajectory(sessionId),
         fetchPromptPreview(sessionId),
