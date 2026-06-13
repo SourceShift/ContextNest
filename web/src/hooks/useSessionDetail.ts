@@ -99,9 +99,37 @@ async function fetchKinds(
   return merged;
 }
 
+/**
+ * Race a promise against a hard timeout. The original promise keeps
+ * running on the network, but the caller resolves with `fallback`
+ * after `ms` so it never blocks a Promise.all sibling.
+ *
+ * Needed because some BE endpoints (notably `/sessions/:id/trajectory`)
+ * scale super-linearly with fragment count and can hang for >30s on
+ * sessions with 1000+ fragments — long enough to keep the whole
+ * session-detail Promise.all in flight and render every section as
+ * `loading=true`. With this race, a slow trajectory just yields a
+ * null trajectory section while every other section paints.
+ */
+function raceTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
 async function fetchTrajectory(sessionId: string): Promise<TrajectoryResponse | null> {
   try {
-    return await api.sessionTrajectory(sessionId);
+    return await raceTimeout(api.sessionTrajectory(sessionId), 6_000, null);
   } catch {
     return null;
   }
@@ -109,7 +137,7 @@ async function fetchTrajectory(sessionId: string): Promise<TrajectoryResponse | 
 
 async function fetchPromptPreview(sessionId: string): Promise<PromptPreviewResponse | null> {
   try {
-    return await api.sessionPromptPreview(sessionId);
+    return await raceTimeout(api.sessionPromptPreview(sessionId), 6_000, null);
   } catch {
     return null;
   }
