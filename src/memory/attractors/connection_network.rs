@@ -742,12 +742,37 @@ impl ConnectionNetwork {
     // Helper methods
 
     async fn create_connections_for_node(&self, node_id: &str) -> ContextNestResult<()> {
+        // Connection-creation knobs. Read per-call because env can be
+        // hot-reloaded between substrate restarts; reads are cheap and the
+        // values are stable within a single consolidation tick.
+        //
+        // CONTEXTNEST_MAX_CONNECTIONS_PER_NODE caps the fan-out per new
+        // fragment. Without it, `create_connections_for_node` issues one
+        // `create_connection` per peer above the similarity threshold,
+        // letting avg_degree (and per-insert CPU) grow monotonically with
+        // substrate size. Production substrate hit avg_degree=204 / 7M
+        // edges / 75% sustained CPU before this cap landed.
+        //
+        // CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD raises the floor
+        // when operators want fewer but stronger edges (e.g. during
+        // backlog drain). Defaults preserve the pre-cap connectivity for
+        // small substrates: most fragments have <32 peers above 0.7, so
+        // the cap is a no-op there and only bites at scale.
+        let max_connections = std::env::var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let similarity_threshold = std::env::var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.7);
+
         // Phase 1: snapshot similarity candidates under a read lock. We
         // collect owned `(other_id, similarity)` pairs and release the read
         // lock by letting `graph` drop. Without this snapshot, the inner
         // `create_connection` call below tries to take a `write()` while we
         // still hold the `read()`, which deadlocks `std::sync::RwLock`.
-        let candidates: Vec<(String, f32)> = {
+        let mut candidates: Vec<(String, f32)> = {
             let graph = self.graph.read().unwrap();
             let new_node = match graph.nodes.get(node_id) {
                 Some(node) => node,
@@ -759,10 +784,20 @@ impl ConnectionNetwork {
                 .filter(|(other_id, _)| other_id.as_str() != node_id)
                 .filter_map(|(other_id, other_node)| {
                     let sim = utils::cosine_similarity(&new_node.content, &other_node.content);
-                    (sim > 0.7).then(|| (other_id.clone(), sim))
+                    (sim > similarity_threshold).then(|| (other_id.clone(), sim))
                 })
                 .collect()
         };
+
+        // Top-K cap: sort strongest-first and truncate. The strongest-K
+        // peers carry almost all of the basin signal — empirically the
+        // similarity distribution has a long thin tail past rank ~20, so
+        // dropping the tail loses little retrieval quality while bounding
+        // per-insert cost from O(N) to O(K).
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if candidates.len() > max_connections {
+            candidates.truncate(max_connections);
+        }
 
         // Phase 2: issue connection creates with no read lock held.
         for (other_id, similarity) in candidates {
@@ -1629,6 +1664,88 @@ mod tests {
 
         let path = path.unwrap();
         assert_eq!(path.nodes, vec!["node1", "node2", "node3"]);
+    }
+
+    /// Verify that `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` bounds the fan-out
+    /// when adding a new node into a graph where many existing peers exceed
+    /// the similarity threshold. Without the cap, `add_node` would create
+    /// one edge per qualifying peer, causing avg_degree (and consolidation
+    /// CPU) to grow with substrate size. With the cap set to 3 here we
+    /// expect at most 3 connections to be created for the inbound node even
+    /// though 10 peers qualify.
+    ///
+    /// This test mutates a process-global env var; serialize against other
+    /// env-mutating tests via the conventional Mutex pattern if more land.
+    #[tokio::test]
+    async fn test_create_connections_respects_top_k_cap() {
+        // Snapshot + override the cap. Restore on drop via a scope guard
+        // pattern so a panic mid-test doesn't leak env to siblings.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        let _g = EnvGuard {
+            key: "CONTEXTNEST_MAX_CONNECTIONS_PER_NODE",
+            prev: std::env::var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE").ok(),
+        };
+        std::env::set_var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE", "3");
+
+        let config = MemoryAttractorConfig::default();
+        let network = ConnectionNetwork::new(config);
+        network.initialize().await.unwrap();
+
+        // Seed 10 peers whose content is essentially identical to the
+        // inbound node — every one sits well above the 0.7 similarity floor.
+        for i in 0..10 {
+            let peer = MemoryNode {
+                id: format!("peer{}", i),
+                node_type: MemoryNodeType::Primary,
+                content: vec![0.1; 32],
+                importance: 0.5,
+                last_accessed: Utc::now(),
+                access_frequency: 1.0,
+                metadata: HashMap::new(),
+                created_at: Utc::now(),
+                fragment_ids: vec![],
+            };
+            network.add_node(peer).await.unwrap();
+        }
+
+        // Baseline: capture connection count after the seeding completes
+        // (peers connect to each other as they're added).
+        let stats_before = network.get_statistics();
+
+        // Inbound node — same content vector, so all 10 peers qualify.
+        let inbound = MemoryNode {
+            id: "inbound".to_string(),
+            node_type: MemoryNodeType::Primary,
+            content: vec![0.1; 32],
+            importance: 0.8,
+            last_accessed: Utc::now(),
+            access_frequency: 1.0,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+            fragment_ids: vec![],
+        };
+        network.add_node(inbound).await.unwrap();
+
+        let stats_after = network.get_statistics();
+        let new_connections =
+            stats_after.total_connections_created - stats_before.total_connections_created;
+
+        assert!(
+            new_connections <= 3,
+            "expected at most 3 new connections (top-K cap), got {}",
+            new_connections
+        );
     }
 
     /// Verify that calling `find_path` once increments the path-finder search
