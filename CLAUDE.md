@@ -142,6 +142,8 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT` | true | Auto-attach on chain queries |
 | `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | Worker tick |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | In-flight embedder calls |
+| `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` | 32 | Top-K cap on edges created per new fragment in `create_connections_for_node`. Bounds avg_degree growth as the substrate fills. Lower → faster ingest, smaller graph; higher → richer connection-aware retrieval. |
+| `CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD` | 0.7 | Cosine-similarity floor for a peer to qualify as a connection candidate. Raise to 0.8 during backlog drain to halve fan-out. |
 
 Full list in `docs/architecture-honest.md`.
 
