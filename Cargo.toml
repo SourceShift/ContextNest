@@ -112,7 +112,7 @@ validator = { version = "0.18", features = ["derive"] }
 
 # Cryptographic utilities
 rand = "0.10"
-base64 = "0.21"
+base64 = "0.22"
 hex = "0.4"
 
 # HTTP security
