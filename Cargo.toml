@@ -125,7 +125,7 @@ parking_lot = "0.12"  # Fast mutex for memory pools and caching
 # Security: Force minimum safe versions
 ring = "0.17.12"
 ed25519-dalek = "2.1"
-sha2 = "0.10"
+sha2 = "0.11"
 rsa = "0.9"
 p256 = "0.13"
 elliptic-curve = "0.13"
