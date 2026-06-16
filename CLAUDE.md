@@ -135,7 +135,8 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 
 | Env | Default | Effect |
 |---|---|---|
-| `CONTEXTNEST_DECAY_HALF_LIFE_DAYS` | 60 | Age-based decay multiplier |
+| `CONTEXTNEST_DECAY_HALF_LIFE_DAYS` | 60 | Global age-based decay half-life (days) |
+| `CONTEXTNEST_DECAY_HALFLIFE_MULT_<KIND>` | per-kind | Scales the global half-life per `MemoryKind`. Defaults from `kind_registry::durability` (HarnessBridge Fig. 4): durable kinds (decision/verification/feature/learning/accomplishment/decision_made) ×2.0, volatile kinds (state/current_task/read_context/files_touched) ×0.5, everything else ×1.0. e.g. `CONTEXTNEST_DECAY_HALFLIFE_MULT_VERIFICATION=3.0`. |
 | `CONTEXTNEST_RETRIEVE_BASIN_BOOST` | 0.7 | Basin-sibling outer multiplier |
 | `CONTEXTNEST_RETRIEVE_CONNECTION_BOOST` | 0.5 | Graph-neighbor multiplier |
 | `CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT` | 0.1 | Edge floor |

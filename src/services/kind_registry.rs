@@ -92,6 +92,50 @@ pub enum Cardinality {
     PerEvent,
 }
 
+/// How fast a kind should lose retrieve weight to age.
+///
+/// HarnessBridge (arXiv 2606.12882) Fig. 4 measured which trajectory
+/// turns are safe to compress: `test_execution` shrinks ~3% (it carries
+/// the decisive verification signal) while navigation / file-reads
+/// shrink 20–40%. The same ranking applies to *forgetting*: a settled
+/// decision or a passing-test verification stays load-bearing for weeks,
+/// while "what file am I looking at right now" is stale within days.
+///
+/// This class scales the global half-life
+/// (`CONTEXTNEST_DECAY_HALF_LIFE_DAYS`) per kind instead of decaying
+/// everything at one rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum Durability {
+    /// Settled facts worth keeping long — decisions, passing
+    /// verifications, shipped features, learnings. Half-life ×2.0.
+    Durable,
+    /// Default — no special treatment. Half-life ×1.0.
+    Standard,
+    /// Transient system state — what's being looked at / worked on
+    /// right now. Stale fast. Half-life ×0.5.
+    Volatile,
+}
+
+impl Durability {
+    /// Multiplier applied to the global decay half-life. A value >1
+    /// slows decay (memory lasts longer); <1 speeds it up.
+    pub fn half_life_multiplier(self) -> f64 {
+        match self {
+            Durability::Durable => 2.0,
+            Durability::Standard => 1.0,
+            Durability::Volatile => 0.5,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Durability::Durable => "durable",
+            Durability::Standard => "standard",
+            Durability::Volatile => "volatile",
+        }
+    }
+}
+
 /// Specification for one known fragment kind.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct KindSpec {
@@ -289,6 +333,44 @@ pub fn is_boilerplate(kind: &str) -> bool {
     kind_spec(kind).signal_class == SignalClass::Boilerplate
 }
 
+/// Durability class for a kind — how fast it should decay relative to
+/// the global half-life. See [`Durability`] for the HarnessBridge Fig. 4
+/// rationale. Unknown kinds default to [`Durability::Standard`].
+pub fn durability(kind: &str) -> Durability {
+    match kind {
+        // Settled facts — keep long. Decisions don't un-happen, a
+        // passing verification stays a passing verification, a shipped
+        // feature stays shipped, a learning stays learned.
+        "decision" | "decision_made" | "verification" | "feature" | "learning"
+        | "accomplishment" => Durability::Durable,
+        // Right-now system state — stale within days. These mirror
+        // Fig. 4's fast-compressing navigation / file-read turns.
+        "state" | "current_task" | "read_context" | "files_touched" => Durability::Volatile,
+        _ => Durability::Standard,
+    }
+}
+
+/// Per-kind multiplier applied to the global decay half-life
+/// (`CONTEXTNEST_DECAY_HALF_LIFE_DAYS`). A value >1 slows decay; <1
+/// speeds it up. Defaults come from [`durability`]; each kind is
+/// overridable via `CONTEXTNEST_DECAY_HALFLIFE_MULT_<KIND_UPPER>`
+/// (e.g. `CONTEXTNEST_DECAY_HALFLIFE_MULT_VERIFICATION=3.0`). Env value
+/// must parse as a finite f64 > 0; bad values fall back to the default.
+pub fn decay_half_life_multiplier(kind: &str) -> f64 {
+    let env_name = format!(
+        "CONTEXTNEST_DECAY_HALFLIFE_MULT_{}",
+        kind.to_uppercase().replace('-', "_")
+    );
+    if let Ok(raw) = std::env::var(&env_name) {
+        if let Ok(parsed) = raw.parse::<f64>() {
+            if parsed.is_finite() && parsed > 0.0 {
+                return parsed;
+            }
+        }
+    }
+    durability(kind).half_life_multiplier()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +476,67 @@ mod tests {
                 "expected {k} = PerEvent"
             );
         }
+    }
+
+    #[test]
+    fn durable_kinds_decay_slower_than_volatile() {
+        for k in [
+            "decision",
+            "decision_made",
+            "verification",
+            "feature",
+            "learning",
+            "accomplishment",
+        ] {
+            assert_eq!(durability(k), Durability::Durable, "expected {k} = Durable");
+            assert!(decay_half_life_multiplier(k) > 1.0, "{k} should slow decay");
+        }
+        for k in ["state", "current_task", "read_context", "files_touched"] {
+            assert_eq!(
+                durability(k),
+                Durability::Volatile,
+                "expected {k} = Volatile"
+            );
+            assert!(
+                decay_half_life_multiplier(k) < 1.0,
+                "{k} should speed decay"
+            );
+        }
+        // Strict ordering: durable half-life > standard > volatile.
+        assert!(
+            decay_half_life_multiplier("decision") > decay_half_life_multiplier("todo")
+                && decay_half_life_multiplier("todo") > decay_half_life_multiplier("state")
+        );
+    }
+
+    #[test]
+    fn unknown_kind_decays_at_standard_rate() {
+        assert_eq!(durability("brand_new_kind_2027"), Durability::Standard);
+        assert!((decay_half_life_multiplier("brand_new_kind_2027") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decay_mult_env_override_takes_precedence() {
+        std::env::set_var("CONTEXTNEST_DECAY_HALFLIFE_MULT_DECAY_ENV_KIND", "4.5");
+        let m = decay_half_life_multiplier("decay_env_kind");
+        std::env::remove_var("CONTEXTNEST_DECAY_HALFLIFE_MULT_DECAY_ENV_KIND");
+        assert!((m - 4.5).abs() < 1e-9, "env override must apply; got {m}");
+    }
+
+    #[test]
+    fn decay_mult_env_override_rejects_non_positive() {
+        std::env::set_var("CONTEXTNEST_DECAY_HALFLIFE_MULT_DECAY_OOR_KIND", "-1.0");
+        let m = decay_half_life_multiplier("decay_oor_kind");
+        std::env::remove_var("CONTEXTNEST_DECAY_HALFLIFE_MULT_DECAY_OOR_KIND");
+        // Unknown kind → Standard default = 1.0
+        assert!((m - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn durability_string_form_is_stable() {
+        assert_eq!(Durability::Durable.as_str(), "durable");
+        assert_eq!(Durability::Standard.as_str(), "standard");
+        assert_eq!(Durability::Volatile.as_str(), "volatile");
     }
 
     #[test]

@@ -75,18 +75,22 @@ async fn old_fragments_score_lower_than_fresh_ones_with_identical_content() {
 
     // Both fragments carry the SAME content — embeddings will match the
     // query identically, so any score difference comes purely from decay.
+    // Use a Standard-durability kind ("todo") so the global half-life
+    // (60d) applies unscaled — durable kinds like "learning" get a ×2.0
+    // half-life multiplier (see kind_registry::durability) which would
+    // move the expected ratio out of the band asserted below.
     let fresh_id = store(
         &server,
         session,
         "rust async runtime tokio is the de facto standard",
-        json!({"kind": "learning", "ts": iso_days_ago(0)}),
+        json!({"kind": "todo", "ts": iso_days_ago(0)}),
     )
     .await;
     let old_id = store(
         &server,
         session,
         "rust async runtime tokio is the de facto standard",
-        json!({"kind": "learning", "ts": iso_days_ago(100)}),
+        json!({"kind": "todo", "ts": iso_days_ago(100)}),
     )
     .await;
 

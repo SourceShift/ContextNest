@@ -1444,15 +1444,28 @@ async fn compute_reconstruction(
 /// 60 days). A 1-day-old fragment scores ~99% of its base similarity; a
 /// 60-day-old one scores ~50%; a 180-day-old one ~12%.
 ///
+/// The global half-life is then scaled per fragment `kind` by
+/// [`kind_registry::decay_half_life_multiplier`] — settled facts
+/// (decision / verification / feature) decay at half the rate, transient
+/// system state (state / current_task / read_context / files_touched) at
+/// double. See HarnessBridge Fig. 4 rationale in `kind_registry`.
+///
 /// Recency boost: `last_accessed` (bumped on every retrieve hit) takes
 /// precedence over `ts` so frequently-referenced fragments stay fresh.
 /// Returns 1.0 (no decay) when no usable timestamp is present.
 fn decay_multiplier(metadata: &HashMap<String, serde_json::Value>) -> f32 {
-    let half_life_days: f64 = std::env::var("CONTEXTNEST_DECAY_HALF_LIFE_DAYS")
+    let global_half_life_days: f64 = std::env::var("CONTEXTNEST_DECAY_HALF_LIFE_DAYS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|v: &f64| v.is_finite() && *v > 0.0)
         .unwrap_or(60.0);
+
+    let kind_mult = metadata
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(crate::services::kind_registry::decay_half_life_multiplier)
+        .unwrap_or(1.0);
+    let half_life_days = global_half_life_days * kind_mult;
 
     let ref_ts = metadata
         .get("last_accessed")
