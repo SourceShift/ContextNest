@@ -78,13 +78,34 @@ async fn summarize_with_llm_disabled_returns_count_and_null_id() {
     // and this field will be a non-null string — we allow that so the test
     // doesn't hard-fail for contributors who have keys set. The primary CI
     // assertion is the merged_count one above.
+    // source_fragment_ids must always be present as an array (provenance
+    // field added per HarnessBridge §4 — shrunk text cites its sources).
+    let provenance = body["source_fragment_ids"]
+        .as_array()
+        .expect("source_fragment_ids must be an array");
+
     if body["summary_attractor_id"].is_null() {
-        // LLM disabled: this is the canonical CI path.
+        // LLM disabled: this is the canonical CI path. No summary was
+        // produced, so there are no source ids to cite.
+        assert!(
+            provenance.is_empty(),
+            "disabled path must return empty source_fragment_ids; got {provenance:?}"
+        );
     } else {
         assert!(
             body["summary_attractor_id"].is_string(),
             "When LLM is enabled, summary_attractor_id must be a string UUID; got {:?}",
             body["summary_attractor_id"]
+        );
+        // LLM enabled: the summary cites exactly the fragments it merged.
+        assert_eq!(
+            provenance.len(),
+            body["merged_count"].as_u64().unwrap() as usize,
+            "summary must cite one source id per merged fragment"
+        );
+        assert!(
+            provenance.iter().all(|v| v.is_string()),
+            "every source_fragment_id must be a string; got {provenance:?}"
         );
     }
 }
