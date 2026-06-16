@@ -321,6 +321,10 @@ pub fn extract_memories(
     // over the full stream because tool_result parts live in `user` events,
     // outside the assistant-only z-insight walk below.
     let bash_index = build_bash_outcome_index(events);
+    // Same idea for file claims: index the real Edit/Write (touched) and Read
+    // (read) tool_use events so `delivered_features[].files` and
+    // `read_context[]` can be graded against what actually happened.
+    let file_index = build_tool_file_index(events);
 
     for ev in events {
         if ev.event_type != "assistant" {
@@ -440,6 +444,13 @@ pub fn extract_memories(
                                 rec = rec.with_meta("defs", Value::Array(filtered));
                             }
                         }
+                        // Ground the feature's claimed `files` against the real
+                        // edits. A feature claiming files that were never edited
+                        // is a fabricated/overstated deliverable — tag the same
+                        // provenance tier the retrieve trust-weighting reads.
+                        if let Some(tier) = feature_provenance(feat, &file_index) {
+                            rec = rec.with_meta("provenance", Value::String(tier.to_string()));
+                        }
                         out.push(rec);
                     }
                 }
@@ -450,6 +461,7 @@ pub fn extract_memories(
                     project_cwd,
                     &cn_session_id,
                     &bash_index,
+                    &file_index,
                     &mut out,
                 );
                 // Track latest domain/progress + union topics for the
@@ -629,7 +641,6 @@ const FILE_MUTATING_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEd
 /// fn only emits the per-block kinds: state, current_task, accomplishment,
 /// learning, decision, blocker, user_action.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn extract_block_memories(
     block: &Value,
     ts: Option<&str>,
@@ -637,6 +648,7 @@ fn extract_block_memories(
     project_cwd: &str,
     cn_session_id: &str,
     bash_index: &[BashRun],
+    file_index: &ToolFileIndex,
     out: &mut Vec<MemoryRecord>,
 ) {
     let mk = |kind: MemoryKind, text: String| -> MemoryRecord {
@@ -726,11 +738,13 @@ fn extract_block_memories(
         }
     }
 
-    extract_structured_array(
+    // read_context gets a dedicated path so each item can be graded against
+    // the real Read/Edit events: a context entry naming an in-repo file that
+    // was never opened is `absent`; URLs and docs (no Read event possible)
+    // stay untagged. See `read_context_provenance`.
+    extract_read_contexts(
         block,
-        "read_context",
-        MemoryKind::ReadContext,
-        &["salient", "reason", "path"],
+        file_index,
         ts,
         session_uuid,
         project_cwd,
@@ -1208,6 +1222,194 @@ fn extract_verifications(
     }
 }
 
+// ── File-claim grounding (Feature + ReadContext provenance) ─────────────────
+//
+// The trust problem that hits `verification[]` also hits `delivered_features[]`
+// (self-reported files a feature shipped in) and `read_context[]` (self-reported
+// files inspected). We already see the ground truth — `Edit`/`Write` and `Read`
+// `tool_use` events — so index them once and grade the claims, tagging the same
+// `provenance` tier the retrieve trust-weighting consumes.
+
+/// File-reading tools whose `tool_use` means "the agent inspected this file".
+/// Complements [`FILE_MUTATING_TOOLS`]; kept separate because read and edit are
+/// different grounding signals.
+const FILE_READING_TOOLS: &[&str] = &["Read", "NotebookRead"];
+
+/// Real file paths the session edited (`touched`) vs. read (`read`), harvested
+/// from `tool_use` events — the harness-recorded ground truth, not self-report.
+#[derive(Debug, Default)]
+pub(crate) struct ToolFileIndex {
+    pub touched: HashSet<String>,
+    pub read: HashSet<String>,
+}
+
+/// One pre-pass over the full stream collecting edited and read file paths.
+pub(crate) fn build_tool_file_index(events: &[RawEvent]) -> ToolFileIndex {
+    let mut idx = ToolFileIndex::default();
+    for ev in events {
+        let Some(msg) = &ev.message else { continue };
+        let Some(parts) = msg.content.as_array() else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(name) = part.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(path) = part
+                .get("input")
+                .and_then(|i| i.get("file_path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if FILE_MUTATING_TOOLS.contains(&name) {
+                idx.touched.insert(path.to_string());
+            } else if FILE_READING_TOOLS.contains(&name) {
+                idx.read.insert(path.to_string());
+            }
+        }
+    }
+    idx
+}
+
+/// Segment-aligned trailing-path match: a self-reported relative `src/x.rs`
+/// matches a real absolute `/Volumes/.../src/x.rs`, and a bare `x.rs` matches
+/// by basename — but `bar.rs` does NOT match `foobar.rs` (the char before the
+/// suffix must be a path separator).
+fn path_matches(real: &str, claimed: &str) -> bool {
+    let real = real.trim_end_matches('/');
+    let claimed = claimed.trim_end_matches('/');
+    if real.is_empty() || claimed.is_empty() {
+        return false;
+    }
+    if real == claimed {
+        return true;
+    }
+    let (long, short) = if real.len() >= claimed.len() {
+        (real, claimed)
+    } else {
+        (claimed, real)
+    };
+    long.strip_suffix(short)
+        .map(|prefix| prefix.ends_with('/'))
+        .unwrap_or(false)
+}
+
+/// True iff any real path in `set` trailing-matches `claimed`.
+fn any_path_matches(set: &HashSet<String>, claimed: &str) -> bool {
+    set.iter().any(|real| path_matches(real, claimed))
+}
+
+/// Grade a `delivered_features[]` entry's claimed `files` against real edits.
+///   `None`     — no files claimed; nothing to ground (record stays untagged)
+///   `observed` — every claimed file was actually edited
+///   `partial`  — some claimed files were edited, some weren't
+///   `absent`   — none of the claimed files were ever edited (fabricated)
+fn feature_provenance(feat: &Value, idx: &ToolFileIndex) -> Option<&'static str> {
+    let files: Vec<&str> = feat
+        .get("files")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    let matched = files
+        .iter()
+        .filter(|f| any_path_matches(&idx.touched, f))
+        .count();
+    Some(if matched == files.len() {
+        "observed"
+    } else if matched > 0 {
+        "partial"
+    } else {
+        "absent"
+    })
+}
+
+/// Grade a `read_context[]` item against real Read/Edit events. Only entries
+/// that look like in-repo files can be graded; URLs, doc names and other
+/// non-path context legitimately have no Read event, so they stay untagged
+/// rather than being penalised.
+///   `observed` — the cited file was actually read (or edited, which implies read)
+///   `absent`   — an in-repo-looking path that was never read or edited
+///   `None`     — no gradeable path (URL/doc/bare text) → untagged
+fn read_context_provenance(item: &Value, idx: &ToolFileIndex) -> Option<&'static str> {
+    let candidate = read_context_path(item)?;
+    if any_path_matches(&idx.read, &candidate) || any_path_matches(&idx.touched, &candidate) {
+        return Some("observed");
+    }
+    looks_like_repo_path(&candidate).then_some("absent")
+}
+
+/// Pull a path-like token from a read_context item: prefer an explicit `path`
+/// field, else the leading whitespace-delimited token of the text, with a
+/// trailing `:line` / `:line-range` suffix stripped.
+fn read_context_path(item: &Value) -> Option<String> {
+    if let Some(p) = item
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(p.to_string());
+    }
+    let text = item
+        .as_str()
+        .or_else(|| item.get("salient").and_then(Value::as_str))
+        .or_else(|| item.get("reason").and_then(Value::as_str))?;
+    let token = text.split_whitespace().next()?;
+    let path = token.split(':').next().unwrap_or(token);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// A token "looks like" an in-repo file if it has a path separator and a file
+/// extension — enough to distinguish `src/api/tools.rs` from a bare word or a
+/// `https`-mangled URL fragment.
+fn looks_like_repo_path(s: &str) -> bool {
+    s.contains('/') && std::path::Path::new(s).extension().is_some()
+}
+
+/// read_context extraction with file grounding. Mirrors
+/// `extract_structured_array` but adds the `provenance` tier when the item
+/// names a gradeable file.
+#[allow(clippy::too_many_arguments)]
+fn extract_read_contexts(
+    block: &Value,
+    file_index: &ToolFileIndex,
+    ts: Option<&str>,
+    session_uuid: &str,
+    project_cwd: &str,
+    cn_session_id: &str,
+    out: &mut Vec<MemoryRecord>,
+) {
+    let Some(items) = block.get("read_context").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(text) = structured_item_text(item, &["salient", "reason", "path"]) else {
+            continue;
+        };
+        let mut rec = MemoryRecord::new(MemoryKind::ReadContext, text, cn_session_id.to_string());
+        rec.importance = structured_item_importance(MemoryKind::ReadContext, item);
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, ts);
+        rec = copy_structured_item_metadata(rec, item);
+        rec = rec.with_meta("zinsight_field", Value::String("read_context".to_string()));
+        if let Some(tier) = read_context_provenance(item, file_index) {
+            rec = rec.with_meta("provenance", Value::String(tier.to_string()));
+        }
+        out.push(rec);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GoalPhaseBuilt {
     pub text: String,
@@ -1668,6 +1870,160 @@ mod tests {
             zinsight_verify("./scripts/smoke.sh", "passed", "2026-01-01T00:00:02Z"),
         ];
         assert_eq!(verification_provenances(&events), vec!["partial"]);
+    }
+
+    // ── File-claim grounding (Feature + ReadContext) ────────────────────────
+
+    fn ev_tool_call(id: &str, name: &str, file_path: &str, ts: &str) -> RawEvent {
+        let part = serde_json::json!({
+            "type": "tool_use", "id": id, "name": name,
+            "input": {"file_path": file_path}
+        });
+        let msg = serde_json::json!({"role": "assistant", "content": [part]});
+        let ev = serde_json::json!({"type": "assistant", "timestamp": ts, "message": msg});
+        serde_json::from_value(ev).unwrap()
+    }
+
+    fn zinsight_feature(name: &str, files: &[&str], ts: &str) -> RawEvent {
+        let payload = serde_json::json!({
+            "goal": "x",
+            "delivered_features": [{"feature": name, "files": files}]
+        });
+        ev_assistant_with_text(&format!("<z-insight>{payload}</z-insight>"), ts)
+    }
+
+    fn zinsight_read_context(items: serde_json::Value, ts: &str) -> RawEvent {
+        let payload = serde_json::json!({"goal": "x", "read_context": items});
+        ev_assistant_with_text(&format!("<z-insight>{payload}</z-insight>"), ts)
+    }
+
+    fn provenances_of(events: &[RawEvent], kind: MemoryKind) -> Vec<String> {
+        extract_memories(events, "sess-1", "/work")
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| {
+                r.metadata
+                    .get("provenance")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<none>")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn feature_observed_when_all_files_edited() {
+        // Relative claim matches the real absolute edit path by trailing segments.
+        let events = vec![
+            ev_tool_call(
+                "t1",
+                "Edit",
+                "/Volumes/repo/src/api/tools.rs",
+                "2026-01-01T00:00:00Z",
+            ),
+            zinsight_feature(
+                "trust weighting",
+                &["src/api/tools.rs"],
+                "2026-01-01T00:00:01Z",
+            ),
+        ];
+        assert_eq!(
+            provenances_of(&events, MemoryKind::Feature),
+            vec!["observed"]
+        );
+    }
+
+    #[test]
+    fn feature_absent_when_no_claimed_file_edited() {
+        // Claims a file that was never edited — fabricated deliverable.
+        let events = vec![
+            ev_tool_call(
+                "t1",
+                "Write",
+                "/Volumes/repo/src/real.rs",
+                "2026-01-01T00:00:00Z",
+            ),
+            zinsight_feature(
+                "ghost feature",
+                &["src/imaginary.rs"],
+                "2026-01-01T00:00:01Z",
+            ),
+        ];
+        assert_eq!(provenances_of(&events, MemoryKind::Feature), vec!["absent"]);
+    }
+
+    #[test]
+    fn feature_partial_when_some_files_edited() {
+        let events = vec![
+            ev_tool_call(
+                "t1",
+                "Edit",
+                "/Volumes/repo/src/a.rs",
+                "2026-01-01T00:00:00Z",
+            ),
+            zinsight_feature(
+                "half-shipped",
+                &["src/a.rs", "src/b.rs"],
+                "2026-01-01T00:00:01Z",
+            ),
+        ];
+        assert_eq!(
+            provenances_of(&events, MemoryKind::Feature),
+            vec!["partial"]
+        );
+    }
+
+    #[test]
+    fn feature_untagged_when_no_files_claimed() {
+        // No files to ground against → record stays neutral (no provenance).
+        let events = vec![zinsight_feature("vague", &[], "2026-01-01T00:00:01Z")];
+        assert_eq!(provenances_of(&events, MemoryKind::Feature), vec!["<none>"]);
+    }
+
+    #[test]
+    fn read_context_observed_when_file_was_read() {
+        let events = vec![
+            ev_tool_call(
+                "t1",
+                "Read",
+                "/Volumes/repo/src/api/tools.rs",
+                "2026-01-01T00:00:00Z",
+            ),
+            zinsight_read_context(
+                serde_json::json!(["src/api/tools.rs:1432 (decay_multiplier)"]),
+                "2026-01-01T00:00:01Z",
+            ),
+        ];
+        assert_eq!(
+            provenances_of(&events, MemoryKind::ReadContext),
+            vec!["observed"]
+        );
+    }
+
+    #[test]
+    fn read_context_absent_when_repo_file_never_read() {
+        let events = vec![zinsight_read_context(
+            serde_json::json!(["src/api/never_opened.rs (claimed but not read)"]),
+            "2026-01-01T00:00:01Z",
+        )];
+        assert_eq!(
+            provenances_of(&events, MemoryKind::ReadContext),
+            vec!["absent"]
+        );
+    }
+
+    #[test]
+    fn read_context_untagged_for_non_file_context() {
+        // A URL is legitimately ungroundable (no Read event possible) — leave
+        // it neutral rather than penalising it as absent.
+        let events = vec![zinsight_read_context(
+            serde_json::json!(["https://arxiv.org/abs/2603.10060 (Tool Receipts)"]),
+            "2026-01-01T00:00:01Z",
+        )];
+        assert_eq!(
+            provenances_of(&events, MemoryKind::ReadContext),
+            vec!["<none>"]
+        );
     }
 
     #[test]
