@@ -266,6 +266,13 @@ pub struct SummarizeRequest {
 pub struct SummarizeResponse {
     pub merged_count: usize,
     pub summary_attractor_id: Option<String>,
+    /// Ids of the fragments this summary was compressed from. Empty on
+    /// every degrade path (no LLM, no target, store failure). The same
+    /// list is persisted in the summary fragment's metadata sidecar so
+    /// the provenance survives past the response — HarnessBridge's
+    /// "shrunk text must cite its source spans" rule.
+    #[serde(default)]
+    pub source_fragment_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1902,6 +1909,7 @@ pub async fn summarize(
             Json(SummarizeResponse {
                 merged_count,
                 summary_attractor_id: None,
+                source_fragment_ids: Vec::new(),
             }),
         );
     }
@@ -1925,6 +1933,7 @@ pub async fn summarize(
             Json(SummarizeResponse {
                 merged_count,
                 summary_attractor_id: None,
+                source_fragment_ids: Vec::new(),
             }),
         );
     }
@@ -1944,6 +1953,7 @@ pub async fn summarize(
                 Json(SummarizeResponse {
                     merged_count,
                     summary_attractor_id: None,
+                    source_fragment_ids: Vec::new(),
                 }),
             );
         }
@@ -1982,6 +1992,7 @@ pub async fn summarize(
                 Json(SummarizeResponse {
                     merged_count,
                     summary_attractor_id: None,
+                    source_fragment_ids: Vec::new(),
                 }),
             );
         }
@@ -2026,6 +2037,7 @@ pub async fn summarize(
             Json(SummarizeResponse {
                 merged_count,
                 summary_attractor_id: None,
+                source_fragment_ids: Vec::new(),
             }),
         );
     }
@@ -2035,6 +2047,27 @@ pub async fn summarize(
         .write()
         .await
         .insert(summary_id.clone(), summary_text);
+
+    // Provenance sidecar: record which fragments this summary compressed
+    // so the link survives past the response. The summary earns
+    // `provenance=observed` because its sources are real stored fragments
+    // (not a self-report). `kind=summary` so it inherits the registry's
+    // summary durability/weight. HarnessBridge: shrunk text cites sources.
+    {
+        let mut meta = HashMap::new();
+        meta.insert("kind".to_string(), serde_json::json!("summary"));
+        meta.insert("provenance".to_string(), serde_json::json!("observed"));
+        meta.insert("ts".to_string(), serde_json::json!(now.to_rfc3339()));
+        meta.insert(
+            "source_fragment_ids".to_string(),
+            serde_json::json!(active_ids.clone()),
+        );
+        services
+            .fragment_metadata
+            .write()
+            .await
+            .insert(summary_id.clone(), meta);
+    }
 
     services
         .session_index
@@ -2046,6 +2079,7 @@ pub async fn summarize(
         Json(SummarizeResponse {
             merged_count,
             summary_attractor_id: Some(summary_id),
+            source_fragment_ids: active_ids,
         }),
     )
 }
