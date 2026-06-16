@@ -315,6 +315,13 @@ pub fn extract_memories(
     let mut latest_domain_ts: Option<String> = None;
     let mut topics_union: HashSet<String> = HashSet::new();
 
+    // Provenance pre-pass: pair Bash invocations with their results so the
+    // self-reported `verification[]` claims can be grounded (or contradicted)
+    // against what actually ran. See `verification_provenance`. Built once
+    // over the full stream because tool_result parts live in `user` events,
+    // outside the assistant-only z-insight walk below.
+    let bash_index = build_bash_outcome_index(events);
+
     for ev in events {
         if ev.event_type != "assistant" {
             continue;
@@ -442,6 +449,7 @@ pub fn extract_memories(
                     session_uuid,
                     project_cwd,
                     &cn_session_id,
+                    &bash_index,
                     &mut out,
                 );
                 // Track latest domain/progress + union topics for the
@@ -621,12 +629,14 @@ const FILE_MUTATING_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEd
 /// fn only emits the per-block kinds: state, current_task, accomplishment,
 /// learning, decision, blocker, user_action.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn extract_block_memories(
     block: &Value,
     ts: Option<&str>,
     session_uuid: &str,
     project_cwd: &str,
     cn_session_id: &str,
+    bash_index: &[BashRun],
     out: &mut Vec<MemoryRecord>,
 ) {
     let mk = |kind: MemoryKind, text: String| -> MemoryRecord {
@@ -727,11 +737,13 @@ fn extract_block_memories(
         cn_session_id,
         out,
     );
-    extract_structured_array(
+    // Verification gets a dedicated path (not the generic helper) because it
+    // is the one z-insight kind whose claims we can ground against real Bash
+    // output. Adds a `provenance` tier: observed / contradicted / partial /
+    // claimed. See `verification_provenance`.
+    extract_verifications(
         block,
-        "verification",
-        MemoryKind::Verification,
-        &["summary", "command"],
+        bash_index,
         ts,
         session_uuid,
         project_cwd,
@@ -922,6 +934,278 @@ fn copy_structured_item_metadata(mut rec: MemoryRecord, item: &Value) -> MemoryR
         rec.metadata.insert(meta_key.to_string(), value.clone());
     }
     rec
+}
+
+// ── Verification provenance (z-insight grounding) ───────────────────────────
+//
+// The `<z-insight>` block is the agent's self-report about its own turn, with
+// no guarantee it matches what happened. `verification[]` is the highest-stakes
+// kind: a turn can *claim* "tests pass" while the real tool output said they
+// failed. Borrowing HarnessBridge's rule (a claim only stands if a real
+// trajectory span backs it, else default to the safe state), we cross-check
+// each verification claim against the actual Bash output and tag a provenance
+// tier in metadata. Two grounding signals: a coarse Pass/Fail/Unknown string
+// heuristic, and a structured "receipt" (exact `passed`/`failed` counts) the
+// claim is value-compared against — the receipt wins when both disagree.
+
+/// Outcome of a Bash invocation inferred from its raw `tool_result` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BashOutcome {
+    Pass,
+    Fail,
+    Unknown,
+}
+
+/// Structured facts parsed out of a tool result — the "receipt". Unlike the
+/// coarse [`BashOutcome`] heuristic, these are exact recorded values the
+/// self-report can be compared against (Tool Receipts, arXiv 2603.10060).
+/// `None` means the signal wasn't present in the output, not zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReceiptFacts {
+    pub tests_passed: Option<u32>,
+    pub tests_failed: Option<u32>,
+}
+
+/// One Bash command run paired with the outcome inferred from its result and
+/// the structured facts (the receipt) extracted from it.
+#[derive(Debug, Clone)]
+pub(crate) struct BashRun {
+    pub command: String,
+    pub outcome: BashOutcome,
+    pub facts: ReceiptFacts,
+}
+
+/// Pre-pass over the full event stream: pair each `tool_use{name:"Bash"}`
+/// (carries `input.command` + an `id`) with its `tool_result` (lands in the
+/// following `user` message under `tool_use_id`).
+pub(crate) fn build_bash_outcome_index(events: &[RawEvent]) -> Vec<BashRun> {
+    let mut pending: HashMap<String, String> = HashMap::new(); // id -> command
+    let mut runs: Vec<BashRun> = Vec::new();
+
+    for ev in events {
+        let Some(msg) = &ev.message else { continue };
+        let Some(parts) = msg.content.as_array() else {
+            continue;
+        };
+        for part in parts {
+            match part.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if part.get("name").and_then(Value::as_str) == Some("Bash") {
+                        if let (Some(id), Some(cmd)) = (
+                            part.get("id").and_then(Value::as_str),
+                            part.get("input")
+                                .and_then(|i| i.get("command"))
+                                .and_then(Value::as_str),
+                        ) {
+                            pending.insert(id.to_string(), cmd.to_string());
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = part.get("tool_use_id").and_then(Value::as_str) {
+                        if let Some(cmd) = pending.remove(id) {
+                            let text = tool_result_text(part);
+                            runs.push(BashRun {
+                                command: cmd,
+                                outcome: classify_bash_output(&text),
+                                facts: parse_test_counts(&text),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    runs
+}
+
+/// `tool_result.content` is either a plain string or an array of
+/// `{type:"text", text:...}` parts. Flatten both to one string.
+fn tool_result_text(part: &Value) -> String {
+    match part.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Heuristic classification of Bash result text. Strong success markers are
+/// checked first so `0 failed` / `test result: ok` aren't snagged by the
+/// failure scan; then failure markers; then weak success. Anything else is
+/// `Unknown` (we'd rather under-claim than guess).
+fn classify_bash_output(text: &str) -> BashOutcome {
+    let t = text.to_lowercase();
+    const PASS_STRONG: &[&str] = &[
+        "test result: ok",
+        "0 failed",
+        "0 errors",
+        "build succeeded",
+        "all tests passed",
+    ];
+    const FAIL: &[&str] = &[
+        "error[",
+        "error:",
+        "panicked",
+        "test result: failed",
+        "failures:",
+        "build failed",
+        "fatal:",
+        "command not found",
+        "no such file",
+        "traceback (most recent",
+        "assertionerror",
+        "exception",
+    ];
+    const PASS_WEAK: &[&str] = &[
+        "passed",
+        "succeeded",
+        "finished `release`",
+        "finished `dev`",
+    ];
+
+    if PASS_STRONG.iter().any(|m| t.contains(m)) {
+        return BashOutcome::Pass;
+    }
+    if FAIL.iter().any(|m| t.contains(m)) {
+        return BashOutcome::Fail;
+    }
+    if PASS_WEAK.iter().any(|m| t.contains(m)) {
+        return BashOutcome::Pass;
+    }
+    BashOutcome::Unknown
+}
+
+/// Parse `N passed` / `M failed` counts out of result text — works for cargo
+/// (`test result: ok. 15 passed; 0 failed`) and pytest (`12 passed, 3 failed`).
+/// These exact numbers are the receipt the claim is checked against.
+fn parse_test_counts(text: &str) -> ReceiptFacts {
+    let lower = text.to_lowercase();
+    ReceiptFacts {
+        tests_passed: count_before(&lower, "passed"),
+        tests_failed: count_before(&lower, "failed"),
+    }
+}
+
+/// Find the integer immediately preceding `keyword` (e.g. `3` in `3 failed`).
+/// Scans every occurrence and returns the first that has digits in front of it,
+/// so `failures:` (no digits) is ignored while `3 failed` matches.
+fn count_before(lower: &str, keyword: &str) -> Option<u32> {
+    for (idx, _) in lower.match_indices(keyword) {
+        let before = lower[..idx].trim_end();
+        let digits: String = before
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<u32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Cross-check one `verification[]` item against the Bash receipt index.
+///   `observed`     — a matching receipt confirms the claimed status
+///   `contradicted` — claim says pass but the receipt shows failures (money case)
+///   `partial`      — a matching run exists but its outcome is Unknown
+///   `absent`       — a command was cited but no receipt exists for it; the run
+///                    was never observed (fabricated reference)
+///   `claimed`      — no command cited; the claim stands on self-report only
+///
+/// Receipt comparison (exact `failed` count) takes priority over the coarse
+/// string heuristic: a run whose text reads as a pass but whose receipt records
+/// `failed > 0` is still `contradicted`.
+fn verification_provenance(item: &Value, index: &[BashRun]) -> &'static str {
+    // No command cited ⇒ a soft self-report with nothing to ground against.
+    let Some(cmd) = item
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return "claimed";
+    };
+    // A specific command was cited but no receipt exists for it ⇒ the run was
+    // never observed in the transcript. Fabricated tool reference.
+    let Some(run) = index.iter().find(|run| commands_match(&run.command, cmd)) else {
+        return "absent";
+    };
+
+    let claims_pass = match item.get("status").and_then(Value::as_str) {
+        Some(s) => matches!(
+            s.to_lowercase().as_str(),
+            "pass" | "passed" | "ok" | "success" | "succeeded"
+        ),
+        // A verification entry with no explicit failure status reads as an
+        // implicit "this checked out" — treat as a pass-claim for grounding.
+        None => true,
+    };
+
+    // Receipt comparison: an exact failed-count beats the string heuristic.
+    if claims_pass {
+        if let Some(failed) = run.facts.tests_failed {
+            return if failed > 0 {
+                "contradicted"
+            } else {
+                "observed"
+            };
+        }
+    }
+
+    match (claims_pass, run.outcome) {
+        (true, BashOutcome::Fail) => "contradicted",
+        (_, BashOutcome::Unknown) => "partial",
+        _ => "observed",
+    }
+}
+
+/// Fuzzy command match: trimmed substring either direction. The z-insight
+/// `command` is often an abbreviation of the real invocation (`cargo test` vs
+/// `cargo test --test seven_tools_api`), so containment beats equality.
+fn commands_match(real: &str, claimed: &str) -> bool {
+    let real = real.trim();
+    let claimed = claimed.trim();
+    !claimed.is_empty() && (real.contains(claimed) || claimed.contains(real))
+}
+
+/// Verification extraction with provenance grounding. Mirrors
+/// `extract_structured_array` but adds the `provenance` tier.
+#[allow(clippy::too_many_arguments)]
+fn extract_verifications(
+    block: &Value,
+    bash_index: &[BashRun],
+    ts: Option<&str>,
+    session_uuid: &str,
+    project_cwd: &str,
+    cn_session_id: &str,
+    out: &mut Vec<MemoryRecord>,
+) {
+    let Some(items) = block.get("verification").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(text) = structured_item_text(item, &["summary", "command"]) else {
+            continue;
+        };
+        let mut rec = MemoryRecord::new(MemoryKind::Verification, text, cn_session_id.to_string());
+        rec.importance = structured_item_importance(MemoryKind::Verification, item);
+        rec = annotate_session_meta(rec, session_uuid, project_cwd, ts);
+        rec = copy_structured_item_metadata(rec, item);
+        rec = rec.with_meta("zinsight_field", Value::String("verification".to_string()));
+        rec = rec.with_meta(
+            "provenance",
+            Value::String(verification_provenance(item, bash_index).to_string()),
+        );
+        out.push(rec);
+    }
 }
 
 #[derive(Debug)]
@@ -1253,6 +1537,137 @@ mod tests {
             serde_json::to_string(title).unwrap()
         );
         serde_json::from_str(&line).unwrap()
+    }
+
+    // ── Verification-provenance prototype helpers + tests ───────────────────
+
+    fn ev_bash_call(id: &str, command: &str, ts: &str) -> RawEvent {
+        let part = serde_json::json!({
+            "type": "tool_use", "id": id, "name": "Bash",
+            "input": {"command": command}
+        });
+        let msg = serde_json::json!({"role": "assistant", "content": [part]});
+        let ev = serde_json::json!({"type": "assistant", "timestamp": ts, "message": msg});
+        serde_json::from_value(ev).unwrap()
+    }
+
+    fn ev_bash_result(id: &str, output: &str, ts: &str) -> RawEvent {
+        let part = serde_json::json!({
+            "type": "tool_result", "tool_use_id": id, "content": output
+        });
+        let msg = serde_json::json!({"role": "user", "content": [part]});
+        let ev = serde_json::json!({"type": "user", "timestamp": ts, "sessionId": "sess-1", "message": msg});
+        serde_json::from_value(ev).unwrap()
+    }
+
+    fn zinsight_verify(command: &str, status: &str, ts: &str) -> RawEvent {
+        let payload = serde_json::json!({
+            "goal": "x",
+            "verification": [{"summary": "ran the suite", "command": command, "status": status}]
+        });
+        ev_assistant_with_text(&format!("<z-insight>{payload}</z-insight>"), ts)
+    }
+
+    fn zinsight_verify_no_command(status: &str, ts: &str) -> RawEvent {
+        let payload = serde_json::json!({
+            "goal": "x",
+            "verification": [{"summary": "looks correct", "status": status}]
+        });
+        ev_assistant_with_text(&format!("<z-insight>{payload}</z-insight>"), ts)
+    }
+
+    fn verification_provenances(events: &[RawEvent]) -> Vec<String> {
+        extract_memories(events, "sess-1", "/work")
+            .into_iter()
+            .filter(|r| r.kind == MemoryKind::Verification)
+            .map(|r| {
+                r.metadata
+                    .get("provenance")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<none>")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn verification_contradicted_when_bash_failed() {
+        // Agent claims the suite passed, but the real run failed.
+        let events = vec![
+            ev_bash_call(
+                "toolu_1",
+                "cargo test --test seven_tools_api",
+                "2026-01-01T00:00:00Z",
+            ),
+            ev_bash_result(
+                "toolu_1",
+                "running 5 tests\nerror[E0277]: mismatch\ntest result: FAILED. 2 passed; 3 failed",
+                "2026-01-01T00:00:01Z",
+            ),
+            zinsight_verify("cargo test", "passed", "2026-01-01T00:00:02Z"),
+        ];
+        assert_eq!(verification_provenances(&events), vec!["contradicted"]);
+    }
+
+    #[test]
+    fn verification_observed_when_bash_passed() {
+        let events = vec![
+            ev_bash_call("toolu_2", "cargo test", "2026-01-01T00:00:00Z"),
+            ev_bash_result(
+                "toolu_2",
+                "running 5 tests\ntest result: ok. 5 passed; 0 failed",
+                "2026-01-01T00:00:01Z",
+            ),
+            zinsight_verify("cargo test", "passed", "2026-01-01T00:00:02Z"),
+        ];
+        assert_eq!(verification_provenances(&events), vec!["observed"]);
+    }
+
+    #[test]
+    fn verification_absent_when_command_never_ran() {
+        // A specific command is cited but no receipt exists for it — the run
+        // was never observed. Fabricated tool reference.
+        let events = vec![zinsight_verify(
+            "cargo test",
+            "passed",
+            "2026-01-01T00:00:02Z",
+        )];
+        assert_eq!(verification_provenances(&events), vec!["absent"]);
+    }
+
+    #[test]
+    fn verification_claimed_when_no_command_cited() {
+        // No command field at all — a soft self-report with nothing to ground.
+        let events = vec![zinsight_verify_no_command("passed", "2026-01-01T00:00:02Z")];
+        assert_eq!(verification_provenances(&events), vec!["claimed"]);
+    }
+
+    #[test]
+    fn verification_contradicted_by_count_mismatch() {
+        // Output reads as a pass to the string heuristic ("passed" present, no
+        // "FAILED" line), but the receipt records 3 failures. The exact count
+        // must override the heuristic and contradict the pass-claim.
+        let events = vec![
+            ev_bash_call("toolu_9", "pytest", "2026-01-01T00:00:00Z"),
+            ev_bash_result(
+                "toolu_9",
+                "12 passed, 3 failed in 0.4s",
+                "2026-01-01T00:00:01Z",
+            ),
+            zinsight_verify("pytest", "passed", "2026-01-01T00:00:02Z"),
+        ];
+        assert_eq!(verification_provenances(&events), vec!["contradicted"]);
+    }
+
+    #[test]
+    fn verification_partial_when_outcome_unknown() {
+        // A matching run exists but its output isn't classifiable.
+        let events = vec![
+            ev_bash_call("toolu_3", "./scripts/smoke.sh", "2026-01-01T00:00:00Z"),
+            ev_bash_result("toolu_3", "doing stuff... done", "2026-01-01T00:00:01Z"),
+            zinsight_verify("./scripts/smoke.sh", "passed", "2026-01-01T00:00:02Z"),
+        ];
+        assert_eq!(verification_provenances(&events), vec!["partial"]);
     }
 
     #[test]
