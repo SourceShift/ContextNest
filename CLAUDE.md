@@ -140,6 +140,11 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_RETRIEVE_CONNECTION_BOOST` | 0.5 | Graph-neighbor multiplier |
 | `CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT` | 0.1 | Edge floor |
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT` | true | Auto-attach on chain queries |
+| `CONTEXTNEST_RETRIEVE_TRUST_OBSERVED` | 1.0 | Trust multiplier for `provenance=observed` Verification records (receipt-confirmed). Untagged records always score 1.0. |
+| `CONTEXTNEST_RETRIEVE_TRUST_PARTIAL` | 0.7 | Trust multiplier for `provenance=partial` (run exists, outcome unclassifiable) |
+| `CONTEXTNEST_RETRIEVE_TRUST_CLAIMED` | 0.4 | Trust multiplier for `provenance=claimed` (no command cited; self-report only) |
+| `CONTEXTNEST_RETRIEVE_TRUST_ABSENT` | 0.4 | Trust multiplier for `provenance=absent` (command cited but no matching receipt; fabricated reference) |
+| `CONTEXTNEST_RETRIEVE_TRUST_CONTRADICTED` | 0.25 | Trust multiplier for `provenance=contradicted` (receipt disproved the claim). Set 0.0 to bury falsified claims. |
 | `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | Worker tick |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | In-flight embedder calls |
 | `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` | 32 | Top-K cap on edges created per new fragment in `create_connections_for_node`. Bounds avg_degree growth as the substrate fills. Lower → faster ingest, smaller graph; higher → richer connection-aware retrieval. |
