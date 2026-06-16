@@ -798,11 +798,19 @@ pub async fn retrieve(
                 .map(|d| d as f32)
                 .map(|d| apply_density_weight(d, *density_weight_cached()))
                 .unwrap_or(1.0);
+            // Trust weight — demote self-reported claims the ingest
+            // extractor could not ground against a real tool receipt.
+            // `provenance` (set on Verification records) ranks
+            // observed > partial > claimed/absent/contradicted. Records
+            // without the tag (the vast majority) score a neutral 1.0,
+            // so this is backward-compatible. Knobs:
+            //   CONTEXTNEST_RETRIEVE_TRUST_<TIER>.
+            let trust = fragment_meta.map(provenance_weight).unwrap_or(1.0);
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
-                similarity: base_similarity * decay * kind_weight * density,
+                similarity: base_similarity * decay * kind_weight * density * trust,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
             }
@@ -1499,6 +1507,66 @@ fn apply_density_weight(raw_density: f32, weight: f32) -> f32 {
     (1.0 - w) + w * raw
 }
 
+/// Per-tier retrieve trust multipliers. The ingest extractor tags every
+/// `Verification` record with a `provenance` tier reflecting how well a
+/// self-reported claim could be grounded against the real Bash tool receipt
+/// (see `src/ingest/claude_code/extractor.rs`). At retrieve time we demote
+/// the weaker tiers so verified outcomes outrank unbacked self-reports.
+#[derive(Debug, Clone, Copy)]
+struct TrustWeights {
+    observed: f32,
+    partial: f32,
+    claimed: f32,
+    absent: f32,
+    contradicted: f32,
+}
+
+/// Cached trust weights, read from env exactly once per process (env doesn't
+/// change at runtime; retrieve scoring is O(n) per request). Defaults rank
+/// `observed > partial > claimed/absent/contradicted`; `contradicted` is the
+/// floor because the receipt actively disproved the claim. Override any tier
+/// with `CONTEXTNEST_RETRIEVE_TRUST_<TIER>` (e.g. `..._CONTRADICTED=0.0` to
+/// bury falsified claims entirely). Values are clamped to `[0, 1]`.
+fn trust_weights_cached() -> &'static TrustWeights {
+    static CACHED: std::sync::OnceLock<TrustWeights> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        let read = |var: &str, default: f32| -> f32 {
+            std::env::var(var)
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 1.0))
+                .unwrap_or(default)
+        };
+        TrustWeights {
+            observed: read("CONTEXTNEST_RETRIEVE_TRUST_OBSERVED", 1.0),
+            partial: read("CONTEXTNEST_RETRIEVE_TRUST_PARTIAL", 0.7),
+            claimed: read("CONTEXTNEST_RETRIEVE_TRUST_CLAIMED", 0.4),
+            absent: read("CONTEXTNEST_RETRIEVE_TRUST_ABSENT", 0.4),
+            contradicted: read("CONTEXTNEST_RETRIEVE_TRUST_CONTRADICTED", 0.25),
+        }
+    })
+}
+
+/// Map a fragment's `provenance` metadata tier to its trust multiplier.
+/// Records with no `provenance` tag (every non-Verification kind, plus legacy
+/// data ingested before grounding existed) score a neutral `1.0`, keeping this
+/// backward-compatible and inert on the common path.
+fn provenance_weight(metadata: &HashMap<String, serde_json::Value>) -> f32 {
+    let w = trust_weights_cached();
+    match metadata
+        .get("provenance")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("observed") => w.observed,
+        Some("partial") => w.partial,
+        Some("claimed") => w.claimed,
+        Some("absent") => w.absent,
+        Some("contradicted") => w.contradicted,
+        _ => 1.0,
+    }
+}
+
 #[cfg(test)]
 mod density_weight_tests {
     use super::apply_density_weight;
@@ -1535,6 +1603,55 @@ mod density_weight_tests {
         assert!((apply_density_weight(1.5, 1.0) - 1.0).abs() < 1e-6);
         assert!((apply_density_weight(-0.5, 1.0)).abs() < 1e-6);
         assert!((apply_density_weight(0.5, 2.0) - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod provenance_weight_tests {
+    use super::provenance_weight;
+    use std::collections::HashMap;
+
+    fn meta(provenance: Option<&str>) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        if let Some(p) = provenance {
+            m.insert(
+                "provenance".to_string(),
+                serde_json::Value::String(p.to_string()),
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn untagged_records_score_neutral() {
+        // The common path: non-Verification kinds and legacy data carry no
+        // provenance tag and must not be penalized.
+        assert!((provenance_weight(&meta(None)) - 1.0).abs() < 1e-6);
+        assert!((provenance_weight(&meta(Some("nonsense-tier"))) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trust_tiers_are_strictly_ordered() {
+        // observed > partial > claimed/absent > contradicted — the whole
+        // point of the weighting. Asserting the ordering rather than exact
+        // defaults keeps the test stable if the env defaults are retuned.
+        let observed = provenance_weight(&meta(Some("observed")));
+        let partial = provenance_weight(&meta(Some("partial")));
+        let claimed = provenance_weight(&meta(Some("claimed")));
+        let absent = provenance_weight(&meta(Some("absent")));
+        let contradicted = provenance_weight(&meta(Some("contradicted")));
+
+        assert!(
+            observed > partial,
+            "observed {observed} !> partial {partial}"
+        );
+        assert!(partial > claimed, "partial {partial} !> claimed {claimed}");
+        assert!(claimed >= contradicted);
+        assert!(absent >= contradicted);
+        // An observed verification keeps full signal; a contradicted one is
+        // demoted well below it.
+        assert!((observed - 1.0).abs() < 1e-6);
+        assert!(contradicted < observed);
     }
 }
 
