@@ -1429,6 +1429,136 @@ struct PhaseWindow {
     end_ts: Option<String>,
 }
 
+/// One entry in the active-state index — a single open/settled item the
+/// agent should carry forward. Deliberately thin (id + kind + content +
+/// ts) so the response stays a glanceable working-memory note, not a
+/// full record dump.
+#[derive(Debug, Serialize)]
+pub struct ActiveStateItem {
+    pub id: String,
+    pub kind: String,
+    pub content: String,
+    pub ts: Option<String>,
+}
+
+/// HarnessBridge's per-turn "active state index `U_t`", reconstructed
+/// from the session's substrate instead of from a single trajectory.
+/// Where HarnessBridge rebuilds this every turn from the live history
+/// (and loses it on `/clear`), ContextNest's version is durable and
+/// crosses sessions. Each bucket maps to a `MemoryKind` family:
+///
+/// - `unresolved_errors`  ← failure, blocker
+/// - `open_constraints`   ← user_action (open), risk_flag
+/// - `established_facts`   ← decision (settled), decision_made, verification
+/// - `pending_goals`      ← todo (not completed)
+#[derive(Debug, Serialize)]
+pub struct ActiveStateResponse {
+    pub session_id: String,
+    pub unresolved_errors: Vec<ActiveStateItem>,
+    pub open_constraints: Vec<ActiveStateItem>,
+    pub established_facts: Vec<ActiveStateItem>,
+    pub pending_goals: Vec<ActiveStateItem>,
+}
+
+/// Max items returned per bucket. Keeps the active-state note bounded —
+/// the point is a glanceable working set, not exhaustive history (that's
+/// what `/trajectory` is for).
+const ACTIVE_STATE_BUCKET_CAP: usize = 25;
+
+/// Which bucket (if any) a fragment's metadata belongs in. Returns the
+/// bucket discriminant so the caller can route the item. Encodes the
+/// same resolution semantics as `inbox::is_inbox_eligible` (completed
+/// todos and already-settled `awaiting_decision` decisions are filtered)
+/// but partitions into the four `U_t` families instead of one queue.
+fn active_state_bucket(meta: &std::collections::HashMap<String, serde_json::Value>) -> Option<u8> {
+    match meta.get("kind").and_then(|v| v.as_str())? {
+        "failure" | "blocker" => Some(0),       // unresolved_errors
+        "user_action" | "risk_flag" => Some(1), // open_constraints
+        "decision" => {
+            // Settled decisions are facts; ones still awaiting a choice
+            // are pending, not established — they belong in the inbox.
+            let awaiting = meta
+                .get("awaiting_decision")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (!awaiting).then_some(2) // established_facts
+        }
+        "decision_made" | "verification" => Some(2), // established_facts
+        "todo" => {
+            // Completed todos are done — drop them, same as the inbox.
+            let completed = matches!(
+                meta.get("task_status").and_then(|v| v.as_str()),
+                Some("completed")
+            );
+            (!completed).then_some(3) // pending_goals
+        }
+        _ => None,
+    }
+}
+
+/// GET /api/v1/sessions/:id/active-state — HarnessBridge `U_t` served
+/// from the substrate. Walks the session's active fragments once,
+/// partitions the actionable kinds into the four working-memory buckets,
+/// and returns the most-recent items per bucket. 404 when the session
+/// has no active fragments.
+pub async fn session_active_state(
+    State(services): State<ContextNestServices>,
+    Path(session_id): Path<String>,
+) -> Result<Json<ActiveStateResponse>, StatusCode> {
+    let active_ids = services.session_index.list_active(&session_id).await;
+    if active_ids.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    let mut buckets: [Vec<ActiveStateItem>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+    for frag_id in &active_ids {
+        let Some(meta) = metadata.get(frag_id) else {
+            continue;
+        };
+        let Some(bucket) = active_state_bucket(meta) else {
+            continue;
+        };
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = meta
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let content = texts.get(frag_id).cloned().unwrap_or_default();
+        buckets[bucket as usize].push(ActiveStateItem {
+            id: frag_id.clone(),
+            kind,
+            content,
+            ts,
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Most-recent-first per bucket, then cap. Items without a ts sort
+    // last (None < Some under reverse, so push them to the bottom).
+    for bucket in &mut buckets {
+        bucket.sort_by(|a, b| b.ts.cmp(&a.ts));
+        bucket.truncate(ACTIVE_STATE_BUCKET_CAP);
+    }
+    let [unresolved_errors, open_constraints, established_facts, pending_goals] = buckets;
+
+    Ok(Json(ActiveStateResponse {
+        session_id,
+        unresolved_errors,
+        open_constraints,
+        established_facts,
+        pending_goals,
+    }))
+}
+
 pub async fn session_trajectory(
     State(services): State<ContextNestServices>,
     Path(session_id): Path<String>,
@@ -2995,6 +3125,10 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
         .route("/api/v1/sessions/:id/summary", get(session_summary))
         .route("/api/v1/sessions/:id/trajectory", get(session_trajectory))
         .route(
+            "/api/v1/sessions/:id/active-state",
+            get(session_active_state),
+        )
+        .route(
             "/api/v1/sessions/:id/prompt-preview",
             get(session_prompt_preview),
         )
@@ -3262,6 +3396,172 @@ mod tests {
         assert_eq!(resp.total_scored, 0);
         assert!(!resp.truncated);
         assert!(resp.sessions.is_empty());
+    }
+
+    fn meta_kv(kv: &[(&str, Value)]) -> std::collections::HashMap<String, Value> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn active_state_bucket_routes_kinds_and_filters_resolved() {
+        // Error family.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("failure"))])),
+            Some(0)
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("blocker"))])),
+            Some(0)
+        );
+        // Constraint family.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("user_action"))])),
+            Some(1)
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("risk_flag"))])),
+            Some(1)
+        );
+        // Fact family.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("decision_made"))])),
+            Some(2)
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("verification"))])),
+            Some(2)
+        );
+        // Goal family.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("todo"))])),
+            Some(3)
+        );
+
+        // Resolution filters mirror the inbox.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[
+                ("kind", json!("todo")),
+                ("task_status", json!("completed"))
+            ])),
+            None,
+            "completed todos are dropped"
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[
+                ("kind", json!("decision")),
+                ("awaiting_decision", json!(true))
+            ])),
+            None,
+            "awaiting decisions are pending, not facts"
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("decision"))])),
+            Some(2),
+            "settled decisions are established facts"
+        );
+        // Non-actionable kinds are excluded.
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("state"))])),
+            None
+        );
+        assert_eq!(
+            active_state_bucket(&meta_kv(&[("kind", json!("accomplishment"))])),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn active_state_unknown_session_is_not_found() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let err = session_active_state(State(services), Path("nope".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn active_state_partitions_session_into_ut_buckets() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let now = chrono::Utc::now();
+        let recent = now.to_rfc3339();
+        let older = (now - chrono::Duration::hours(2)).to_rfc3339();
+
+        {
+            let mut texts = services.fragment_texts.write().await;
+            let mut meta = services.fragment_metadata.write().await;
+            let mut put = |id: &str, text: &str, kv: &[(&str, Value)]| {
+                texts.insert(id.to_string(), text.to_string());
+                meta.insert(id.to_string(), meta_kv(kv));
+            };
+            put(
+                "e1",
+                "tests broke",
+                &[("kind", json!("failure")), ("ts", json!(recent))],
+            );
+            put(
+                "e2",
+                "blocked on key",
+                &[("kind", json!("blocker")), ("ts", json!(older))],
+            );
+            put(
+                "c1",
+                "user must restart",
+                &[("kind", json!("user_action")), ("ts", json!(recent))],
+            );
+            put(
+                "fa1",
+                "chose tokio",
+                &[("kind", json!("decision_made")), ("ts", json!(recent))],
+            );
+            put(
+                "fa2",
+                "still deciding db",
+                &[
+                    ("kind", json!("decision")),
+                    ("awaiting_decision", json!(true)),
+                    ("ts", json!(recent)),
+                ],
+            );
+            put(
+                "g1",
+                "ship the PR",
+                &[("kind", json!("todo")), ("ts", json!(recent))],
+            );
+            put(
+                "g2",
+                "old done task",
+                &[
+                    ("kind", json!("todo")),
+                    ("task_status", json!("completed")),
+                    ("ts", json!(recent)),
+                ],
+            );
+            put(
+                "n1",
+                "looking at tools.rs",
+                &[("kind", json!("state")), ("ts", json!(recent))],
+            );
+        }
+        for id in ["e1", "e2", "c1", "fa1", "fa2", "g1", "g2", "n1"] {
+            services.session_index.add("S", id).await;
+        }
+
+        let resp = session_active_state(State(services), Path("S".into()))
+            .await
+            .expect("ok")
+            .0;
+
+        assert_eq!(resp.unresolved_errors.len(), 2, "failure + blocker");
+        // Most-recent-first: the recent failure outranks the 2h-old blocker.
+        assert_eq!(resp.unresolved_errors[0].id, "e1");
+        assert_eq!(resp.open_constraints.len(), 1);
+        assert_eq!(resp.open_constraints[0].kind, "user_action");
+        // decision_made counts; awaiting decision does NOT.
+        assert_eq!(resp.established_facts.len(), 1);
+        assert_eq!(resp.established_facts[0].id, "fa1");
+        // pending todo counts; completed todo dropped; `state` excluded.
+        assert_eq!(resp.pending_goals.len(), 1);
+        assert_eq!(resp.pending_goals[0].id, "g1");
     }
 
     #[test]
