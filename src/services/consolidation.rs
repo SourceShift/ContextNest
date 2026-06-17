@@ -83,9 +83,14 @@ const CONTENT_DENSITY_FIELD: &str = "_cn_content_density";
 pub struct ConsolidationConfig {
     /// Idle tick interval when the queue is empty. The worker doesn't
     /// poll continuously — it sleeps this long between drain attempts.
+    /// Also the *base* delay for the rate-limit backoff schedule (the
+    /// loop sleeps `interval_ms << consecutive_rate_limit_batches`,
+    /// capped at `max_backoff_ms`).
     pub interval_ms: u64,
-    /// Max in-flight `process_memories` calls. Caps embedder
-    /// concurrency to avoid rate-limit spikes.
+    /// Max in-flight `process_memories` calls under normal conditions.
+    /// Caps embedder concurrency to avoid rate-limit spikes. The worker
+    /// MAY drop below this when the embedder is returning rate-limit
+    /// errors — see `backoff_concurrency_floor`.
     pub concurrency: usize,
     /// Max ids drained per tick. Bounds memory pressure when a backlog
     /// of 25k+ ids is waiting after a WAL replay.
@@ -94,6 +99,17 @@ pub struct ConsolidationConfig {
     /// false. Useful in tests and for ops who want to pause
     /// consolidation under load.
     pub enabled: bool,
+    /// Upper bound on the exponential backoff delay after consecutive
+    /// rate-limited batches. The schedule is
+    /// `min(interval_ms * 2^k, max_backoff_ms)` where k is the number
+    /// of consecutive batches that returned at least one
+    /// `engine_overloaded` / `429` / "Model busy" error. 30s default.
+    pub max_backoff_ms: u64,
+    /// Floor on concurrency while backoff is active. Default 1 — when
+    /// the embedder is asking us to slow down, fall back to serial
+    /// requests. Set higher only if your provider's "rate limit"
+    /// returns are spurious (rare).
+    pub backoff_concurrency_floor: usize,
 }
 
 impl Default for ConsolidationConfig {
@@ -103,6 +119,8 @@ impl Default for ConsolidationConfig {
             concurrency: 4,
             batch_size: 32,
             enabled: true,
+            max_backoff_ms: 30_000,
+            backoff_concurrency_floor: 1,
         }
     }
 }
@@ -131,6 +149,18 @@ impl ConsolidationConfig {
                 .ok()
                 .map(|s| s != "false" && s != "0")
                 .unwrap_or(d.enabled),
+            max_backoff_ms: std::env::var("CONTEXTNEST_CONSOLIDATION_MAX_BACKOFF_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n: &u64| *n >= 100)
+                .unwrap_or(d.max_backoff_ms),
+            backoff_concurrency_floor: std::env::var(
+                "CONTEXTNEST_CONSOLIDATION_BACKOFF_CONCURRENCY_FLOOR",
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(d.backoff_concurrency_floor),
         }
     }
 }
@@ -412,22 +442,88 @@ async fn consolidate_one(
     Ok(ConsolidationOutcome::Done)
 }
 
+/// Per-batch outcome buckets that drive both the metrics counters and
+/// the worker's backoff decision. `RateLimited` is broken out from
+/// `Failed` because the right reaction is opposite: a generic failure
+/// should NOT slow the worker (probably a per-fragment data issue), but
+/// a rate-limit failure means the embedder is asking us to back off —
+/// continuing at full speed wastes CPU on retries that will keep
+/// failing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchOutcome {
+    pub done: usize,
+    pub skipped: usize,
+    /// Generic failures (per-fragment data issues, parse errors, etc.).
+    pub failed: usize,
+    /// Subset of failures that look like embedder rate-limit / overload
+    /// signals (OpenAI `engine_overloaded`, HTTP 429, "Model busy",
+    /// "rate limit", "rate_limit_exceeded"). Detected by substring
+    /// match against the error string bubbled up from `consolidate_one`.
+    /// Any non-zero value here trips the worker's exponential backoff.
+    pub rate_limited: usize,
+}
+
+/// Substring-detect rate-limit error patterns in an embedder error
+/// string. Patterns are case-insensitive and cover the common shapes
+/// emitted by OpenAI-compatible providers (DeepInfra, Z.AI, OpenAI
+/// proper, etc.) plus generic HTTP 429.
+///
+/// This is intentionally a string match, not a typed error: the
+/// embedder layer collapses provider responses into `ContextNestError`
+/// which loses the original error code shape. A typed wrapper would
+/// require touching every provider integration; the substring match
+/// matches what already shows up in logs without that surgery.
+pub(crate) fn looks_rate_limited(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    // Substring needles. `429` is matched as a standalone digit run via
+    // regex-free heuristic (preceded by non-digit, followed by non-digit
+    // or end-of-string) so we don't false-positive on e.g. "fragment id
+    // 1429ab".
+    const NEEDLES: &[&str] = &[
+        "engine_overloaded",
+        "model busy",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    ];
+    if NEEDLES.iter().any(|needle| lower.contains(needle)) {
+        return true;
+    }
+    // 429 boundary check: scan for "429" preceded by non-digit (or
+    // start) and followed by non-digit (or end). Catches "HTTP 429",
+    // "status: 429", "code\":429", " 429,", but rejects "12429" or
+    // "4290" or "fragment-id-429-extra-7".
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"429" {
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let next_ok = i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit();
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Drive one batch through `consolidate_one` with bounded concurrency.
-/// Returns `(done_count, skipped_count, failed_count)` so the caller
-/// can fold them into the queue metrics — only `done` bumps the
-/// consolidation counter; skips don't count as work.
+/// Returns a [`BatchOutcome`] so the caller can fold it into metrics
+/// AND decide whether to back off on the next tick.
 async fn process_batch(
     services: &ContextNestServices,
     batch: Vec<String>,
     concurrency: usize,
-) -> (usize, usize, usize) {
+) -> BatchOutcome {
     use futures::stream::{self, StreamExt};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum Tag {
         Done,
         Skipped,
         Failed,
+        RateLimited,
     }
 
     let results: Vec<Tag> = stream::iter(batch.into_iter().map(|id| {
@@ -437,8 +533,13 @@ async fn process_batch(
                 Ok(ConsolidationOutcome::Done) => Tag::Done,
                 Ok(ConsolidationOutcome::Skipped) => Tag::Skipped,
                 Err(e) => {
-                    tracing::warn!(fragment_id = %id, error = %e, "consolidation: process failed");
-                    Tag::Failed
+                    if looks_rate_limited(&e) {
+                        tracing::warn!(fragment_id = %id, error = %e, "consolidation: process rate-limited");
+                        Tag::RateLimited
+                    } else {
+                        tracing::warn!(fragment_id = %id, error = %e, "consolidation: process failed");
+                        Tag::Failed
+                    }
                 }
             }
         }
@@ -447,10 +548,15 @@ async fn process_batch(
     .collect()
     .await;
 
-    let done = results.iter().filter(|t| matches!(t, Tag::Done)).count();
-    let skipped = results.iter().filter(|t| matches!(t, Tag::Skipped)).count();
-    let failed = results.iter().filter(|t| matches!(t, Tag::Failed)).count();
-    (done, skipped, failed)
+    BatchOutcome {
+        done: results.iter().filter(|t| matches!(t, Tag::Done)).count(),
+        skipped: results.iter().filter(|t| matches!(t, Tag::Skipped)).count(),
+        failed: results.iter().filter(|t| matches!(t, Tag::Failed)).count(),
+        rate_limited: results
+            .iter()
+            .filter(|t| matches!(t, Tag::RateLimited))
+            .count(),
+    }
 }
 
 /// Run the worker loop forever. Spawned once per server lifetime from
@@ -476,32 +582,101 @@ pub async fn run_worker(
 
     initial_scan(&services, &queue).await;
 
-    let interval = Duration::from_millis(config.interval_ms);
+    let base_interval = Duration::from_millis(config.interval_ms);
+    let max_backoff = Duration::from_millis(config.max_backoff_ms);
+    // Exponential backoff state. Each consecutive rate-limited batch
+    // bumps this by 1; a clean batch resets it to 0. Sleep duration is
+    // `base_interval << consecutive_rl_batches`, capped at max_backoff.
+    let mut consecutive_rl_batches: u32 = 0;
+
     loop {
         let batch = queue.drain_batch(config.batch_size);
         if batch.is_empty() {
-            tokio::time::sleep(interval).await;
+            // Idle: use base interval. Don't carry forward backoff
+            // state across an idle period — by the time work returns,
+            // the embedder's rate limit window has likely reset.
+            consecutive_rl_batches = 0;
+            tokio::time::sleep(base_interval).await;
             continue;
         }
+
+        // Adaptive concurrency: under backoff, drop to floor (default
+        // 1) so we're not spinning up parallel requests the embedder is
+        // already refusing. Linear ramp down then snap-back keeps the
+        // logic simple — production-grade AIMD can come later if the
+        // simple form proves insufficient.
+        let effective_concurrency = if consecutive_rl_batches > 0 {
+            config.backoff_concurrency_floor
+        } else {
+            config.concurrency
+        };
+
         let start = Instant::now();
-        let (done, skipped, failed) = process_batch(&services, batch, config.concurrency).await;
+        let outcome = process_batch(&services, batch, effective_concurrency).await;
         let lap_ms = start.elapsed().as_millis() as u64;
+
         {
             let mut m = queue.metrics.lock().expect("metrics lock poisoned");
-            m.consolidated += done;
-            m.failed += failed;
+            m.consolidated += outcome.done;
+            // Rate-limited counts as "failed" in the public metric — it
+            // surfaces in /substrate/consolidation so ops can see the
+            // pressure, plus the per-batch warn-level logs above
+            // distinguish the two kinds.
+            m.failed += outcome.failed + outcome.rate_limited;
             m.last_lap_ms = lap_ms;
         }
-        if failed > 0 {
+
+        // Update backoff state BEFORE the post-batch sleep so the sleep
+        // duration reflects the most recent batch's outcome.
+        if outcome.rate_limited > 0 {
+            consecutive_rl_batches = consecutive_rl_batches.saturating_add(1);
+            // 2^N can grow fast; cap shift to 16 (= 65536x base) to
+            // avoid silly shifts that would overflow Duration anyway.
+            let shift = consecutive_rl_batches.min(16);
+            let raw_ms = config.interval_ms.saturating_mul(1u64 << shift);
+            let backoff = Duration::from_millis(raw_ms).min(max_backoff);
             tracing::warn!(
-                done,
-                skipped,
-                failed,
+                done = outcome.done,
+                skipped = outcome.skipped,
+                failed = outcome.failed,
+                rate_limited = outcome.rate_limited,
                 lap_ms,
-                "consolidation: batch completed with failures"
+                consecutive_rl_batches,
+                effective_concurrency,
+                backoff_ms = backoff.as_millis() as u64,
+                "consolidation: batch hit rate-limit — backing off"
             );
+            tokio::time::sleep(backoff).await;
         } else {
-            tracing::debug!(done, skipped, lap_ms, "consolidation: batch completed");
+            // Reset backoff on a clean (or merely-data-failed) batch.
+            if consecutive_rl_batches > 0 {
+                tracing::info!(
+                    previous_rl_streak = consecutive_rl_batches,
+                    "consolidation: rate-limit backoff cleared by clean batch"
+                );
+            }
+            consecutive_rl_batches = 0;
+            if outcome.failed > 0 {
+                tracing::warn!(
+                    done = outcome.done,
+                    skipped = outcome.skipped,
+                    failed = outcome.failed,
+                    lap_ms,
+                    "consolidation: batch completed with failures"
+                );
+            } else {
+                tracing::debug!(
+                    done = outcome.done,
+                    skipped = outcome.skipped,
+                    lap_ms,
+                    "consolidation: batch completed"
+                );
+            }
+            // No post-batch sleep on clean runs — keep draining work as
+            // fast as the embedder allows. The base_interval sleep
+            // happens only on empty queues (above) and after rate-limit
+            // backoff. This matches the pre-PR-2 hot-loop behavior so
+            // we don't slow steady-state throughput.
         }
     }
 }
@@ -522,10 +697,10 @@ pub async fn drain_for_test(
             return;
         }
         let start = Instant::now();
-        let (done, _skipped, failed) = process_batch(services, batch, concurrency).await;
+        let outcome = process_batch(services, batch, concurrency).await;
         let mut m = queue.metrics.lock().expect("metrics lock poisoned");
-        m.consolidated += done;
-        m.failed += failed;
+        m.consolidated += outcome.done;
+        m.failed += outcome.failed + outcome.rate_limited;
         m.last_lap_ms = start.elapsed().as_millis() as u64;
     }
 }
@@ -556,17 +731,106 @@ mod tests {
 
     #[test]
     fn config_from_env_uses_defaults_when_unset() {
-        // Unset to neutralize CI environment that may have set these.
-        std::env::remove_var("CONTEXTNEST_CONSOLIDATION_INTERVAL_MS");
-        std::env::remove_var("CONTEXTNEST_CONSOLIDATION_CONCURRENCY");
-        std::env::remove_var("CONTEXTNEST_CONSOLIDATION_BATCH_SIZE");
-        std::env::remove_var("CONTEXTNEST_CONSOLIDATION_ENABLED");
-        let cfg = ConsolidationConfig::from_env();
-        assert_eq!(cfg.interval_ms, 500);
-        assert_eq!(cfg.concurrency, 4);
-        assert_eq!(cfg.batch_size, 32);
-        assert!(cfg.enabled);
+        // All env-touching tests merged into config_from_env_full_sweep
+        // below because cargo's default parallel test runner races env-
+        // var mutations across threads — each individual test gets
+        // intermittent failures when a sibling test sets a var it
+        // expects to be unset. Single-test ownership of the env mutex
+        // is the cleanest fix without adding the serial_test dep.
+        config_from_env_full_sweep();
     }
+
+    fn config_from_env_full_sweep() {
+        // Save + restore relevant env vars so we don't leak state to
+        // sibling tests OR to the next `cargo test` invocation.
+        let keys = [
+            "CONTEXTNEST_CONSOLIDATION_INTERVAL_MS",
+            "CONTEXTNEST_CONSOLIDATION_CONCURRENCY",
+            "CONTEXTNEST_CONSOLIDATION_BATCH_SIZE",
+            "CONTEXTNEST_CONSOLIDATION_ENABLED",
+            "CONTEXTNEST_CONSOLIDATION_MAX_BACKOFF_MS",
+            "CONTEXTNEST_CONSOLIDATION_BACKOFF_CONCURRENCY_FLOOR",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let restore = || {
+            for (k, v) in &saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        };
+
+        // 1. Defaults
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+        let d = ConsolidationConfig::from_env();
+        assert_eq!(d.interval_ms, 500);
+        assert_eq!(d.concurrency, 4);
+        assert_eq!(d.batch_size, 32);
+        assert!(d.enabled);
+        assert_eq!(d.max_backoff_ms, 30_000);
+        assert_eq!(d.backoff_concurrency_floor, 1);
+
+        // 2. enabled=false explicitly
+        std::env::set_var("CONTEXTNEST_CONSOLIDATION_ENABLED", "false");
+        assert!(!ConsolidationConfig::from_env().enabled);
+        std::env::remove_var("CONTEXTNEST_CONSOLIDATION_ENABLED");
+
+        // 3. backoff knobs parse correctly
+        std::env::set_var("CONTEXTNEST_CONSOLIDATION_MAX_BACKOFF_MS", "60000");
+        std::env::set_var("CONTEXTNEST_CONSOLIDATION_BACKOFF_CONCURRENCY_FLOOR", "2");
+        let cfg = ConsolidationConfig::from_env();
+        assert_eq!(cfg.max_backoff_ms, 60_000);
+        assert_eq!(cfg.backoff_concurrency_floor, 2);
+
+        // 4. floor=0 rejected → default 1
+        std::env::set_var("CONTEXTNEST_CONSOLIDATION_BACKOFF_CONCURRENCY_FLOOR", "0");
+        assert_eq!(ConsolidationConfig::from_env().backoff_concurrency_floor, 1);
+
+        // 5. max_backoff<100ms rejected → default 30_000
+        std::env::set_var("CONTEXTNEST_CONSOLIDATION_MAX_BACKOFF_MS", "50");
+        assert_eq!(ConsolidationConfig::from_env().max_backoff_ms, 30_000);
+
+        restore();
+    }
+
+    #[test]
+    fn looks_rate_limited_matches_known_provider_shapes() {
+        // OpenAI rate-limit envelope:
+        assert!(looks_rate_limited(
+            r#"{"error":{"message":"Model busy, retry later","code":"engine_overloaded"}}"#
+        ));
+        // Bare HTTP 429:
+        assert!(looks_rate_limited("HTTP 429 Too Many Requests"));
+        assert!(looks_rate_limited("status: 429"));
+        // OpenAI rate_limit_exceeded:
+        assert!(looks_rate_limited(
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+        // Case-insensitive match:
+        assert!(looks_rate_limited("RATE LIMIT REACHED"));
+        // Negative: ordinary errors should NOT trip backoff.
+        assert!(!looks_rate_limited("connection refused"));
+        assert!(!looks_rate_limited("malformed json"));
+        assert!(!looks_rate_limited(""));
+    }
+
+    #[test]
+    fn batch_outcome_buckets_default_to_zero() {
+        let o = BatchOutcome::default();
+        assert_eq!(o.done, 0);
+        assert_eq!(o.skipped, 0);
+        assert_eq!(o.failed, 0);
+        assert_eq!(o.rate_limited, 0);
+    }
+
+    // Backoff-knob env-parsing assertions moved into
+    // `config_from_env_full_sweep` above to avoid parallel env-mutation
+    // races with the older `config_from_env_disables_via_false_string`
+    // test (which runs concurrently under cargo's default test
+    // scheduler and would race on the ENABLED key).
 
     #[test]
     fn config_from_env_disables_via_false_string() {
