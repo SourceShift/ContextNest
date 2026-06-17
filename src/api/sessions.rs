@@ -1505,9 +1505,25 @@ pub async fn session_active_state(
     State(services): State<ContextNestServices>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ActiveStateResponse>, StatusCode> {
-    let active_ids = services.session_index.list_active(&session_id).await;
+    collect_active_state(&services, &session_id, ACTIVE_STATE_BUCKET_CAP)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Build the `U_t` active-state buckets for a session, capped at `cap`
+/// items per bucket (most-recent-first). Returns `None` when the session
+/// has no active fragments — callers map that to 404 or an empty-warning
+/// response as appropriate. Shared by the `/active-state` endpoint and the
+/// PreToolUse action-gate so both partition identically.
+pub(crate) async fn collect_active_state(
+    services: &ContextNestServices,
+    session_id: &str,
+    cap: usize,
+) -> Option<ActiveStateResponse> {
+    let active_ids = services.session_index.list_active(session_id).await;
     if active_ids.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        return None;
     }
 
     let texts = services.fragment_texts.read().await;
@@ -1546,17 +1562,17 @@ pub async fn session_active_state(
     // last (None < Some under reverse, so push them to the bottom).
     for bucket in &mut buckets {
         bucket.sort_by(|a, b| b.ts.cmp(&a.ts));
-        bucket.truncate(ACTIVE_STATE_BUCKET_CAP);
+        bucket.truncate(cap);
     }
     let [unresolved_errors, open_constraints, established_facts, pending_goals] = buckets;
 
-    Ok(Json(ActiveStateResponse {
-        session_id,
+    Some(ActiveStateResponse {
+        session_id: session_id.to_string(),
         unresolved_errors,
         open_constraints,
         established_facts,
         pending_goals,
-    }))
+    })
 }
 
 pub async fn session_trajectory(

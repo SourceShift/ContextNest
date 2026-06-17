@@ -49,7 +49,7 @@ use axum::{
     routing::post,
     Extension, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -182,7 +182,9 @@ pub struct HookPayload {
 /// shared `State<ContextNestServices>` typed the same as the tools
 /// router (no second state type, no router rewrite).
 pub fn create_cc_hooks_router() -> Router<ContextNestServices> {
-    Router::new().route("/api/v1/cc/hook/:event", post(dispatch))
+    Router::new()
+        .route("/api/v1/cc/hook/:event", post(dispatch))
+        .route("/api/v1/cc/pretool", post(pretool_gate))
 }
 
 /// Single dispatch entry — Claude Code's hook config points at this
@@ -238,6 +240,126 @@ async fn dispatch(
         }
     }
     StatusCode::NO_CONTENT
+}
+
+/// Max items per bucket folded into the gate warning. Smaller than the
+/// `/active-state` endpoint's cap (25) — a PreToolUse advisory fires on
+/// every tool call, so it must stay a glance, not a wall of text.
+const GATE_CAP: usize = 5;
+
+/// Per-item content truncation inside the gate summary string. Keeps each
+/// bullet to a single readable line.
+const GATE_CONTENT_TRUNCATE: usize = 160;
+
+/// PreToolUse payload shape we read. `session_id` ties the call to the
+/// substrate; `tool_name` is echoed back for the hook's logging. Other
+/// Claude Code PreToolUse fields (`tool_input`, `cwd`, …) are ignored —
+/// serde drops unknown keys, so future fields don't break us.
+#[derive(Debug, Deserialize)]
+pub struct PreToolGateRequest {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub tool_name: String,
+}
+
+/// The `hookSpecificOutput` block Claude Code reads from a PreToolUse
+/// hook. `permission_decision` is **always** `"allow"` here — the gate is
+/// advisory, never a veto, honouring the cc-hooks contract that the
+/// substrate never blocks Claude's loop. The advice rides in
+/// `additional_context`, which Claude surfaces to the model verbatim.
+#[derive(Debug, Serialize)]
+pub struct HookSpecificOutput {
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: &'static str,
+    #[serde(rename = "permissionDecision")]
+    pub permission_decision: &'static str,
+    #[serde(rename = "additionalContext")]
+    pub additional_context: String,
+}
+
+/// Response of the PreToolUse action-gate. The flat `warn` / bucket fields
+/// make the decision inspectable (and testable) on their own; the nested
+/// `hookSpecificOutput` is the part Claude Code actually consumes.
+#[derive(Debug, Serialize)]
+pub struct PreToolGateResponse {
+    pub session_id: String,
+    pub tool_name: String,
+    pub warn: bool,
+    pub unresolved_errors: Vec<crate::api::sessions::ActiveStateItem>,
+    pub open_constraints: Vec<crate::api::sessions::ActiveStateItem>,
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: HookSpecificOutput,
+}
+
+/// POST /api/v1/cc/pretool — HarnessBridge action-gate.
+///
+/// Before Claude runs a tool, surface this session's still-open `U_t`
+/// items (unresolved errors + open constraints) so the model doesn't
+/// re-walk a known-failed path or trip a recorded constraint. Warn-only:
+/// the response is always `permissionDecision: "allow"`. A session with no
+/// active fragments, or no open errors/constraints, returns `warn: false`
+/// and an empty `additionalContext` — a no-op the hook passes through.
+async fn pretool_gate(
+    State(services): State<ContextNestServices>,
+    Json(req): Json<PreToolGateRequest>,
+) -> Json<PreToolGateResponse> {
+    let state =
+        crate::api::sessions::collect_active_state(&services, &req.session_id, GATE_CAP).await;
+    let (unresolved_errors, open_constraints) = state
+        .map(|s| (s.unresolved_errors, s.open_constraints))
+        .unwrap_or_default();
+
+    let warn = !unresolved_errors.is_empty() || !open_constraints.is_empty();
+    let additional_context = if warn {
+        build_gate_advisory(&unresolved_errors, &open_constraints)
+    } else {
+        String::new()
+    };
+
+    Json(PreToolGateResponse {
+        session_id: req.session_id,
+        tool_name: req.tool_name,
+        warn,
+        unresolved_errors,
+        open_constraints,
+        hook_specific_output: HookSpecificOutput {
+            hook_event_name: "PreToolUse",
+            permission_decision: "allow",
+            additional_context,
+        },
+    })
+}
+
+/// Format the open `U_t` items into a compact one-line-per-item advisory.
+/// Only called when at least one bucket is non-empty.
+fn build_gate_advisory(
+    unresolved_errors: &[crate::api::sessions::ActiveStateItem],
+    open_constraints: &[crate::api::sessions::ActiveStateItem],
+) -> String {
+    let mut out = format!(
+        "ContextNest active-state: {} unresolved error(s), {} open constraint(s) from this session are still open. Review before proceeding:",
+        unresolved_errors.len(),
+        open_constraints.len()
+    );
+    for item in unresolved_errors.iter().chain(open_constraints.iter()) {
+        out.push_str("\n- [");
+        out.push_str(&item.kind);
+        out.push_str("] ");
+        out.push_str(&truncate_for_gate(&item.content));
+    }
+    out
+}
+
+/// Single-line truncation for a gate bullet. Char-boundary safe (never
+/// splits a multibyte UTF-8 scalar) and appends an ellipsis when cut.
+fn truncate_for_gate(content: &str) -> String {
+    let one_line = content.replace('\n', " ");
+    if one_line.chars().count() <= GATE_CONTENT_TRUNCATE {
+        return one_line;
+    }
+    let truncated: String = one_line.chars().take(GATE_CONTENT_TRUNCATE).collect();
+    format!("{truncated}…")
 }
 
 /// Read the transcript .jsonl from the session's last byte offset,
@@ -657,5 +779,165 @@ mod tests {
         assert!(payload.transcript_path.is_some());
         assert!(payload.extra.contains_key("future_unknown_field"));
         assert!(payload.extra.contains_key("tool_input"));
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_drops_unknown_extra_fields() {
+        // Claude Code's PreToolUse payload carries tool_input/cwd/etc.
+        // The gate only needs session_id + tool_name; everything else
+        // must deserialize away without error.
+        let raw = json!({
+            "session_id": "abc",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/x", "old_string": "a"},
+            "cwd": "/work"
+        });
+        let req: PreToolGateRequest = serde_json::from_value(raw).expect("permissive deserialize");
+        assert_eq!(req.session_id, "abc");
+        assert_eq!(req.tool_name, "Edit");
+    }
+
+    fn meta_kv(kv: &[(&str, Value)]) -> HashMap<String, Value> {
+        kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_warns_on_open_errors_and_constraints() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        {
+            let mut texts = services.fragment_texts.write().await;
+            let mut meta = services.fragment_metadata.write().await;
+            let mut put = |id: &str, text: &str, kv: &[(&str, Value)]| {
+                texts.insert(id.to_string(), text.to_string());
+                meta.insert(id.to_string(), meta_kv(kv));
+            };
+            put(
+                "e1",
+                "cargo test --lib failed: 2 broken",
+                &[
+                    ("kind", json!("failure")),
+                    ("ts", json!("2026-06-16T10:00:00Z")),
+                ],
+            );
+            put(
+                "c1",
+                "WAL schema change — back up first",
+                &[
+                    ("kind", json!("risk_flag")),
+                    ("ts", json!("2026-06-16T09:00:00Z")),
+                ],
+            );
+            // Non-actionable noise that must NOT warn.
+            put(
+                "n1",
+                "looking at tools.rs",
+                &[
+                    ("kind", json!("state")),
+                    ("ts", json!("2026-06-16T11:00:00Z")),
+                ],
+            );
+        }
+        for id in ["e1", "c1", "n1"] {
+            services.session_index.add("G", id).await;
+        }
+
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "G".into(),
+                tool_name: "Bash".into(),
+            }),
+        )
+        .await
+        .0;
+
+        assert!(resp.warn, "open error + constraint must warn");
+        assert_eq!(resp.unresolved_errors.len(), 1);
+        assert_eq!(resp.open_constraints.len(), 1);
+        assert_eq!(resp.tool_name, "Bash");
+        // Advisory is non-blocking and names the kinds.
+        assert_eq!(resp.hook_specific_output.permission_decision, "allow");
+        assert_eq!(resp.hook_specific_output.hook_event_name, "PreToolUse");
+        let ctx = &resp.hook_specific_output.additional_context;
+        assert!(ctx.contains("[failure]"), "advisory cites the error: {ctx}");
+        assert!(
+            ctx.contains("[risk_flag]"),
+            "advisory cites the constraint: {ctx}"
+        );
+        assert!(
+            ctx.contains("cargo test"),
+            "advisory includes the error text"
+        );
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_clean_session_does_not_warn() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        {
+            let mut texts = services.fragment_texts.write().await;
+            let mut meta = services.fragment_metadata.write().await;
+            // Only resolved / non-actionable kinds — nothing open.
+            texts.insert("g1".into(), "shipped it".into());
+            meta.insert(
+                "g1".into(),
+                meta_kv(&[
+                    ("kind", json!("todo")),
+                    ("task_status", json!("completed")),
+                    ("ts", json!("2026-06-16T10:00:00Z")),
+                ]),
+            );
+        }
+        services.session_index.add("clean", "g1").await;
+
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "clean".into(),
+                tool_name: "Read".into(),
+            }),
+        )
+        .await
+        .0;
+
+        assert!(!resp.warn, "no open errors/constraints → no warning");
+        assert!(resp.unresolved_errors.is_empty());
+        assert!(resp.open_constraints.is_empty());
+        assert_eq!(resp.hook_specific_output.permission_decision, "allow");
+        assert!(
+            resp.hook_specific_output.additional_context.is_empty(),
+            "clean session emits empty additionalContext (a no-op for the hook)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_unknown_session_is_silent_allow() {
+        // A session the substrate has never seen must not error — it's a
+        // warn:false, allow no-op so the hook never blocks Claude's loop.
+        let services = ContextNestServices::new_default().await.expect("services");
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "never-seen".into(),
+                tool_name: "Bash".into(),
+            }),
+        )
+        .await
+        .0;
+        assert!(!resp.warn);
+        assert_eq!(resp.hook_specific_output.permission_decision, "allow");
+        assert!(resp.hook_specific_output.additional_context.is_empty());
+    }
+
+    #[test]
+    fn truncate_for_gate_is_multibyte_safe() {
+        // Guard against a char-boundary panic: a string of multibyte
+        // scalars longer than the cap must truncate without slicing a
+        // codepoint in half.
+        let s = "é".repeat(GATE_CONTENT_TRUNCATE + 50);
+        let out = truncate_for_gate(&s);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), GATE_CONTENT_TRUNCATE + 1); // cap + ellipsis
+                                                                    // Short strings pass through untouched and collapse newlines.
+        assert_eq!(truncate_for_gate("a\nb"), "a b");
     }
 }
