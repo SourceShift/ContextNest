@@ -9,6 +9,7 @@ pub use crate::services::HealthStatus;
 // Domain-specific API modules moved to examples/domains/
 // Use route_registry for dynamic plugin-based routing
 
+pub mod agent_outcome;
 pub mod cc_hooks;
 pub mod coord;
 pub mod field;
@@ -27,6 +28,7 @@ pub mod tools;
 #[cfg(test)]
 pub mod tests;
 
+pub use agent_outcome::create_agent_outcome_router;
 pub use cc_hooks::{create_cc_hooks_router, HookPayload, SessionTracker};
 pub use field::create_field_router;
 pub use inbox::create_inbox_router;

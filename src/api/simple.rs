@@ -5,6 +5,7 @@ use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
+use crate::api::agent_outcome;
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::coord;
 use crate::api::field;
@@ -35,6 +36,8 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     // router's State<S> signature.
     let cc_hooks_router = cc_hooks::create_cc_hooks_router();
     let coord_router = coord::create_coord_router();
+    // PR-6: agent outcome feedback endpoint
+    let agent_outcome_router = agent_outcome::create_agent_outcome_router();
     let sessions_router = sessions::create_sessions_router();
     let inbox_router = inbox::create_inbox_router();
     let stats_router = stats::create_stats_router();
@@ -62,6 +65,7 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .merge(tools_router)
         .merge(cc_hooks_router)
         .merge(coord_router)
+        .merge(agent_outcome_router)
         .merge(sessions_router)
         .merge(inbox_router)
         .merge(stats_router)
