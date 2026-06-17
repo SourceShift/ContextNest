@@ -180,6 +180,15 @@ pub struct ContextNestServices {
     /// promote the semantic-match step to the substrate's attractor
     /// activation.
     pub llm_cache: LlmCacheService,
+    /// Cross-fleet coordination lease registry (agent-coordination epic,
+    /// Phase 1). In-memory list of live, TTL'd advisory leases that let
+    /// heterogeneous agents serialize overlapping writes to the shared
+    /// codebase. Ephemeral by design — leases are live coordination state,
+    /// not durable memory, so they're never WAL-persisted and a restart
+    /// resets the fleet's relationship (which is correct: post-restart no
+    /// agent's in-flight edit is still anchored to a pre-restart lease).
+    /// See `src/api/coord.rs` and `docs/roadmap/epics/agent-coordination.md`.
+    pub coord_leases: Arc<tokio::sync::RwLock<Vec<crate::api::coord::Lease>>>,
 }
 
 impl ContextNestServices {
@@ -315,6 +324,7 @@ impl ContextNestServices {
             wal: wal_cell,
             llm,
             llm_cache,
+            coord_leases: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         })
     }
 

@@ -10,6 +10,7 @@ pub use crate::services::HealthStatus;
 // Use route_registry for dynamic plugin-based routing
 
 pub mod cc_hooks;
+pub mod coord;
 pub mod field;
 pub mod inbox;
 pub mod llm_proxy;
