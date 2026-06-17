@@ -1,10 +1,27 @@
 # Epic — Role-Tailored Agent ContextPack
 
-**Status:** Proposal. ~3-5 dev-days across 6 PRs (4 mini-ork, 2 ContextNest). Each phase independently shippable; no big-bang merge.
+**Status:** **5 of 6 PRs shipped (PR-5 skipped per measurement, PR-6 deferred).** Original estimate: ~3-5 dev-days across 6 PRs; actuals are tracked in the per-PR sections below.
 
 **Owner:** TBA.
 
-**Last updated:** 2026-06-16.
+**Last updated:** 2026-06-17.
+
+## Shipment status
+
+| PR | Title | Status | Commit / Note |
+|---|---|---|---|
+| **PR-1** | mini-ork capsule swap + timeout-default fixes | ✅ shipped 2026-06-17 | mini-ork `6261eb8` (#21) |
+| **PR-2** | CN consolidation backoff + adaptive concurrency | ✅ shipped 2026-06-17 | ContextNest `f0701ee` (#159) |
+| **PR-3** | mini-ork role-tailored ContextPack helpers | ✅ shipped 2026-06-17 | mini-ork `0d0aaa2` (#23) |
+| **PR-4** | mini-ork worker prompt template wires MO_CN_PREFETCH_DIR | ✅ shipped 2026-06-15 (eb9bd5d), restored 2026-06-17 after PR #18 regression | mini-ork `325c8c8` (#22) |
+| **PR-5** | Optional composed `/api/v1/agent/context-pack` CN endpoint | ⏸ **skipped per PR-3 latency measurement** | per-endpoint composition completes in ~3-5s; well under planner LLM wall-clock. Keeping operational surface small. Revisit if a future workload makes the composition latency painful. |
+| **PR-6** | Outcome feedback loop (EvoMem pattern) | ⏸ planned | Needs new CN endpoint `POST /api/v1/agent/outcome` + sidecar table. Separate PR. |
+
+### Concrete proof-of-value already collected
+
+- **Drift audit motivating the epic (2026-06-15):** a memory entry asserted 10 facts about a chapter-anchor schema; verification showed 3 outright wrong, 2 internally inconsistent, 2 incomplete. After PR-3 ships, planners running similar audits see the failed-assertion atoms (via `## Failures to avoid` capsule section + risk_flag clusters) before forming the plan.
+- **CPU storm motivating PR-2 (2026-06-15 → 2026-06-17):** the consolidation worker pegged 92% CPU sustained 9h on a 296K-fragment backlog with embedder rate-limit retries. After PR-2 ships, the same binary running against the same backlog idles at 0.2% CPU because the worker now backs off when the embedder returns `engine_overloaded`.
+- **Smoke Test Standard self-validating:** PR #18 silently dropped half of PR #17's wiring during a cross-merge — caught within hours of authoring the Standard by `scripts/smoke-cn-bridge.sh`. The same regression class then dropped PR-4's wiring a second time and was caught by direct grep during the PR-1 smoke run. The Standard is now also responsible for the per-PR `scripts/smoke-pr-<N>-<slug>.sh` deliverables shipped with #21, #22, #23, and ContextNest #159.
 
 **Spans:** ContextNest (`docs/roadmap/epics/`) + mini-ork (`lib/`, `bin/`, `hooks/`, `docs/`).
 
