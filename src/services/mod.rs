@@ -32,7 +32,7 @@ pub struct SessionIntentEntry {
 use crate::error::ContextNestResult;
 use crate::memory::attractors::{MemoryAttractorConfig, MemoryAttractorManager};
 use crate::Config;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 pub mod consolidation;
@@ -189,6 +189,16 @@ pub struct ContextNestServices {
     /// agent's in-flight edit is still anchored to a pre-restart lease).
     /// See `src/api/coord.rs` and `docs/roadmap/epics/agent-coordination.md`.
     pub coord_leases: Arc<tokio::sync::RwLock<Vec<crate::api::coord::Lease>>>,
+    /// Phase 4 observability — contention counters (granted, queued, peak
+    /// queue depth, TTL expirations, deadlocks broken, leases held).
+    /// Snapshotted by `GET /api/v1/coord/metrics`. In-memory only; reset
+    /// on restart alongside the lease registry itself.
+    pub coord_metrics: Arc<tokio::sync::RwLock<crate::api::coord::CoordMetrics>>,
+    /// Phase 4 observability — bounded ring buffer of contention events
+    /// (granted/queued/released/ttl_expired/deadlock_abort). Oldest entry
+    /// is evicted FIFO at [`crate::api::coord::AUDIT_RING_CAP`] so memory
+    /// stays bounded. Served by `GET /api/v1/coord/audit[?since=...]`.
+    pub coord_audit: Arc<tokio::sync::RwLock<VecDeque<crate::api::coord::AuditRecord>>>,
 }
 
 impl ContextNestServices {
@@ -325,6 +335,12 @@ impl ContextNestServices {
             llm,
             llm_cache,
             coord_leases: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            coord_metrics: Arc::new(tokio::sync::RwLock::new(
+                crate::api::coord::CoordMetrics::default(),
+            )),
+            coord_audit: Arc::new(tokio::sync::RwLock::new(VecDeque::with_capacity(
+                crate::api::coord::AUDIT_RING_CAP,
+            ))),
         })
     }
 

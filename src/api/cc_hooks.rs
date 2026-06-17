@@ -55,6 +55,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::api::coord::LeaseGateDecision;
 use crate::ingest::claude_code::{
     event::parse_session_string, extract_memories, MemoryKind, MemoryRecord, ServicesSink, Sink,
 };
@@ -324,22 +325,38 @@ async fn pretool_gate(
     };
 
     // Coordination consult: if this tool targets a file another agent holds
-    // a conflicting write lease on, append a WAIT advisory. The session_id
-    // doubles as the agent identity for the lease registry. Still
-    // permissionDecision:"allow" — advisory only, warn-only contract intact.
+    // a conflicting write lease on, enforce strict-mode deny or append the
+    // Phase-1 WAIT advisory. The session_id doubles as the agent identity
+    // for the lease registry.
     if let Some(path) = req
         .tool_input
         .as_ref()
         .and_then(|v| v.get("file_path"))
         .and_then(|v| v.as_str())
     {
-        if let Some(adv) = crate::api::coord::lease_advisory(&services, &req.session_id, path).await
-        {
-            warn = true;
-            if !additional_context.is_empty() {
-                additional_context.push_str("\n\n");
+        match crate::api::coord::lease_decision(&services, &req.session_id, path).await {
+            LeaseGateDecision::Deny { reason } => {
+                return Json(PreToolGateResponse {
+                    session_id: req.session_id,
+                    tool_name: req.tool_name,
+                    warn: true,
+                    unresolved_errors,
+                    open_constraints,
+                    hook_specific_output: HookSpecificOutput {
+                        hook_event_name: "PreToolUse",
+                        permission_decision: "deny",
+                        additional_context: reason,
+                    },
+                });
             }
-            additional_context.push_str(&adv);
+            LeaseGateDecision::Allow { warning: Some(adv) } => {
+                warn = true;
+                if !additional_context.is_empty() {
+                    additional_context.push_str("\n\n");
+                }
+                additional_context.push_str(&adv);
+            }
+            LeaseGateDecision::Allow { warning: None } => {}
         }
     }
 
@@ -953,6 +970,7 @@ mod tests {
                 mode: LeaseMode::Write,
                 priority: 10,
                 reason: Some("refactor API".into()),
+                strict: false,
                 granted_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
             });
@@ -976,6 +994,92 @@ mod tests {
         let ctx = &resp.hook_specific_output.additional_context;
         assert!(ctx.contains("WAIT"), "advisory tells B to wait: {ctx}");
         assert!(ctx.contains('A'), "advisory names holder A: {ctx}");
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_denies_on_strict_lease_overlap() {
+        use crate::api::coord::{Lease, LeaseMode};
+        let services = ContextNestServices::new_default().await.expect("services");
+
+        // Agent A holds a STRICT write lease on src/migrations/*.
+        {
+            let mut leases = services.coord_leases.write().await;
+            leases.push(Lease {
+                lease_id: "lease-a".into(),
+                agent_id: "A".into(),
+                fleet_id: Some("ork-1".into()),
+                paths: vec!["src/migrations/".into()],
+                mode: LeaseMode::Write,
+                priority: 10,
+                reason: Some("WAL schema migration".into()),
+                strict: true,
+                granted_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+            });
+        }
+
+        // Agent B's pretool check on a file under that scope is denied.
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "B".into(),
+                tool_name: "Edit".into(),
+                tool_input: Some(json!({"file_path": "src/migrations/0007.sql"})),
+            }),
+        )
+        .await
+        .0;
+
+        assert!(resp.warn, "strict block must warn");
+        assert_eq!(
+            resp.hook_specific_output.permission_decision, "deny",
+            "strict overlap must hard-block"
+        );
+        let ctx = &resp.hook_specific_output.additional_context;
+        assert!(
+            ctx.contains("hard block"),
+            "deny reason explains block: {ctx}"
+        );
+        assert!(ctx.contains('A'), "deny reason names holder A: {ctx}");
+    }
+
+    #[tokio::test]
+    async fn pretool_gate_self_strict_lease_is_allowed() {
+        use crate::api::coord::{Lease, LeaseMode};
+        let services = ContextNestServices::new_default().await.expect("services");
+
+        // Agent A holds a strict write lease on its own scope.
+        {
+            let mut leases = services.coord_leases.write().await;
+            leases.push(Lease {
+                lease_id: "lease-a".into(),
+                agent_id: "A".into(),
+                fleet_id: None,
+                paths: vec!["src/foo.rs".into()],
+                mode: LeaseMode::Write,
+                priority: 10,
+                reason: None,
+                strict: true,
+                granted_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+            });
+        }
+
+        // A's own pretool check on the scoped file is allowed.
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "A".into(),
+                tool_name: "Edit".into(),
+                tool_input: Some(json!({"file_path": "src/foo.rs"})),
+            }),
+        )
+        .await
+        .0;
+
+        assert!(!resp.warn, "holder must not warn/block itself");
+        assert_eq!(resp.hook_specific_output.permission_decision, "allow");
+        assert!(resp.hook_specific_output.additional_context.is_empty());
     }
 
     #[tokio::test]
