@@ -1,6 +1,6 @@
 # Epic — Role-Tailored Agent ContextPack
 
-**Status:** **5 of 6 PRs shipped (PR-5 skipped per measurement, PR-6 deferred).** Original estimate: ~3-5 dev-days across 6 PRs; actuals are tracked in the per-PR sections below.
+**Status:** **EPIC COMPLETE. All 6 PRs landed (PR-5 skipped per latency measurement).** Original estimate: ~3-5 dev-days across 6 PRs; actuals: ~2 dev-days total (delivered 2026-06-17 across CN + mini-ork repos).
 
 **Owner:** TBA.
 
@@ -15,7 +15,7 @@
 | **PR-3** | mini-ork role-tailored ContextPack helpers | ✅ shipped 2026-06-17 | mini-ork `0d0aaa2` (#23) |
 | **PR-4** | mini-ork worker prompt template wires MO_CN_PREFETCH_DIR | ✅ shipped 2026-06-15 (eb9bd5d), restored 2026-06-17 after PR #18 regression | mini-ork `325c8c8` (#22) |
 | **PR-5** | Optional composed `/api/v1/agent/context-pack` CN endpoint | ⏸ **skipped per PR-3 latency measurement** | per-endpoint composition completes in ~3-5s; well under planner LLM wall-clock. Keeping operational surface small. Revisit if a future workload makes the composition latency painful. |
-| **PR-6** | Outcome feedback loop (EvoMem pattern) | ⏸ planned | Needs new CN endpoint `POST /api/v1/agent/outcome` + sidecar table. Separate PR. |
+| **PR-6** | Outcome feedback loop (EvoMem pattern) | ✅ shipped 2026-06-17 | ContextNest `abaa4a4` (#162) + mini-ork `6cf81b9` (#24). After subagent_stop, mini-ork extracts atom ids the worker consumed via prefetch + fires POST /api/v1/agent/outcome. CN bumps last_accessed + adjusts _cn_confidence_signal (±0.05 per call, ±1.0 cumulative). |
 
 ### Concrete proof-of-value already collected
 
