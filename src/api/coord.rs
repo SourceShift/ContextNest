@@ -80,6 +80,10 @@ pub struct Lease {
     /// (non-preemptive); a held lease is never interrupted.
     pub priority: i64,
     pub reason: Option<String>,
+    /// Opt-in strict mode: while held, another agent's PreToolUse on an
+    /// overlapping path is hard-blocked (`permissionDecision: "deny"`)
+    /// instead of warned. Default false keeps Phase 1 warn-only.
+    pub strict: bool,
     pub granted_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -98,6 +102,8 @@ pub struct AcquireRequest {
     pub ttl_secs: Option<u64>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 /// A lease standing between the requester and its scope.
@@ -390,6 +396,7 @@ fn decide(leases: &mut Vec<Lease>, req: AcquireRequest, now: DateTime<Utc>) -> A
             mode: req.mode,
             priority: req.priority,
             reason: req.reason,
+            strict: req.strict,
             granted_at: now,
             expires_at: now + Duration::seconds(ttl as i64),
         };
@@ -623,6 +630,54 @@ fn advisory_for(
     Some(out)
 }
 
+/// Decision returned to the PreToolUse gate. A strict lease held by another
+/// agent on an overlapping path forces a hard deny; otherwise the gate is
+/// allowed, optionally carrying the Phase-1 WAIT advisory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseGateDecision {
+    Deny { reason: String },
+    Allow { warning: Option<String> },
+}
+
+/// Pure PreToolUse gate decision over a lease set. Mirrors `advisory_for`
+/// for the warn path, but adds a hard-deny branch for strict leases held by
+/// another agent on an overlapping path.
+fn decision_for(
+    leases: &mut Vec<Lease>,
+    agent_id: &str,
+    path: &str,
+    now: DateTime<Utc>,
+) -> LeaseGateDecision {
+    sweep_expired(leases, now);
+    let blockers: Vec<&Lease> = leases
+        .iter()
+        .filter(|l| {
+            l.agent_id != agent_id
+                && l.mode == LeaseMode::Write
+                && l.strict
+                && l.paths.iter().any(|lp| path_overlap(lp, path))
+        })
+        .collect();
+
+    if !blockers.is_empty() {
+        let holders: Vec<&str> = blockers.iter().map(|l| l.agent_id.as_str()).collect();
+        let reason = format!(
+            "ContextNest coordination: hard block — {} strict write-lease(s) overlap `{}`, held by agent(s) {}.",
+            blockers.len(),
+            path,
+            holders.join(", ")
+        );
+        return LeaseGateDecision::Deny { reason };
+    }
+
+    match advisory_for(leases, agent_id, path, now) {
+        Some(warning) => LeaseGateDecision::Allow {
+            warning: Some(warning),
+        },
+        None => LeaseGateDecision::Allow { warning: None },
+    }
+}
+
 /// Consulted by the PreToolUse gate. Returns a `WAIT` advisory when
 /// another agent holds a conflicting write lease on `path`, else `None`.
 pub async fn lease_advisory(
@@ -633,6 +688,18 @@ pub async fn lease_advisory(
     let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
     advisory_for(&mut leases, agent_id, path, now)
+}
+
+/// PreToolUse gate decision helper. Returns deny when another agent holds a
+/// strict overlapping write lease, otherwise allow with an optional warning.
+pub async fn lease_decision(
+    services: &ContextNestServices,
+    agent_id: &str,
+    path: &str,
+) -> LeaseGateDecision {
+    let now = Utc::now();
+    let mut leases = services.coord_leases.write().await;
+    decision_for(&mut leases, agent_id, path, now)
 }
 
 /// Register the coordination sub-router.
@@ -657,6 +724,14 @@ mod tests {
             priority: prio,
             ttl_secs: Some(120),
             reason: Some(format!("{agent} work")),
+            strict: false,
+        }
+    }
+
+    fn strict_req(agent: &str, paths: &[&str], mode: LeaseMode, prio: i64) -> AcquireRequest {
+        AcquireRequest {
+            strict: true,
+            ..req(agent, paths, mode, prio)
         }
     }
 
@@ -682,6 +757,7 @@ mod tests {
             mode: LeaseMode::Read,
             priority: 1,
             reason: None,
+            strict: false,
             granted_at: Utc::now(),
             expires_at: Utc::now() + Duration::seconds(60),
         };
@@ -814,6 +890,7 @@ mod tests {
             mode: LeaseMode::Write,
             priority: 10,
             reason: None,
+            strict: false,
             granted_at: now - Duration::seconds(10),
             expires_at: now - Duration::seconds(1),
         });
@@ -828,7 +905,46 @@ mod tests {
     }
 
     #[test]
-    fn advisory_names_the_blocking_holder() {
+    fn strict_lease_denies_other_agent_on_overlap() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+        let a = decide(
+            &mut leases,
+            strict_req("A", &["src/migrations/"], LeaseMode::Write, 10),
+            now,
+        );
+        assert!(matches!(a, AcquireResponse::Granted { .. }));
+
+        // B is hard-blocked on the exact path.
+        let dec = decision_for(&mut leases, "B", "src/migrations/0007.sql", now);
+        if let LeaseGateDecision::Deny { reason } = &dec {
+            assert!(
+                reason.contains("hard block"),
+                "deny reason mentions hard block: {reason}"
+            );
+            assert!(reason.contains('A'), "deny reason names holder A: {reason}");
+        } else {
+            panic!("strict overlap must deny: {dec:?}");
+        }
+
+        // B is hard-blocked on a path under the strict directory scope.
+        let dec = decision_for(&mut leases, "B", "src/migrations/0008.sql", now);
+        assert!(
+            matches!(dec, LeaseGateDecision::Deny { .. }),
+            "directory-scoped strict overlap must deny: {dec:?}"
+        );
+
+        // Same agent is never blocked by its own strict lease.
+        let dec = decision_for(&mut leases, "A", "src/migrations/0007.sql", now);
+        assert_eq!(dec, LeaseGateDecision::Allow { warning: None });
+
+        // Disjoint path is allowed even for another agent.
+        let dec = decision_for(&mut leases, "B", "src/other.rs", now);
+        assert_eq!(dec, LeaseGateDecision::Allow { warning: None });
+    }
+
+    #[test]
+    fn non_strict_lease_still_warns_and_allows() {
         let now = Utc::now();
         let mut leases = Vec::new();
         decide(
@@ -837,16 +953,29 @@ mod tests {
             now,
         );
 
-        // B's gate check on the contended file gets a WAIT advisory.
-        let adv = advisory_for(&mut leases, "B", "src/foo.rs", now).expect("advisory present");
-        assert!(adv.contains("WAIT"));
-        assert!(adv.contains('A'));
+        let dec = decision_for(&mut leases, "B", "src/foo.rs", now);
+        match dec {
+            LeaseGateDecision::Allow { warning: Some(w) } => {
+                assert!(w.contains("WAIT"), "non-strict overlap must warn: {w}");
+            }
+            other => panic!("expected allow+warn for non-strict overlap: {other:?}"),
+        }
+    }
 
-        // A's own check on its own lease: no self-advisory.
-        assert!(advisory_for(&mut leases, "A", "src/foo.rs", now).is_none());
+    #[test]
+    fn strict_read_lease_does_not_deny() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+        let a = decide(
+            &mut leases,
+            strict_req("A", &["src/foo.rs"], LeaseMode::Read, 10),
+            now,
+        );
+        assert!(matches!(a, AcquireResponse::Granted { .. }));
 
-        // An unrelated file: no advisory.
-        assert!(advisory_for(&mut leases, "B", "src/other.rs", now).is_none());
+        // Strict only applies to write leases; read/read stays compatible.
+        let dec = decision_for(&mut leases, "B", "src/foo.rs", now);
+        assert_eq!(dec, LeaseGateDecision::Allow { warning: None });
     }
 
     // ── Phase 2 ────────────────────────────────────────────────────────────
