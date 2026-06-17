@@ -643,6 +643,174 @@ pub async fn list_features(
     }
 }
 
+// =============================================================================
+// `GET /api/v1/training/provenance-pairs?since=<dur>&tier=<tier>&project=<s>&limit=<n>`
+//
+// First slice of the HarnessBridge §3 training-data flywheel. Harvests the
+// provenance signal the substrate already grounds (#149-#155) into labeled
+// `(content, provenance_tier)` rows: every fragment that carries a
+// `provenance` tag — Verification records classified observed/partial/
+// claimed/absent/contradicted, plus summary/feature records tagged at
+// store time. The point is a corpus a fine-tune or eval can consume:
+// "this claim was {observed → receipt-backed} vs {contradicted →
+// receipt disproved it}". Read-only; same localhost posture as
+// `/features` and `/trajectory` (content already served by those).
+// =============================================================================
+
+/// Default per-call row cap. Bounds the response so a full-substrate
+/// harvest doesn't return an unbounded body; callers page via `since`.
+const PROVENANCE_PAIRS_DEFAULT_LIMIT: usize = 500;
+
+/// The five provenance tiers the substrate assigns. Used to validate the
+/// `tier` filter and to seed a zero-filled histogram so the caller always
+/// sees every tier's count (including the zeroes — dataset balance signal).
+const PROVENANCE_TIERS: [&str; 5] = ["observed", "partial", "claimed", "absent", "contradicted"];
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProvenancePairsQuery {
+    /// Duration suffix (`5m`/`2h`/`24h`/`7d`/`30d`). Defaults to `7d` —
+    /// a week of grounded claims is a useful harvest window. Unparseable
+    /// values fall through to the default.
+    pub since: Option<String>,
+    /// Optional exact provenance-tier filter. Unknown tiers match nothing
+    /// (the response's `pairs` is empty but `tier_counts` still reports).
+    pub tier: Option<String>,
+    /// Optional substring match on `project_cwd` (case-sensitive, mirrors
+    /// `/features`). Omit to harvest every project.
+    pub project: Option<String>,
+    /// Row cap. Defaults to `PROVENANCE_PAIRS_DEFAULT_LIMIT`. The histogram
+    /// in `tier_counts` reflects the full window, not the capped page.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProvenancePair {
+    pub session_id: String,
+    pub fragment_id: String,
+    pub kind: String,
+    pub provenance: String,
+    pub content: String,
+    pub ts: Option<String>,
+    /// Cited sources for records that carry them (summary/feature
+    /// provenance). Empty for Verification records, which ground against a
+    /// receipt rather than other fragments.
+    pub source_fragment_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ProvenancePairsResponse {
+    pub since: String,
+    pub tier: Option<String>,
+    /// Rows actually returned (after the `limit` cap).
+    pub count: usize,
+    /// Per-tier counts across the **full** window before the cap — the
+    /// flywheel's dataset-balance signal (e.g. how many `observed` vs
+    /// `contradicted` examples exist). Always carries all five tiers.
+    pub tier_counts: std::collections::BTreeMap<String, usize>,
+    pub pairs: Vec<ProvenancePair>,
+}
+
+pub async fn list_provenance_pairs(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<ProvenancePairsQuery>,
+) -> Json<ProvenancePairsResponse> {
+    let since_raw = q.since.as_deref().unwrap_or("7d");
+    let dur = parse_since(since_raw).unwrap_or_else(|| chrono::Duration::days(7));
+    let cutoff = chrono::Utc::now() - dur;
+    let want_tier = q.tier.as_deref();
+    let want_project = q.project.as_deref();
+    let limit = q.limit.unwrap_or(PROVENANCE_PAIRS_DEFAULT_LIMIT);
+
+    let texts = services.fragment_texts.read().await;
+    let metadata = services.fragment_metadata.read().await;
+
+    let mut tier_counts: std::collections::BTreeMap<String, usize> = PROVENANCE_TIERS
+        .iter()
+        .map(|t| (t.to_string(), 0))
+        .collect();
+    let mut pairs: Vec<ProvenancePair> = Vec::new();
+
+    for (frag_id, meta) in metadata.iter() {
+        let Some(provenance) = meta.get("provenance").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ts_str = meta.get("ts").and_then(|v| v.as_str());
+        if let Some(ts) = ts_str {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if parsed.with_timezone(&chrono::Utc) < cutoff {
+                    continue;
+                }
+            }
+            // Unparseable ts → keep (over-report beats silent drop).
+        }
+        if let Some(want) = want_project {
+            match meta.get("project_cwd").and_then(|v| v.as_str()) {
+                Some(p) if p.contains(want) => {}
+                _ => continue,
+            }
+        }
+
+        // Counts reflect the full window (after time/project filters) so
+        // the histogram is honest even when a `tier` filter narrows pairs.
+        *tier_counts.entry(provenance.to_string()).or_insert(0) += 1;
+
+        if let Some(want) = want_tier {
+            if provenance != want {
+                continue;
+            }
+        }
+
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = meta
+            .get("src_session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let source_fragment_ids: Vec<String> = meta
+            .get("source_fragment_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let content = texts.get(frag_id).cloned().unwrap_or_default();
+        pairs.push(ProvenancePair {
+            session_id,
+            fragment_id: frag_id.clone(),
+            kind,
+            provenance: provenance.to_string(),
+            content,
+            ts: ts_str.map(|s| s.to_string()),
+            source_fragment_ids,
+        });
+    }
+    drop(texts);
+    drop(metadata);
+
+    // Newest-first; deterministic tiebreak on fragment_id.
+    pairs.sort_by(|a, b| {
+        b.ts.as_deref()
+            .unwrap_or("")
+            .cmp(a.ts.as_deref().unwrap_or(""))
+            .then_with(|| a.fragment_id.cmp(&b.fragment_id))
+    });
+    pairs.truncate(limit);
+
+    Json(ProvenancePairsResponse {
+        since: since_raw.to_string(),
+        tier: q.tier,
+        count: pairs.len(),
+        tier_counts,
+        pairs,
+    })
+}
+
 /// Per-feature preview cap so the Markdown body stays bounded even when
 /// `how_to_test` carries a long recipe. Mirrors `CAPSULE_LINE_LIMIT`.
 const FEATURES_HOW_TO_TEST_LIMIT: usize = 280;
@@ -3150,6 +3318,10 @@ pub fn create_sessions_router() -> Router<ContextNestServices> {
         )
         .route("/api/v1/sessions/:id", get(session_detail))
         .route("/api/v1/features", get(list_features))
+        .route(
+            "/api/v1/training/provenance-pairs",
+            get(list_provenance_pairs),
+        )
 }
 
 #[cfg(test)]
@@ -3578,6 +3750,146 @@ mod tests {
         // pending todo counts; completed todo dropped; `state` excluded.
         assert_eq!(resp.pending_goals.len(), 1);
         assert_eq!(resp.pending_goals[0].id, "g1");
+    }
+
+    /// Seed a substrate with provenance-tagged fragments plus one untagged
+    /// fragment, all timestamped now so the default 7d window keeps them.
+    async fn seed_provenance_corpus() -> ContextNestServices {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut texts = services.fragment_texts.write().await;
+        let mut meta = services.fragment_metadata.write().await;
+        let mut put = |id: &str, text: &str, kv: &[(&str, Value)]| {
+            texts.insert(id.to_string(), text.to_string());
+            meta.insert(id.to_string(), meta_kv(kv));
+        };
+        put(
+            "v1",
+            "cargo test passed",
+            &[
+                ("kind", json!("verification")),
+                ("provenance", json!("observed")),
+                ("ts", json!(now)),
+            ],
+        );
+        put(
+            "v2",
+            "claimed the build was green",
+            &[
+                ("kind", json!("verification")),
+                ("provenance", json!("claimed")),
+                ("ts", json!(now)),
+            ],
+        );
+        put(
+            "v3",
+            "said tests passed but receipt shows failure",
+            &[
+                ("kind", json!("verification")),
+                ("provenance", json!("contradicted")),
+                ("ts", json!(now)),
+            ],
+        );
+        put(
+            "s1",
+            "summary of the auth refactor",
+            &[
+                ("kind", json!("summary")),
+                ("provenance", json!("observed")),
+                ("source_fragment_ids", json!(["a", "b"])),
+                ("ts", json!(now)),
+            ],
+        );
+        // No provenance tag → must be skipped entirely.
+        put(
+            "n1",
+            "just an observation",
+            &[("kind", json!("state")), ("ts", json!(now))],
+        );
+        drop(texts);
+        drop(meta);
+        services
+    }
+
+    #[tokio::test]
+    async fn provenance_pairs_harvests_only_tagged_fragments_with_histogram() {
+        let services = seed_provenance_corpus().await;
+        let resp = list_provenance_pairs(
+            State(services),
+            Query(ProvenancePairsQuery {
+                since: None,
+                tier: None,
+                project: None,
+                limit: None,
+            }),
+        )
+        .await
+        .0;
+
+        // 4 tagged fragments harvested; the untagged `state` is excluded.
+        assert_eq!(resp.count, 4, "only provenance-tagged fragments harvested");
+        assert!(resp.pairs.iter().all(|p| !p.provenance.is_empty()));
+        assert!(
+            resp.pairs.iter().all(|p| p.fragment_id != "n1"),
+            "untagged fragment must not appear"
+        );
+
+        // Histogram always carries all five tiers, zero-filled.
+        assert_eq!(resp.tier_counts.len(), 5);
+        assert_eq!(resp.tier_counts["observed"], 2); // v1 + s1
+        assert_eq!(resp.tier_counts["claimed"], 1);
+        assert_eq!(resp.tier_counts["contradicted"], 1);
+        assert_eq!(resp.tier_counts["partial"], 0);
+        assert_eq!(resp.tier_counts["absent"], 0);
+    }
+
+    #[tokio::test]
+    async fn provenance_pairs_tier_filter_narrows_pairs_not_counts() {
+        let services = seed_provenance_corpus().await;
+        let resp = list_provenance_pairs(
+            State(services),
+            Query(ProvenancePairsQuery {
+                since: None,
+                tier: Some("observed".into()),
+                project: None,
+                limit: None,
+            }),
+        )
+        .await
+        .0;
+
+        // Only the two observed rows survive the filter...
+        assert_eq!(resp.count, 2);
+        assert!(resp.pairs.iter().all(|p| p.provenance == "observed"));
+        // ...but the histogram still reports the full window.
+        assert_eq!(resp.tier_counts["observed"], 2);
+        assert_eq!(resp.tier_counts["contradicted"], 1);
+
+        // The summary row carries its cited sources; the verification does not.
+        let summary = resp.pairs.iter().find(|p| p.fragment_id == "s1").unwrap();
+        assert_eq!(summary.source_fragment_ids, vec!["a", "b"]);
+        let verif = resp.pairs.iter().find(|p| p.fragment_id == "v1").unwrap();
+        assert!(verif.source_fragment_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provenance_pairs_empty_substrate_is_zeroed_histogram() {
+        let services = ContextNestServices::new_default().await.expect("services");
+        let resp = list_provenance_pairs(
+            State(services),
+            Query(ProvenancePairsQuery {
+                since: None,
+                tier: None,
+                project: None,
+                limit: None,
+            }),
+        )
+        .await
+        .0;
+        assert_eq!(resp.count, 0);
+        assert!(resp.pairs.is_empty());
+        assert_eq!(resp.tier_counts.len(), 5);
+        assert!(resp.tier_counts.values().all(|&c| c == 0));
     }
 
     #[test]
