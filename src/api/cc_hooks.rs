@@ -261,6 +261,12 @@ pub struct PreToolGateRequest {
     pub session_id: String,
     #[serde(default)]
     pub tool_name: String,
+    /// Raw Claude Code `tool_input` blob. We only read `file_path` from it
+    /// (the target of an Edit/Write/Read), to consult the coordination
+    /// lease registry. Kept as an opaque `Value` so the rest of the tool's
+    /// arguments don't have to be modelled and future fields don't break us.
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
 }
 
 /// The `hookSpecificOutput` block Claude Code reads from a PreToolUse
@@ -310,12 +316,32 @@ async fn pretool_gate(
         .map(|s| (s.unresolved_errors, s.open_constraints))
         .unwrap_or_default();
 
-    let warn = !unresolved_errors.is_empty() || !open_constraints.is_empty();
-    let additional_context = if warn {
+    let mut warn = !unresolved_errors.is_empty() || !open_constraints.is_empty();
+    let mut additional_context = if warn {
         build_gate_advisory(&unresolved_errors, &open_constraints)
     } else {
         String::new()
     };
+
+    // Coordination consult: if this tool targets a file another agent holds
+    // a conflicting write lease on, append a WAIT advisory. The session_id
+    // doubles as the agent identity for the lease registry. Still
+    // permissionDecision:"allow" — advisory only, warn-only contract intact.
+    if let Some(path) = req
+        .tool_input
+        .as_ref()
+        .and_then(|v| v.get("file_path"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(adv) = crate::api::coord::lease_advisory(&services, &req.session_id, path).await
+        {
+            warn = true;
+            if !additional_context.is_empty() {
+                additional_context.push_str("\n\n");
+            }
+            additional_context.push_str(&adv);
+        }
+    }
 
     Json(PreToolGateResponse {
         session_id: req.session_id,
@@ -846,6 +872,7 @@ mod tests {
             Json(PreToolGateRequest {
                 session_id: "G".into(),
                 tool_name: "Bash".into(),
+                tool_input: None,
             }),
         )
         .await
@@ -894,6 +921,7 @@ mod tests {
             Json(PreToolGateRequest {
                 session_id: "clean".into(),
                 tool_name: "Read".into(),
+                tool_input: None,
             }),
         )
         .await
@@ -910,6 +938,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pretool_gate_surfaces_coordination_lease_wait() {
+        use crate::api::coord::{Lease, LeaseMode};
+        let services = ContextNestServices::new_default().await.expect("services");
+
+        // Agent A holds a write lease on src/foo.rs.
+        {
+            let mut leases = services.coord_leases.write().await;
+            leases.push(Lease {
+                lease_id: "lease-a".into(),
+                agent_id: "A".into(),
+                fleet_id: Some("ork-1".into()),
+                paths: vec!["src/foo.rs".into()],
+                mode: LeaseMode::Write,
+                priority: 10,
+                reason: Some("refactor API".into()),
+                granted_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+            });
+        }
+
+        // Agent B's pretool check on the same file gets a WAIT advisory,
+        // still as permissionDecision:"allow" (warn-only contract).
+        let resp = pretool_gate(
+            State(services),
+            Json(PreToolGateRequest {
+                session_id: "B".into(),
+                tool_name: "Edit".into(),
+                tool_input: Some(json!({"file_path": "src/foo.rs"})),
+            }),
+        )
+        .await
+        .0;
+
+        assert!(resp.warn, "contended write must warn");
+        assert_eq!(resp.hook_specific_output.permission_decision, "allow");
+        let ctx = &resp.hook_specific_output.additional_context;
+        assert!(ctx.contains("WAIT"), "advisory tells B to wait: {ctx}");
+        assert!(ctx.contains('A'), "advisory names holder A: {ctx}");
+    }
+
+    #[tokio::test]
     async fn pretool_gate_unknown_session_is_silent_allow() {
         // A session the substrate has never seen must not error — it's a
         // warn:false, allow no-op so the hook never blocks Claude's loop.
@@ -919,6 +988,7 @@ mod tests {
             Json(PreToolGateRequest {
                 session_id: "never-seen".into(),
                 tool_name: "Bash".into(),
+                tool_input: None,
             }),
         )
         .await
