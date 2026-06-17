@@ -13,9 +13,29 @@
 //! This module is the registry: scoped, priority-aware, TTL'd **leases**
 //! (Gray & Cheriton 1989 — a crashed holder's lease expires rather than
 //! deadlocking the fleet). Conflict = path-set overlap AND ≥1 writer
-//! (readers-writers, Courtois 1971). Phase 1 is advisory only; priority
-//! inheritance, deadlock detection, and deny-mode enforcement are later
-//! phases (see `docs/roadmap/epics/agent-coordination.md`).
+//! (readers-writers, Courtois 1971).
+//!
+//! Phase 2 adds two fairness mechanisms on top of the Phase-1 registry,
+//! both implemented purely over the `Vec<Lease>` so they stay unit-testable
+//! without booting services:
+//!
+//! - **Priority inheritance** (Sha/Rajkumar/Lehoczky 1990). While a
+//!   high-priority agent waits on a lower-priority holder, the holder's
+//!   *effective* priority is raised to the waiter's so a medium-priority
+//!   third agent can't jump the queue and starve the high-priority waiter.
+//!   We never store the inherited value on the holder lease — it is derived
+//!   on read from the recorded waiters (see `effective_priority`) and surfaced
+//!   as `effective_priority` in `GET /coord/leases`.
+//! - **Deadlock detection via wound-wait** (Rosenkrantz 1978). Queued
+//!   requests are recorded as waiter rows (a `Lease` whose `lease_id` carries
+//!   the `waiter:` prefix). A wait-for graph is derived from waiters → held
+//!   leases; if a new `queued` decision would close a cycle, the
+//!   lower-priority requester in the cycle loses and its acquire returns
+//!   `{ status: "abort", reason: "deadlock" }`. Wound-wait only ever cancels
+//!   a *requester's wait*; an established holder is never preempted.
+//!
+//! Deny-mode enforcement and persistence are later phases (see
+//! `docs/roadmap/epics/agent-coordination.md`).
 
 use axum::{
     extract::{Path, Query, State},
@@ -25,6 +45,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 use crate::services::ContextNestServices;
 
@@ -103,10 +124,20 @@ pub enum AcquireResponse {
         /// hint. The waiter sleeps roughly this long (e.g. via
         /// `ScheduleWakeup`) then re-requests, instead of busy-spinning.
         retry_after_secs: i64,
-        /// Number of conflicting holders at or above the requester's
-        /// priority — a coarse "how far back am I" signal for Phase 1.
+        /// How far back in line the requester is: conflicting holders whose
+        /// **effective** priority is at or above the requester, plus other
+        /// already-waiting agents that outrank it (higher priority, or equal
+        /// priority recorded earlier). Priority inheritance feeds the holder
+        /// term; the waiter term is what keeps a medium-priority agent behind
+        /// a high-priority waiter.
         position: usize,
     },
+    /// Wound-wait deadlock break (Phase 2). Returned when granting/queueing
+    /// this request would close a wait-for cycle and the requester is the
+    /// lower-priority party in that cycle. The requester must abandon this
+    /// acquire (and typically retry later); the higher-priority party keeps
+    /// its place. After an abort no wait-for cycle remains.
+    Abort { reason: String },
 }
 
 /// Two scopes overlap if one is a path-prefix of the other at a segment
@@ -140,6 +171,185 @@ fn sweep_expired(leases: &mut Vec<Lease>, now: DateTime<Utc>) {
     leases.retain(|l| l.expires_at > now);
 }
 
+// ── Phase 2: waiter records, priority inheritance, wound-wait deadlock ──────
+//
+// Phase 2 needs state that outlives a single HTTP call: a queued requester's
+// priority (so a holder can inherit it) and the "who waits for whom" edges (so
+// a cycle is detectable on the *next* request). The registry's only storage is
+// the `Vec<Lease>`, so a queued request is recorded as a *waiter row* — a
+// normal `Lease` whose `lease_id` carries this prefix. Waiter rows never count
+// as held leases (they don't block, don't appear in `GET /coord/leases`, and
+// don't drive the advisory); they only feed inheritance and cycle detection,
+// and they self-heal via the same lazy TTL sweep as held leases.
+
+/// Marks a `Lease` row as a queued *waiter*, not a held lease. Keeping waiters
+/// in the same `Vec` (rather than a second field on the services struct) lets
+/// every Phase-2 rule stay a pure function over `&mut Vec<Lease>`.
+const WAITER_PREFIX: &str = "waiter:";
+
+fn is_waiter(l: &Lease) -> bool {
+    l.lease_id.starts_with(WAITER_PREFIX)
+}
+
+fn is_held(l: &Lease) -> bool {
+    !is_waiter(l)
+}
+
+/// A held lease's *effective* priority = its own priority, raised to the
+/// highest priority among waiters currently blocked on it (priority
+/// inheritance). Derived on read so it's always consistent with the live
+/// waiter set — there is no stored, drift-prone copy.
+fn effective_priority(leases: &[Lease], held: &Lease) -> i64 {
+    let mut eff = held.priority;
+    for w in leases.iter().filter(|w| is_waiter(w)) {
+        if w.agent_id != held.agent_id && conflicts(held, &w.paths, w.mode) && w.priority > eff {
+            eff = w.priority;
+        }
+    }
+    eff
+}
+
+/// Wait-for graph: an edge `waiter_agent → holder_agent` for every held lease
+/// a waiter is blocked by. Agents are the nodes; a cycle here is a deadlock.
+fn waiter_adjacency(leases: &[Lease]) -> HashMap<String, HashSet<String>> {
+    let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+    for w in leases.iter().filter(|w| is_waiter(w)) {
+        let edges = adj.entry(w.agent_id.clone()).or_default();
+        for h in leases.iter().filter(|h| is_held(h)) {
+            if h.agent_id != w.agent_id && conflicts(h, &w.paths, w.mode) {
+                edges.insert(h.agent_id.clone());
+            }
+        }
+    }
+    adj
+}
+
+/// DFS for a path `start → … → target` in the wait-for graph. Returns the node
+/// sequence (inclusive) or `None` if `target` is unreachable from `start`.
+fn find_path(
+    adj: &HashMap<String, HashSet<String>>,
+    start: &str,
+    target: &str,
+) -> Option<Vec<String>> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut parent: HashMap<String, String> = HashMap::new();
+    let mut stack = vec![start.to_string()];
+    visited.insert(start.to_string());
+    while let Some(node) = stack.pop() {
+        if node == target {
+            let mut path = vec![node.clone()];
+            let mut cur = node;
+            while let Some(p) = parent.get(&cur) {
+                path.push(p.clone());
+                cur = p.clone();
+            }
+            path.reverse();
+            return Some(path);
+        }
+        if let Some(neigh) = adj.get(&node) {
+            for n in neigh {
+                if visited.insert(n.clone()) {
+                    parent.insert(n.clone(), node.clone());
+                    stack.push(n.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If queueing `req` (which would wait on the held leases it conflicts with)
+/// closes a wait-for cycle, return the agents on that cycle (including
+/// `req.agent_id`). The proposed edges are `req.agent → each conflicting
+/// holder`; a cycle exists iff one of those holders can already reach
+/// `req.agent` through the existing waiter graph.
+fn find_deadlock_cycle(leases: &[Lease], req: &AcquireRequest) -> Option<Vec<String>> {
+    let adj = waiter_adjacency(leases);
+    for h in leases.iter().filter(|h| is_held(h)) {
+        if h.agent_id != req.agent_id && conflicts(h, &req.paths, req.mode) {
+            if let Some(path) = find_path(&adj, &h.agent_id, &req.agent_id) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// The cycle member that loses the wound-wait break: the lowest-priority
+/// requester, ties broken deterministically by the lexicographically greater
+/// `agent_id`. `req`'s priority is taken from the request itself (it isn't a
+/// waiter row yet); every other member's from its recorded waiter row.
+fn pick_loser(leases: &[Lease], members: &[String], req: &AcquireRequest) -> String {
+    let prio_of = |agent: &str| -> i64 {
+        if agent == req.agent_id {
+            req.priority
+        } else {
+            leases
+                .iter()
+                .filter(|w| is_waiter(w) && w.agent_id == agent)
+                .map(|w| w.priority)
+                .max()
+                .unwrap_or(i64::MAX)
+        }
+    };
+    let mut best: Option<(i64, &String)> = None;
+    for m in members {
+        let p = prio_of(m);
+        let replace = match best {
+            None => true,
+            // Lower priority loses; ties broken by the greater agent_id so the
+            // choice is independent of which agent happened to call.
+            Some((bp, bm)) => p < bp || (p == bp && m > bm),
+        };
+        if replace {
+            best = Some((p, m));
+        }
+    }
+    best.map(|(_, m)| m.clone()).unwrap_or_default()
+}
+
+/// Drop a queued waiter's record entirely (all of that agent's waiter rows).
+/// Used to break a cycle: the loser's *wait* is cancelled — never its held
+/// lease, so wound-wait stays non-preemptive for established holders.
+fn cancel_waiter(leases: &mut Vec<Lease>, agent: &str) {
+    leases.retain(|l| !(is_waiter(l) && l.agent_id == agent));
+}
+
+/// Record (or refresh) `req` as a waiter on its scope. Re-polls keep their
+/// original `granted_at` so FIFO position among equal-priority waiters is
+/// preserved; only priority/scope/TTL are updated.
+fn upsert_waiter(leases: &mut Vec<Lease>, req: &AcquireRequest, now: DateTime<Utc>, ttl: u64) {
+    let expires_at = now + Duration::seconds(ttl as i64);
+    if let Some(w) = leases
+        .iter_mut()
+        .find(|w| is_waiter(w) && w.agent_id == req.agent_id && sets_overlap(&w.paths, &req.paths))
+    {
+        w.priority = req.priority;
+        w.paths = req.paths.clone();
+        w.mode = req.mode;
+        w.reason = req.reason.clone();
+        w.expires_at = expires_at;
+    } else {
+        leases.push(Lease {
+            lease_id: format!("{WAITER_PREFIX}{}", uuid::Uuid::new_v4()),
+            agent_id: req.agent_id.clone(),
+            fleet_id: req.fleet_id.clone(),
+            paths: req.paths.clone(),
+            mode: req.mode,
+            priority: req.priority,
+            reason: req.reason.clone(),
+            granted_at: now,
+            expires_at,
+        });
+    }
+}
+
+/// Drop any waiter rows the granted agent had on this scope — once it holds the
+/// lease it is no longer waiting, so its stale wait edges must disappear.
+fn clear_waiters_for_scope(leases: &mut Vec<Lease>, agent: &str, paths: &[String]) {
+    leases.retain(|l| !(is_waiter(l) && l.agent_id == agent && sets_overlap(&l.paths, paths)));
+}
+
 /// Pure grant/queue decision over a lease set — the functional core. The
 /// async handler is a thin lock-acquire wrapper around this so the
 /// conflict/priority/TTL rules are testable without booting services.
@@ -147,7 +357,15 @@ fn sweep_expired(leases: &mut Vec<Lease>, now: DateTime<Utc>) {
 /// A request from the **same** agent never blocks itself (re-entrant /
 /// re-acquire is allowed). Grant is non-preemptive: a held conflicting
 /// lease always wins regardless of the requester's priority; priority only
-/// orders the returned queue. Preemption/inheritance is Phase 2.
+/// orders the returned queue.
+///
+/// Phase 2 layers two rules onto the queue branch. Before recording the
+/// requester as a waiter it runs wound-wait deadlock detection: if queueing
+/// would close a wait-for cycle, the lowest-priority agent in the cycle loses
+/// — if that's the requester it `Abort`s here, otherwise the loser's wait is
+/// cancelled (its held lease untouched) and the requester proceeds to queue.
+/// The recorded waiter then powers priority inheritance, which is computed on
+/// read in `effective_priority` rather than stored on the holder.
 fn decide(leases: &mut Vec<Lease>, req: AcquireRequest, now: DateTime<Utc>) -> AcquireResponse {
     sweep_expired(leases, now);
     let ttl = req
@@ -155,13 +373,15 @@ fn decide(leases: &mut Vec<Lease>, req: AcquireRequest, now: DateTime<Utc>) -> A
         .unwrap_or(DEFAULT_TTL_SECS)
         .clamp(1, MAX_TTL_SECS);
 
-    let conflicting: Vec<&Lease> = leases
+    // Only *held* leases block; waiter rows are bookkeeping, never holders.
+    let conflicting: Vec<Lease> = leases
         .iter()
-        .filter(|l| l.agent_id != req.agent_id && conflicts(l, &req.paths, req.mode))
+        .filter(|l| is_held(l) && l.agent_id != req.agent_id && conflicts(l, &req.paths, req.mode))
+        .cloned()
         .collect();
 
     if conflicting.is_empty() {
-        drop(conflicting);
+        clear_waiters_for_scope(leases, &req.agent_id, &req.paths);
         let lease = Lease {
             lease_id: uuid::Uuid::new_v4().to_string(),
             agent_id: req.agent_id,
@@ -178,31 +398,60 @@ fn decide(leases: &mut Vec<Lease>, req: AcquireRequest, now: DateTime<Utc>) -> A
             expires_at: lease.expires_at,
         };
         leases.push(lease);
-        resp
-    } else {
-        let retry_after_secs = conflicting
-            .iter()
-            .map(|l| (l.expires_at - now).num_seconds().max(0))
-            .min()
-            .unwrap_or(0);
-        let position = conflicting
-            .iter()
-            .filter(|l| l.priority >= req.priority)
-            .count();
-        let blocked_by = conflicting
-            .iter()
-            .map(|l| Blocker {
-                lease_id: l.lease_id.clone(),
-                agent_id: l.agent_id.clone(),
-                priority: l.priority,
-                reason: l.reason.clone(),
-            })
-            .collect();
-        AcquireResponse::Queued {
-            blocked_by,
-            retry_after_secs,
-            position,
+        return resp;
+    }
+
+    // Wound-wait: break any wait-for cycle this request would close. Loop so a
+    // chain of breaks settles before we commit the requester to the queue;
+    // each pass drops ≥1 waiter, so it terminates.
+    while let Some(cycle) = find_deadlock_cycle(leases, &req) {
+        let loser = pick_loser(leases, &cycle, &req);
+        if loser == req.agent_id {
+            return AcquireResponse::Abort {
+                reason: "deadlock".to_string(),
+            };
         }
+        cancel_waiter(leases, &loser);
+    }
+
+    // Commit the requester as a waiter so it can inherit priority to its
+    // holders and be visible to future cycle checks.
+    upsert_waiter(leases, &req, now, ttl);
+
+    let retry_after_secs = conflicting
+        .iter()
+        .map(|l| (l.expires_at - now).num_seconds().max(0))
+        .min()
+        .unwrap_or(0);
+    // Conflicting holders that (with inheritance) outrank-or-tie the requester…
+    let holders_ahead = conflicting
+        .iter()
+        .filter(|l| effective_priority(leases, l) >= req.priority)
+        .count();
+    // …plus other waiters that legitimately sit ahead in line.
+    let waiters_ahead = leases
+        .iter()
+        .filter(|w| {
+            is_waiter(w)
+                && w.agent_id != req.agent_id
+                && conflicts(w, &req.paths, req.mode)
+                && (w.priority > req.priority || (w.priority == req.priority && w.granted_at < now))
+        })
+        .count();
+    let position = holders_ahead + waiters_ahead;
+    let blocked_by = conflicting
+        .iter()
+        .map(|l| Blocker {
+            lease_id: l.lease_id.clone(),
+            agent_id: l.agent_id.clone(),
+            priority: l.priority,
+            reason: l.reason.clone(),
+        })
+        .collect();
+    AcquireResponse::Queued {
+        blocked_by,
+        retry_after_secs,
+        position,
     }
 }
 
@@ -285,14 +534,26 @@ struct ListQuery {
     path: Option<String>,
 }
 
+/// A held lease as rendered in the listing — all `Lease` fields plus the
+/// Phase-2 `effective_priority` (the static `priority` raised by any inherited
+/// waiter). The two are distinct: `priority` is the agent's own, while
+/// `effective_priority` reflects who is currently blocked behind it.
+#[derive(Debug, Serialize)]
+struct LeaseView {
+    #[serde(flatten)]
+    lease: Lease,
+    effective_priority: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct ListResponse {
     count: usize,
-    leases: Vec<Lease>,
+    leases: Vec<LeaseView>,
 }
 
-/// GET /api/v1/coord/leases[?path=] — inspect live contention. With
-/// `path`, returns only leases whose scope overlaps it.
+/// GET /api/v1/coord/leases[?path=] — inspect live contention. With `path`,
+/// returns only held leases whose scope overlaps it. Waiter bookkeeping rows
+/// are never listed; each held lease carries its `effective_priority`.
 async fn list(
     State(services): State<ContextNestServices>,
     Query(q): Query<ListQuery>,
@@ -300,17 +561,22 @@ async fn list(
     let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
     sweep_expired(&mut leases, now);
-    let filtered: Vec<Lease> = match q.path.as_deref() {
-        Some(p) => leases
-            .iter()
-            .filter(|l| l.paths.iter().any(|lp| path_overlap(lp, p)))
-            .cloned()
-            .collect(),
-        None => leases.clone(),
-    };
+    let snapshot = leases.clone();
+    let views: Vec<LeaseView> = snapshot
+        .iter()
+        .filter(|l| is_held(l))
+        .filter(|l| match q.path.as_deref() {
+            Some(p) => l.paths.iter().any(|lp| path_overlap(lp, p)),
+            None => true,
+        })
+        .map(|l| LeaseView {
+            effective_priority: effective_priority(&snapshot, l),
+            lease: l.clone(),
+        })
+        .collect();
     Json(ListResponse {
-        count: filtered.len(),
-        leases: filtered,
+        count: views.len(),
+        leases: views,
     })
 }
 
@@ -328,7 +594,8 @@ fn advisory_for(
     let blockers: Vec<&Lease> = leases
         .iter()
         .filter(|l| {
-            l.agent_id != agent_id
+            is_held(l)
+                && l.agent_id != agent_id
                 && l.mode == LeaseMode::Write
                 && l.paths.iter().any(|lp| path_overlap(lp, path))
         })
@@ -580,5 +847,211 @@ mod tests {
 
         // An unrelated file: no advisory.
         assert!(advisory_for(&mut leases, "B", "src/other.rs", now).is_none());
+    }
+
+    // ── Phase 2 ────────────────────────────────────────────────────────────
+
+    /// A high-priority waiter bumps a low-priority holder's *effective*
+    /// priority (priority inheritance), while the holder's static priority is
+    /// left untouched.
+    #[test]
+    fn priority_inheritance_bumps_holder_effective() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+
+        // L (prio 1) holds foo.rs.
+        let l = decide(
+            &mut leases,
+            req("L", &["src/foo.rs"], LeaseMode::Write, 1),
+            now,
+        );
+        assert!(matches!(l, AcquireResponse::Granted { .. }));
+
+        // H (prio 10) waits on foo.rs → queued behind L.
+        let h = decide(
+            &mut leases,
+            req("H", &["src/foo.rs"], LeaseMode::Write, 10),
+            now,
+        );
+        assert!(matches!(h, AcquireResponse::Queued { .. }));
+
+        // L's static priority is unchanged, but its effective priority is the
+        // inherited 10 — so a third agent can't slip in ahead of H.
+        let l_held = leases
+            .iter()
+            .find(|x| is_held(x) && x.agent_id == "L")
+            .expect("L still holds the lease");
+        assert_eq!(l_held.priority, 1, "static priority is untouched");
+        assert_eq!(
+            effective_priority(&leases, l_held),
+            10,
+            "holder inherits the waiter's priority"
+        );
+    }
+
+    /// A medium-priority requester must queue *behind* a high-priority waiter
+    /// that is already blocked on the same holder (no starvation of the
+    /// high-priority waiter). Position is the observable ordering signal.
+    #[test]
+    fn medium_prio_queues_behind_high_prio_waiter() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+
+        // L (prio 1) holds foo.rs.
+        decide(
+            &mut leases,
+            req("L", &["src/foo.rs"], LeaseMode::Write, 1),
+            now,
+        );
+
+        // H (prio 10) waits first.
+        let h = decide(
+            &mut leases,
+            req("H", &["src/foo.rs"], LeaseMode::Write, 10),
+            now,
+        );
+        let h_pos = match h {
+            AcquireResponse::Queued { position, .. } => position,
+            _ => panic!("H should be queued"),
+        };
+
+        // M (prio 5) waits next → must land behind H, not ahead of it.
+        let m = decide(
+            &mut leases,
+            req("M", &["src/foo.rs"], LeaseMode::Write, 5),
+            now,
+        );
+        let m_pos = match m {
+            AcquireResponse::Queued { position, .. } => position,
+            _ => panic!("M should be queued"),
+        };
+
+        assert!(
+            m_pos > h_pos,
+            "medium-prio M (pos {m_pos}) must queue behind high-prio H (pos {h_pos})"
+        );
+    }
+
+    /// Wound-wait: A holds X & waits on Y; B holds Y & requests X, closing the
+    /// cycle. The lower-priority requester (B) aborts; the higher-priority
+    /// party (A) keeps its place, and no wait-for cycle remains.
+    #[test]
+    fn deadlock_detected_lower_priority_aborts() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+
+        // A (prio 10) holds X; B (prio 5) holds Y.
+        decide(
+            &mut leases,
+            req("A", &["src/x.rs"], LeaseMode::Write, 10),
+            now,
+        );
+        decide(
+            &mut leases,
+            req("B", &["src/y.rs"], LeaseMode::Write, 5),
+            now,
+        );
+
+        // A requests Y → queued behind B (records A's wait edge A→B).
+        let a2 = decide(
+            &mut leases,
+            req("A", &["src/y.rs"], LeaseMode::Write, 10),
+            now,
+        );
+        assert!(matches!(a2, AcquireResponse::Queued { .. }));
+
+        // B requests X → would close the cycle B→A→B. B is lower-priority, so
+        // B is the wound-wait loser and aborts.
+        let b2 = decide(
+            &mut leases,
+            req("B", &["src/x.rs"], LeaseMode::Write, 5),
+            now,
+        );
+        match b2 {
+            AcquireResponse::Abort { reason } => assert_eq!(reason, "deadlock"),
+            other => panic!("B should abort on deadlock, got {other:?}"),
+        }
+
+        // The cycle is gone: B was never recorded as a waiter, A's wait stands,
+        // and both original holders are intact (no holder was preempted).
+        assert!(
+            !leases.iter().any(|w| is_waiter(w) && w.agent_id == "B"),
+            "the aborted requester leaves no waiter row"
+        );
+        assert!(
+            leases.iter().any(|w| is_waiter(w) && w.agent_id == "A"),
+            "the surviving party keeps its place in line"
+        );
+        assert!(leases
+            .iter()
+            .any(|l| is_held(l) && l.agent_id == "A" && l.paths == vec!["src/x.rs".to_string()]));
+        assert!(leases
+            .iter()
+            .any(|l| is_held(l) && l.agent_id == "B" && l.paths == vec!["src/y.rs".to_string()]));
+        // The *committed* wait-for graph is acyclic: A still waits on B, but B
+        // only holds (no committed wait edge of its own), so nothing loops.
+        let adj = waiter_adjacency(&leases);
+        for (g, neigh) in &adj {
+            for n in neigh {
+                assert!(
+                    find_path(&adj, n, g).is_none(),
+                    "committed waiter graph must be acyclic ({g}->{n} must not return)"
+                );
+            }
+        }
+    }
+
+    /// The symmetric break: when the requester closing the cycle is the
+    /// *higher*-priority party, it keeps moving — the lower-priority waiter's
+    /// wait is cancelled (its held lease untouched) and the requester queues.
+    #[test]
+    fn deadlock_break_cancels_lower_priority_waiter_not_requester() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+
+        // A (prio 5) holds X; B (prio 10) holds Y.
+        decide(
+            &mut leases,
+            req("A", &["src/x.rs"], LeaseMode::Write, 5),
+            now,
+        );
+        decide(
+            &mut leases,
+            req("B", &["src/y.rs"], LeaseMode::Write, 10),
+            now,
+        );
+
+        // A (low prio) requests Y → queued, recording A→B.
+        let a2 = decide(
+            &mut leases,
+            req("A", &["src/y.rs"], LeaseMode::Write, 5),
+            now,
+        );
+        assert!(matches!(a2, AcquireResponse::Queued { .. }));
+
+        // B (high prio) requests X → cycle; A is the loser, so A's wait is
+        // cancelled and B queues normally (B does NOT abort).
+        let b2 = decide(
+            &mut leases,
+            req("B", &["src/x.rs"], LeaseMode::Write, 10),
+            now,
+        );
+        assert!(
+            matches!(b2, AcquireResponse::Queued { .. }),
+            "the higher-priority requester keeps its position"
+        );
+
+        assert!(
+            !leases.iter().any(|w| is_waiter(w) && w.agent_id == "A"),
+            "the lower-priority waiter loses its wait"
+        );
+        assert!(
+            leases.iter().any(|w| is_waiter(w) && w.agent_id == "B"),
+            "the surviving requester is now queued"
+        );
+        // A's held lease on X is preserved — wound-wait never preempts a holder.
+        assert!(leases
+            .iter()
+            .any(|l| is_held(l) && l.agent_id == "A" && l.paths == vec!["src/x.rs".to_string()]));
     }
 }
