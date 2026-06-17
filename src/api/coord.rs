@@ -45,7 +45,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::services::ContextNestServices;
 
@@ -56,6 +56,13 @@ const DEFAULT_TTL_SECS: u64 = 120;
 /// Upper bound on a single lease's TTL. Caps how long a crashed holder can
 /// stall the fleet before lazy expiry frees its scope.
 const MAX_TTL_SECS: u64 = 3600;
+
+/// Cap on the in-memory contention audit log. Oldest entries are evicted
+/// (FIFO) when the ring overflows so memory stays bounded for long-lived
+/// servers. 512 is enough headroom for a busy agent fleet's worth of
+/// recent contention without forcing the dashboard panel to scan more
+/// than the tail.
+pub const AUDIT_RING_CAP: usize = 512;
 
 /// Access intent for a lease. `read/read` is compatible; any `write`
 /// against an overlapping scope conflicts.
@@ -89,7 +96,7 @@ pub struct Lease {
 }
 
 /// `POST /api/v1/coord/lease` body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AcquireRequest {
     pub agent_id: String,
     #[serde(default)]
@@ -146,6 +153,63 @@ pub enum AcquireResponse {
     Abort { reason: String },
 }
 
+/// Phase 4 observability counters — snapshotted by
+/// `GET /api/v1/coord/metrics`. All fields are in-memory and ephemeral;
+/// restart resets them to zero, matching the lease registry itself.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CoordMetrics {
+    /// Current count of non-expired leases in the registry (gauge).
+    pub coord_leases_held: usize,
+    /// Peak `position` observed across all `queued` responses since
+    /// process start — the worst-case "how many higher-or-equal-priority
+    /// blockers ahead of any waiter" the fleet has seen. Coarse proxy for
+    /// fleet-wide contention since Phase 1 doesn't keep a persistent
+    /// waiter list.
+    pub coord_queue_depth: usize,
+    /// Cumulative count of leases broken by deadlock-cycle detection.
+    /// Always `0` in Phase 1 — cycle detection is Phase 2. Field exists so
+    /// the dashboard wiring doesn't need a schema break later.
+    pub coord_deadlocks_broken: u64,
+    /// Cumulative count of leases swept out by the lazy TTL sweeper.
+    /// Counts every lease whose `expires_at <= now` was found at sweep
+    /// time, regardless of which handler triggered the sweep.
+    pub coord_ttl_expirations: u64,
+    /// Cumulative count of `granted` responses (successful acquisitions).
+    pub coord_leases_granted: u64,
+    /// Cumulative count of `queued` responses (conflicts at acquire time).
+    pub coord_queued_total: u64,
+}
+
+/// Outcome label for a row in the contention audit log. Serialised as the
+/// snake_case form requested by the Phase 4 spec:
+/// `granted|queued|released|ttl_expired|deadlock_abort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Granted,
+    Queued,
+    Released,
+    TtlExpired,
+    DeadlockAbort,
+}
+
+/// One row in the bounded contention audit log. Shape mirrors the spec:
+/// `ts` always set; `waiter`/`holder` are agent ids (one or both may be
+/// `None` depending on outcome); `scope` is the contended path(s);
+/// `waited_secs` is only meaningful for `queued` events.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditRecord {
+    pub ts: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+    pub scope: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_secs: Option<f64>,
+    pub outcome: AuditOutcome,
+}
+
 /// Two scopes overlap if one is a path-prefix of the other at a segment
 /// boundary, or they're equal. MVP granularity is whole files / dir
 /// prefixes; symbol/glob scopes are Phase 5.
@@ -170,11 +234,91 @@ fn conflicts(held: &Lease, req_paths: &[String], req_mode: LeaseMode) -> bool {
     write_involved && sets_overlap(&held.paths, req_paths)
 }
 
-/// Lazy TTL — drop every lease whose window has closed. Called at the top
-/// of every registry read so an abandoned lease never blocks past its TTL,
-/// with no background sweeper needed for the MVP.
-fn sweep_expired(leases: &mut Vec<Lease>, now: DateTime<Utc>) {
-    leases.retain(|l| l.expires_at > now);
+/// Lazy TTL — drop every lease whose window has closed and return the
+/// swept leases so the caller can append `ttl_expired` rows to the audit
+/// log + bump `coord_ttl_expirations`. Called at the top of every
+/// registry read so an abandoned lease never blocks past its TTL, with
+/// no background sweeper needed for the MVP.
+fn sweep_expired(leases: &mut Vec<Lease>, now: DateTime<Utc>) -> Vec<Lease> {
+    let mut kept = Vec::with_capacity(leases.len());
+    let mut expired = Vec::new();
+    for l in leases.drain(..) {
+        if l.expires_at > now {
+            kept.push(l);
+        } else {
+            expired.push(l);
+        }
+    }
+    *leases = kept;
+    expired
+}
+
+/// Push a record onto the audit ring buffer. Drops the oldest entry when
+/// at capacity so memory stays bounded.
+fn push_audit(audit: &mut VecDeque<AuditRecord>, rec: AuditRecord) {
+    if audit.len() >= AUDIT_RING_CAP {
+        audit.pop_front();
+    }
+    audit.push_back(rec);
+}
+
+/// Sweep expired leases and append one `ttl_expired` audit row per swept
+/// lease, bumping `coord_ttl_expirations` accordingly. Pure helper —
+/// operates on the mutable refs the caller already holds under their
+/// respective `RwLock` guards.
+fn sweep_and_audit(
+    leases: &mut Vec<Lease>,
+    audit: &mut VecDeque<AuditRecord>,
+    metrics: &mut CoordMetrics,
+    now: DateTime<Utc>,
+) -> Vec<Lease> {
+    let swept = sweep_expired(leases, now);
+    if swept.is_empty() {
+        return swept;
+    }
+    metrics.coord_ttl_expirations = metrics
+        .coord_ttl_expirations
+        .saturating_add(swept.len() as u64);
+    metrics.coord_leases_held = leases.len();
+    for l in &swept {
+        push_audit(
+            audit,
+            AuditRecord {
+                ts: now,
+                waiter: None,
+                holder: Some(l.agent_id.clone()),
+                scope: l.paths.clone(),
+                waited_secs: None,
+                outcome: AuditOutcome::TtlExpired,
+            },
+        );
+    }
+    swept
+}
+
+/// Parse a `since` lookback string of the form `<n><suffix?>` where
+/// suffix is one of `s`/`m`/`h`/`d` (defaulting to seconds). Returns
+/// `None` when the input is missing or unparseable — the caller treats
+/// `None` as "no filter, return everything". Lenient on purpose so a
+/// typo on the dashboard URL doesn't silently 4xx.
+pub(crate) fn parse_since(s: Option<&str>) -> Option<i64> {
+    let s = s?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_part, suffix) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(idx) => (&s[..idx], s[idx..].trim()),
+        None => (s, ""),
+    };
+    let n: i64 = num_part.parse().ok()?;
+    let mult: i64 = match suffix {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => return None,
+    };
+    Some(n.saturating_mul(mult))
 }
 
 // ── Phase 2: waiter records, priority inheritance, wound-wait deadlock ──────
@@ -344,6 +488,7 @@ fn upsert_waiter(leases: &mut Vec<Lease>, req: &AcquireRequest, now: DateTime<Ut
             mode: req.mode,
             priority: req.priority,
             reason: req.reason.clone(),
+            strict: req.strict,
             granted_at: now,
             expires_at,
         });
@@ -360,6 +505,10 @@ fn clear_waiters_for_scope(leases: &mut Vec<Lease>, agent: &str, paths: &[String
 /// async handler is a thin lock-acquire wrapper around this so the
 /// conflict/priority/TTL rules are testable without booting services.
 ///
+/// Caller is responsible for sweeping expired leases first — `decide`
+/// operates on a clean registry so the audit log can capture exactly
+/// which leases the sweeper evicted.
+///
 /// A request from the **same** agent never blocks itself (re-entrant /
 /// re-acquire is allowed). Grant is non-preemptive: a held conflicting
 /// lease always wins regardless of the requester's priority; priority only
@@ -373,7 +522,6 @@ fn clear_waiters_for_scope(leases: &mut Vec<Lease>, agent: &str, paths: &[String
 /// The recorded waiter then powers priority inheritance, which is computed on
 /// read in `effective_priority` rather than stored on the holder.
 fn decide(leases: &mut Vec<Lease>, req: AcquireRequest, now: DateTime<Utc>) -> AcquireResponse {
-    sweep_expired(leases, now);
     let ttl = req
         .ttl_secs
         .unwrap_or(DEFAULT_TTL_SECS)
@@ -469,7 +617,63 @@ async fn acquire(
 ) -> Json<AcquireResponse> {
     let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
-    Json(decide(&mut leases, req, now))
+    let mut metrics = services.coord_metrics.write().await;
+    let mut audit = services.coord_audit.write().await;
+    let _swept = sweep_and_audit(&mut leases, &mut audit, &mut metrics, now);
+    let resp = decide(&mut leases, req.clone(), now);
+    match &resp {
+        AcquireResponse::Granted { .. } => {
+            metrics.coord_leases_granted = metrics.coord_leases_granted.saturating_add(1);
+            metrics.coord_leases_held = leases.len();
+            push_audit(
+                &mut audit,
+                AuditRecord {
+                    ts: now,
+                    waiter: Some(req.agent_id.clone()),
+                    holder: None,
+                    scope: req.paths.clone(),
+                    waited_secs: None,
+                    outcome: AuditOutcome::Granted,
+                },
+            );
+        }
+        AcquireResponse::Queued {
+            blocked_by,
+            position,
+            ..
+        } => {
+            metrics.coord_queued_total = metrics.coord_queued_total.saturating_add(1);
+            if *position > metrics.coord_queue_depth {
+                metrics.coord_queue_depth = *position;
+            }
+            push_audit(
+                &mut audit,
+                AuditRecord {
+                    ts: now,
+                    waiter: Some(req.agent_id.clone()),
+                    holder: blocked_by.first().map(|b| b.agent_id.clone()),
+                    scope: req.paths.clone(),
+                    waited_secs: Some(0.0),
+                    outcome: AuditOutcome::Queued,
+                },
+            );
+        }
+        AcquireResponse::Abort { .. } => {
+            metrics.coord_deadlocks_broken = metrics.coord_deadlocks_broken.saturating_add(1);
+            push_audit(
+                &mut audit,
+                AuditRecord {
+                    ts: now,
+                    waiter: Some(req.agent_id.clone()),
+                    holder: None,
+                    scope: req.paths.clone(),
+                    waited_secs: None,
+                    outcome: AuditOutcome::DeadlockAbort,
+                },
+            );
+        }
+    }
+    Json(resp)
 }
 
 #[derive(Debug, Serialize)]
@@ -484,10 +688,30 @@ async fn release(
     State(services): State<ContextNestServices>,
     Path(id): Path<String>,
 ) -> Json<ReleaseResponse> {
+    let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
+    let removed: Option<Lease> = leases.iter().find(|l| l.lease_id == id).cloned();
     let before = leases.len();
     leases.retain(|l| l.lease_id != id);
     let released = leases.len() < before;
+    if released {
+        if let Some(l) = removed {
+            let mut metrics = services.coord_metrics.write().await;
+            let mut audit = services.coord_audit.write().await;
+            metrics.coord_leases_held = leases.len();
+            push_audit(
+                &mut audit,
+                AuditRecord {
+                    ts: now,
+                    waiter: None,
+                    holder: Some(l.agent_id),
+                    scope: l.paths,
+                    waited_secs: None,
+                    outcome: AuditOutcome::Released,
+                },
+            );
+        }
+    }
     Json(ReleaseResponse {
         status: if released { "released" } else { "not_found" },
         released,
@@ -524,7 +748,9 @@ async fn renew(
         .unwrap_or(DEFAULT_TTL_SECS)
         .clamp(1, MAX_TTL_SECS);
     let mut leases = services.coord_leases.write().await;
-    sweep_expired(&mut leases, now);
+    let mut metrics = services.coord_metrics.write().await;
+    let mut audit = services.coord_audit.write().await;
+    let _swept = sweep_and_audit(&mut leases, &mut audit, &mut metrics, now);
     if let Some(lease) = leases.iter_mut().find(|l| l.lease_id == id) {
         lease.expires_at = now + Duration::seconds(ttl as i64);
         return Json(RenewResponse::Renewed {
@@ -567,7 +793,9 @@ async fn list(
 ) -> Json<ListResponse> {
     let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
-    sweep_expired(&mut leases, now);
+    let mut metrics = services.coord_metrics.write().await;
+    let mut audit = services.coord_audit.write().await;
+    let _swept = sweep_and_audit(&mut leases, &mut audit, &mut metrics, now);
     let snapshot = leases.clone();
     let views: Vec<LeaseView> = snapshot
         .iter()
@@ -593,11 +821,27 @@ async fn list(
 /// gate (which fires on Edit/Write) only needs to surface write holders.
 fn advisory_for(
     leases: &mut Vec<Lease>,
+    audit: &mut VecDeque<AuditRecord>,
+    metrics: &mut CoordMetrics,
     agent_id: &str,
     path: &str,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    sweep_expired(leases, now);
+    let _swept = sweep_and_audit(leases, audit, metrics, now);
+    build_wait_advisory(leases, agent_id, path, now)
+}
+
+/// Pure advisory builder — no sweeping, no audit/metrics side effects. Given
+/// an already-swept lease set, returns the WAIT string when another agent
+/// holds a conflicting write lease on `path`. Callers that need the audited
+/// sweep go through [`advisory_for`]; callers that have already swept (e.g.
+/// [`decision_for`]) call this directly to avoid double-sweeping.
+fn build_wait_advisory(
+    leases: &[Lease],
+    agent_id: &str,
+    path: &str,
+    now: DateTime<Utc>,
+) -> Option<String> {
     let blockers: Vec<&Lease> = leases
         .iter()
         .filter(|l| {
@@ -670,7 +914,7 @@ fn decision_for(
         return LeaseGateDecision::Deny { reason };
     }
 
-    match advisory_for(leases, agent_id, path, now) {
+    match build_wait_advisory(leases, agent_id, path, now) {
         Some(warning) => LeaseGateDecision::Allow {
             warning: Some(warning),
         },
@@ -687,7 +931,41 @@ pub async fn lease_advisory(
 ) -> Option<String> {
     let now = Utc::now();
     let mut leases = services.coord_leases.write().await;
-    advisory_for(&mut leases, agent_id, path, now)
+    let mut metrics = services.coord_metrics.write().await;
+    let mut audit = services.coord_audit.write().await;
+    advisory_for(&mut leases, &mut audit, &mut metrics, agent_id, path, now)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditQuery {
+    /// Lookback window. Accepts `<n>` (seconds) or `<n><s|m|h|d>` —
+    /// e.g. `10m`, `1h`, `2d`. Missing or unparseable → return every
+    /// record. See [`parse_since`].
+    #[serde(default)]
+    since: Option<String>,
+}
+
+/// `GET /api/v1/coord/metrics` — snapshot of the in-memory counter
+/// struct. Cheap (single RwLock read + clone); safe to poll.
+async fn metrics_handler(State(services): State<ContextNestServices>) -> Json<CoordMetrics> {
+    let metrics = services.coord_metrics.read().await;
+    Json(metrics.clone())
+}
+
+/// `GET /api/v1/coord/audit[?since=<dur>]` — newest-first slice of the
+/// bounded audit ring, optionally filtered to a lookback window. The
+/// dashboard panel polls this on the same cadence as `/metrics`.
+async fn audit_handler(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<AuditQuery>,
+) -> Json<Vec<AuditRecord>> {
+    let audit = services.coord_audit.read().await;
+    let cutoff = parse_since(q.since.as_deref()).map(|secs| Utc::now() - Duration::seconds(secs));
+    let out: Vec<AuditRecord> = match cutoff {
+        Some(c) => audit.iter().rev().filter(|r| r.ts >= c).cloned().collect(),
+        None => audit.iter().rev().cloned().collect(),
+    };
+    Json(out)
 }
 
 /// PreToolUse gate decision helper. Returns deny when another agent holds a
@@ -709,6 +987,8 @@ pub fn create_coord_router() -> Router<ContextNestServices> {
         .route("/api/v1/coord/lease/:id", delete(release))
         .route("/api/v1/coord/lease/:id/renew", put(renew))
         .route("/api/v1/coord/leases", get(list))
+        .route("/api/v1/coord/metrics", get(metrics_handler))
+        .route("/api/v1/coord/audit", get(audit_handler))
 }
 
 #[cfg(test)]
@@ -894,7 +1174,11 @@ mod tests {
             granted_at: now - Duration::seconds(10),
             expires_at: now - Duration::seconds(1),
         });
-        // B requests the same path → the stale lease is swept, B granted.
+        // Caller is responsible for sweeping expired leases before decide().
+        let swept = sweep_expired(&mut leases, now);
+        assert_eq!(swept.len(), 1);
+        assert_eq!(swept[0].lease_id, "stale");
+        // B requests the same path on a now-clean registry → granted.
         let b = decide(
             &mut leases,
             req("B", &["src/foo.rs"], LeaseMode::Write, 1),
@@ -1182,5 +1466,114 @@ mod tests {
         assert!(leases
             .iter()
             .any(|l| is_held(l) && l.agent_id == "A" && l.paths == vec!["src/x.rs".to_string()]));
+    }
+
+    /// The PreToolUse advisory names the blocking holder and only the
+    /// contended scope — audited helper over `advisory_for`.
+    #[test]
+    fn advisory_names_the_blocking_holder() {
+        let now = Utc::now();
+        let mut leases = Vec::new();
+        let mut audit = VecDeque::new();
+        let mut metrics = CoordMetrics::default();
+        decide(
+            &mut leases,
+            req("A", &["src/foo.rs"], LeaseMode::Write, 10),
+            now,
+        );
+
+        // B's gate check on the contended file gets a WAIT advisory.
+        let adv = advisory_for(
+            &mut leases,
+            &mut audit,
+            &mut metrics,
+            "B",
+            "src/foo.rs",
+            now,
+        )
+        .expect("advisory present");
+        assert!(adv.contains("WAIT"));
+        assert!(adv.contains('A'));
+
+        // A's own check on its own lease: no self-advisory.
+        assert!(advisory_for(
+            &mut leases,
+            &mut audit,
+            &mut metrics,
+            "A",
+            "src/foo.rs",
+            now
+        )
+        .is_none());
+
+        // An unrelated file: no advisory.
+        assert!(advisory_for(
+            &mut leases,
+            &mut audit,
+            &mut metrics,
+            "B",
+            "src/other.rs",
+            now
+        )
+        .is_none());
+    }
+
+    /// Ring buffer must drop the oldest entry when at capacity so a
+    /// long-running server's memory stays bounded. Pure helper, no axum.
+    #[test]
+    fn audit_ring_evicts_oldest_past_cap() {
+        let mut audit: VecDeque<AuditRecord> = VecDeque::with_capacity(AUDIT_RING_CAP);
+        let base = Utc::now();
+        // Push cap + 1 records; oldest (id "0") must be evicted, the
+        // remaining IDs must be `1..=cap` in arrival order.
+        for i in 0..=(AUDIT_RING_CAP as i64) {
+            push_audit(
+                &mut audit,
+                AuditRecord {
+                    ts: base + Duration::seconds(i),
+                    waiter: Some(format!("w{i}")),
+                    holder: None,
+                    scope: vec![format!("src/file{i}.rs")],
+                    waited_secs: None,
+                    outcome: AuditOutcome::Granted,
+                },
+            );
+        }
+        assert_eq!(audit.len(), AUDIT_RING_CAP);
+        // The oldest entry should now be id 1, not 0.
+        assert_eq!(audit.front().unwrap().waiter.as_deref(), Some("w1"));
+        // The newest should be id `cap`.
+        assert_eq!(
+            audit.back().unwrap().waiter.as_deref(),
+            Some(format!("w{AUDIT_RING_CAP}").as_str())
+        );
+        // Verify the entire sequence is contiguous 1..=cap (FIFO).
+        for (idx, rec) in audit.iter().enumerate() {
+            assert_eq!(
+                rec.waiter.as_deref(),
+                Some(format!("w{}", idx + 1).as_str())
+            );
+        }
+    }
+
+    /// `since` parser: suffix multiplication + missing/invalid → None.
+    /// Pure helper, no axum.
+    #[test]
+    fn parse_since_basic_units() {
+        assert_eq!(parse_since(None), None);
+        assert_eq!(parse_since(Some("")), None);
+        assert_eq!(parse_since(Some("   ")), None);
+        assert_eq!(parse_since(Some("30s")), Some(30));
+        assert_eq!(parse_since(Some("10m")), Some(600));
+        assert_eq!(parse_since(Some("2h")), Some(7200));
+        assert_eq!(parse_since(Some("1d")), Some(86_400));
+        // Bare number defaults to seconds.
+        assert_eq!(parse_since(Some("45")), Some(45));
+        // Whitespace around the suffix is trimmed.
+        assert_eq!(parse_since(Some(" 5m ")), Some(300));
+        // Unparseable: lenient → None (treated as "no filter").
+        assert_eq!(parse_since(Some("abc")), None);
+        assert_eq!(parse_since(Some("10x")), None);
+        assert_eq!(parse_since(Some("-5m")), None);
     }
 }
