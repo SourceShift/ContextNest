@@ -734,6 +734,15 @@ pub async fn list_provenance_pairs(
         let Some(provenance) = meta.get("provenance").and_then(|v| v.as_str()) else {
             continue;
         };
+        // The `provenance` metadata key is overloaded: the grounding
+        // pipeline tags it with one of the five tiers, but the docs/research
+        // ingest path writes a source-document section path into the same
+        // key. Only the five known tiers are grounding signal — anything
+        // else is a foreign value and must not pollute the histogram or the
+        // harvested corpus.
+        if !PROVENANCE_TIERS.contains(&provenance) {
+            continue;
+        }
         let ts_str = meta.get("ts").and_then(|v| v.as_str());
         if let Some(ts) = ts_str {
             if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
@@ -3806,6 +3815,21 @@ mod tests {
             "just an observation",
             &[("kind", json!("state")), ("ts", json!(now))],
         );
+        // Foreign `provenance` value written by the docs/research ingest
+        // path (a source-section path, not a grounding tier) → must be
+        // skipped, never counted, never harvested.
+        put(
+            "f1",
+            "docs section body, not a grounded claim",
+            &[
+                ("kind", json!("doc_section")),
+                (
+                    "provenance",
+                    json!("docs/_meta/architecture/foo.md#1. Overview"),
+                ),
+                ("ts", json!(now)),
+            ],
+        );
         drop(texts);
         drop(meta);
         services
@@ -3833,9 +3857,21 @@ mod tests {
             resp.pairs.iter().all(|p| p.fragment_id != "n1"),
             "untagged fragment must not appear"
         );
+        assert!(
+            resp.pairs.iter().all(|p| p.fragment_id != "f1"),
+            "foreign-provenance fragment must not be harvested"
+        );
 
-        // Histogram always carries all five tiers, zero-filled.
+        // Histogram carries exactly the five known tiers, zero-filled — the
+        // foreign provenance value must not leak in as a sixth key.
         assert_eq!(resp.tier_counts.len(), 5);
+        assert!(
+            resp.tier_counts
+                .keys()
+                .all(|k| PROVENANCE_TIERS.contains(&k.as_str())),
+            "histogram must contain only the five known tiers, got: {:?}",
+            resp.tier_counts.keys().collect::<Vec<_>>()
+        );
         assert_eq!(resp.tier_counts["observed"], 2); // v1 + s1
         assert_eq!(resp.tier_counts["claimed"], 1);
         assert_eq!(resp.tier_counts["contradicted"], 1);
