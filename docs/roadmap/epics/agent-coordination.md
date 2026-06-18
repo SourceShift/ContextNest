@@ -1,7 +1,7 @@
 # Epic — Cross-fleet agent coordination (advisory lease plane)
 
-**Status:** Proposal + Phase 1 MVP in progress. ~6–8 days across 5 phases.
-Each phase independently shippable; no big-bang merge.
+**Status:** Complete — Phases 1–4 shipped (#160, #167); Phase 5 (GLM/dashboard)
+deferred. Each phase landed independently; no big-bang merge.
 
 **Owner:** TBA.
 
