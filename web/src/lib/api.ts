@@ -15,6 +15,7 @@ import type {
   StatsResponse,
   StatusResponse,
   SubstrateConfigResponse,
+  SubstrateHealthResponse,
   TrajectoryResponse,
 } from './types';
 
@@ -68,13 +69,22 @@ export const api = {
     }),
 
   /**
+   * Aggregate substrate runtime health: consolidation progress,
+   * attractor basins, connection-network size, and decay window.
+   * Used by /substrate to make the neural-field runtime auditable.
+   */
+  substrateHealth: () =>
+    request<SubstrateHealthResponse>('/api/v1/substrate/health', {
+      method: 'GET',
+    }),
+
+  /**
    * LLM proxy cache counters. Mirrors `CacheStats` from
    * `src/services/llm_cache.rs` verbatim — total_entries, total_hits,
    * total_misses, hit_rate. Note the path lives under the proxy mount
    * `/llm/v1/...` not `/api/v1/...`. Used by /llm-cache (Ticket #5).
    */
-  llmCacheStats: () =>
-    request<LlmCacheStats>('/llm/v1/cache/stats', { method: 'GET' }),
+  llmCacheStats: () => request<LlmCacheStats>('/llm/v1/cache/stats', { method: 'GET' }),
 
   retrieve: (params: {
     query: string;
@@ -101,10 +111,9 @@ export const api = {
   sessions: () => request<SessionListResponse>('/api/v1/sessions', { method: 'GET' }),
 
   sessionTrajectory: (sessionId: string) =>
-    request<TrajectoryResponse>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/trajectory`,
-      { method: 'GET' },
-    ),
+    request<TrajectoryResponse>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/trajectory`, {
+      method: 'GET',
+    }),
 
   sessionPromptPreview: (sessionId: string) =>
     request<PromptPreviewResponse>(
@@ -116,13 +125,15 @@ export const api = {
 
   stats: () => request<StatsResponse>('/api/v1/stats', { method: 'GET' }),
 
-  fragments: (params: {
-    session_id?: string;
-    project?: string;
-    kind?: string;
-    with_embedding?: boolean;
-    limit?: number;
-  } = {}) => {
+  fragments: (
+    params: {
+      session_id?: string;
+      project?: string;
+      kind?: string;
+      with_embedding?: boolean;
+      limit?: number;
+    } = {},
+  ) => {
     const q = new URLSearchParams();
     if (params.session_id) q.set('session_id', params.session_id);
     if (params.project) q.set('project', params.project);
@@ -130,10 +141,7 @@ export const api = {
     if (params.with_embedding) q.set('with_embedding', 'true');
     if (params.limit) q.set('limit', String(params.limit));
     const qs = q.toString();
-    return request<FragmentsResponse>(
-      `/api/v1/fragments${qs ? `?${qs}` : ''}`,
-      { method: 'GET' },
-    );
+    return request<FragmentsResponse>(`/api/v1/fragments${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
 
   basins: (params: { project?: string; session_id?: string } = {}) => {
@@ -141,24 +149,18 @@ export const api = {
     if (params.project) q.set('project', params.project);
     if (params.session_id) q.set('session_id', params.session_id);
     const qs = q.toString();
-    return request<BasinsResponse>(
-      `/api/v1/field/basins${qs ? `?${qs}` : ''}`,
-      { method: 'GET' },
-    );
+    return request<BasinsResponse>(`/api/v1/field/basins${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
 
-  connections: (
-    params: { session_id?: string; project?: string; limit?: number } = {},
-  ) => {
+  connections: (params: { session_id?: string; project?: string; limit?: number } = {}) => {
     const q = new URLSearchParams();
     if (params.session_id) q.set('session_id', params.session_id);
     if (params.project) q.set('project', params.project);
     if (params.limit) q.set('limit', String(params.limit));
     const qs = q.toString();
-    return request<ConnectionsResponse>(
-      `/api/v1/connections${qs ? `?${qs}` : ''}`,
-      { method: 'GET' },
-    );
+    return request<ConnectionsResponse>(`/api/v1/connections${qs ? `?${qs}` : ''}`, {
+      method: 'GET',
+    });
   },
 
   store: (params: {
@@ -213,10 +215,7 @@ export const api = {
     if (params.since) q.set('since', params.since);
     if (params.layer) q.set('layer', params.layer);
     const qs = q.toString();
-    return request<FeaturesResponse>(
-      `/api/v1/features${qs ? `?${qs}` : ''}`,
-      { method: 'GET' },
-    );
+    return request<FeaturesResponse>(`/api/v1/features${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
 
   /**
@@ -226,10 +225,9 @@ export const api = {
    * Backed by `GET /api/v1/sessions/by-feature?q=<substring>`.
    */
   sessionsByFeature: (q: string) =>
-    request<SessionsByFeatureResponse>(
-      `/api/v1/sessions/by-feature?q=${encodeURIComponent(q)}`,
-      { method: 'GET' },
-    ),
+    request<SessionsByFeatureResponse>(`/api/v1/sessions/by-feature?q=${encodeURIComponent(q)}`, {
+      method: 'GET',
+    }),
 
   /**
    * Substring search across every session's `files_touched` list.
@@ -241,10 +239,9 @@ export const api = {
    * substring not exact.
    */
   sessionsByFile: (q: string) =>
-    request<SessionsByFileResponse>(
-      `/api/v1/sessions/by-file?path=${encodeURIComponent(q)}`,
-      { method: 'GET' },
-    ),
+    request<SessionsByFileResponse>(`/api/v1/sessions/by-file?path=${encodeURIComponent(q)}`, {
+      method: 'GET',
+    }),
 
   /**
    * One-paragraph LLM-generated summary of a session. Cheap to call —
@@ -253,8 +250,7 @@ export const api = {
    * and the session detail page header.
    */
   sessionSummary: (sessionId: string) =>
-    request<SessionSummaryResponse>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/summary`,
-      { method: 'GET' },
-    ),
+    request<SessionSummaryResponse>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/summary`, {
+      method: 'GET',
+    }),
 };

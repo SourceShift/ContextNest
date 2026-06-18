@@ -1322,6 +1322,66 @@ body {
   gap: 16px;
 }
 
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric-card {
+  padding: 14px 16px;
+}
+
+.metric-label {
+  color: var(--ink-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.metric-value {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  margin-top: 8px;
+}
+
+.metric-value span {
+  color: var(--ink-muted);
+  font-size: 14px;
+  margin-left: 2px;
+}
+
+.metric-detail {
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-top: 8px;
+  min-height: 15px;
+}
+
+.inline-error {
+  border: 1px solid var(--urg-now-soft);
+  border-radius: var(--r-card);
+  color: var(--urg-now);
+  font-size: 12px;
+  margin-top: 10px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 960px) {
+  .grid-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .grid-4 {
+    grid-template-columns: 1fr;
+  }
+}
+
 .health-card {
   display: flex;
   align-items: center;
