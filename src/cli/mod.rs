@@ -294,6 +294,39 @@ pub enum IngestSource {
         #[arg(long = "project-path", action = clap::ArgAction::Append)]
         project_paths: Vec<PathBuf>,
     },
+
+    /// Ingest Codex session transcripts from `~/.codex/sessions/`.
+    ///
+    /// Examples:
+    ///   contextnest ingest codex --project mini-ork --since 24h
+    ///   contextnest ingest codex --session-id 019eb19a --dry-run
+    ///   contextnest ingest codex --substrate http://localhost:28080
+    #[command(name = "codex")]
+    Codex {
+        /// Substring-match the recovered project cwd (case-insensitive).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Specific Codex session id (or first-N-chars prefix).
+        #[arg(long)]
+        session_id: Option<String>,
+
+        /// Only sessions modified within this duration. Format: `<n>{s,m,h,d,w}`.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Print records to stdout instead of POSTing. No network calls.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Substrate base URL. Default: `http://localhost:8080`.
+        #[arg(long, default_value = "http://localhost:8080")]
+        substrate: String,
+
+        /// Override the discovery root. Default: `~/.codex/sessions/`.
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+    },
 }
 
 /// CLI execution result

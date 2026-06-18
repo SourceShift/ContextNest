@@ -221,6 +221,63 @@ impl MemoryRecord {
     }
 }
 
+fn user_prompt_text(ev: &RawEvent) -> Option<&str> {
+    if ev.event_type == "user" {
+        let msg = ev.message.as_ref()?;
+        return msg.content.as_str().filter(|s| !s.is_empty());
+    }
+
+    let payload = ev.extra.get("payload")?;
+    if ev.event_type != "response_item"
+        || payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    codex_message_text(payload, &["input_text", "text"])
+}
+
+fn assistant_content_parts(ev: &RawEvent) -> Vec<&Value> {
+    if ev.event_type == "assistant" {
+        return ev
+            .message
+            .as_ref()
+            .and_then(|msg| msg.content.as_array())
+            .map(|parts| parts.iter().collect())
+            .unwrap_or_default();
+    }
+
+    let Some(payload) = ev.extra.get("payload") else {
+        return Vec::new();
+    };
+    if ev.event_type != "response_item"
+        || payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return Vec::new();
+    }
+
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| parts.iter().collect())
+        .unwrap_or_default()
+}
+
+fn codex_message_text<'a>(payload: &'a Value, allowed_types: &[&str]) -> Option<&'a str> {
+    let parts = payload.get("content").and_then(Value::as_array)?;
+    parts.iter().find_map(|part| {
+        let part_type = part.get("type").and_then(Value::as_str)?;
+        if allowed_types.contains(&part_type) {
+            part.get("text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    })
+}
+
 /// Extract every memory worth storing from a parsed session's event stream.
 ///
 /// `session_uuid` is the full Claude Code session UUID. `project_cwd` is
@@ -253,12 +310,7 @@ pub fn extract_memories(
     // 2. initial_prompt_window — concatenate first 3 user messages.
     let initial_prompts: Vec<(&str, Option<&str>)> = events
         .iter()
-        .filter(|e| e.event_type == "user")
-        .filter_map(|e| {
-            let msg = e.message.as_ref()?;
-            let text = msg.content.as_str()?;
-            Some((text, e.timestamp.as_deref()))
-        })
+        .filter_map(|e| user_prompt_text(e).map(|text| (text, e.timestamp.as_deref())))
         .take(3)
         .collect();
     if !initial_prompts.is_empty() {
@@ -327,13 +379,10 @@ pub fn extract_memories(
     let file_index = build_tool_file_index(events);
 
     for ev in events {
-        if ev.event_type != "assistant" {
+        let parts = assistant_content_parts(ev);
+        if parts.is_empty() {
             continue;
         }
-        let Some(msg) = &ev.message else { continue };
-        let Some(parts) = msg.content.as_array() else {
-            continue;
-        };
         for part in parts {
             let part_type = part.get("type").and_then(Value::as_str);
 
@@ -365,7 +414,7 @@ pub fn extract_memories(
 
             // Branch 2 — text part: existing z-insight extraction +
             // (new) delivered_features extraction.
-            if part_type != Some("text") {
+            if !matches!(part_type, Some("text") | Some("output_text")) {
                 continue;
             }
             let Some(text) = part.get("text").and_then(Value::as_str) else {
@@ -1713,6 +1762,7 @@ fn annotate_session_meta(
 
 #[cfg(test)]
 mod tests {
+    use super::super::event::parse_session_string;
     use super::*;
 
     fn ev_assistant_with_text(text: &str, ts: &str) -> RawEvent {
@@ -2324,6 +2374,68 @@ mod tests {
         let p = prompt.unwrap();
         assert!(p.text.contains("first thing"));
         assert!(p.text.contains("second thing"));
+    }
+
+    #[test]
+    fn extracts_zinsight_from_codex_response_item() {
+        let z_block = r#"<z-insight>
+{
+  "domain":"tooling",
+  "goal":"Fix Codex z-insight ingestion",
+  "progress":"done",
+  "topics":["codex-transcripts","z-insight"],
+  "top_jobs":["Normalized Codex assistant output_text messages"],
+  "current_state":"Codex final answers now feed the existing extractor",
+  "facts":["Codex stores final assistant text under response_item payload content output_text"],
+  "tasks":[
+    {"id":"codex-ingest","subject":"Ingest Codex z-insights","status":"completed"}
+  ],
+  "requires_user_action":[],
+  "delivered_features":[
+    {"feature":"Codex z-insight ingest","layer":"backend","files":["src/ingest/claude_code/extractor.rs"]}
+  ]
+}
+</z-insight>"#;
+        let line = format!(
+            r#"{{"timestamp":"2026-06-11T08:05:00.000Z","type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":{}}}],"phase":"final_answer"}}}}"#,
+            serde_json::to_string(z_block).unwrap()
+        );
+        let (events, _) = parse_session_string(&line);
+        let recs = extract_memories(&events, "codex-session", "/work/codex");
+
+        assert!(recs.iter().any(|r| {
+            r.kind == MemoryKind::Accomplishment
+                && r.text == "Normalized Codex assistant output_text messages"
+        }));
+        assert!(recs.iter().any(|r| {
+            r.kind == MemoryKind::Learning
+                && r.text.contains("response_item payload content output_text")
+        }));
+        assert!(recs.iter().any(|r| {
+            r.kind == MemoryKind::Todo
+                && r.metadata.get("task_id").and_then(Value::as_str) == Some("codex-ingest")
+                && r.metadata.get("task_status").and_then(Value::as_str) == Some("completed")
+        }));
+        assert!(recs.iter().any(|r| {
+            r.kind == MemoryKind::Domain
+                && r.text == "tooling"
+                && r.metadata.get("progress").and_then(Value::as_str) == Some("done")
+        }));
+        assert!(recs
+            .iter()
+            .any(|r| { r.kind == MemoryKind::Feature && r.text == "Codex z-insight ingest" }));
+    }
+
+    #[test]
+    fn codex_user_response_item_seeds_initial_prompt() {
+        let line = r#"{"timestamp":"2026-06-11T08:04:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"why are z-insights missing?"}]}}"#;
+        let (events, _) = parse_session_string(line);
+        let recs = extract_memories(&events, "codex-user-session", "/work/codex");
+        let prompt = recs
+            .iter()
+            .find(|r| r.kind == MemoryKind::InitialPromptWindow)
+            .expect("initial prompt from Codex user item");
+        assert!(prompt.text.contains("why are z-insights missing?"));
     }
 
     #[test]
