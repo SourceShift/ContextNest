@@ -145,7 +145,7 @@ cn-help:
 	@echo "  make cn-watch           — auto-rebuild + restart on .rs changes (needs cargo-watch)"
 	@echo "  make cn-ingest          — backfill Claude Code sessions; vars: SINCE PROJECT"
 	@echo "                              e.g. make cn-ingest SINCE=7d PROJECT=researcher"
-	@echo "  make cn-curl-health     — quick liveness check against the running server"
+	@echo "  make cn-curl-health     — substrate health snapshot against the running server"
 	@echo "  make cn-curl-inbox      — dump current /api/v1/inbox contents"
 	@echo "  make cn-wal-clear       — DELETE $(CN_WAL) (next serve starts fresh)"
 	@echo
@@ -223,7 +223,7 @@ cn-watch: ## Auto-rebuild + restart on .rs file changes (requires cargo-watch). 
 	  -x 'run --profile fast --bin contextnest -- serve --bind $(CN_BIND)'
 
 cn-curl-health:
-	@curl -fsS $(CN_SUBSTRATE)/api/health | head -c 500; echo
+	@curl -fsS $(CN_SUBSTRATE)/api/v1/substrate/health | head -c 1000; echo
 
 cn-curl-inbox:
 	@curl -fsS $(CN_SUBSTRATE)/api/v1/inbox | head -c 1000; echo

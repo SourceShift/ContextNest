@@ -26,7 +26,6 @@ referenced epic spec is approved and tracked through CHANGELOG.
   Four trajectory-card upgrades (basin badge, resonance strip, promotion
   clusters, heat-weighted sort) each grounded in a named substrate
   primitive from `docs/architecture.md`.
-
 ## Recently shipped
 
 Concrete code now in `main`. Listed here so contributors can see what
@@ -65,6 +64,14 @@ the substrate currently exposes without re-reading the commit log.
   I miss while away`), and `/inbox` (`What needs my attention`, grouped
   by urgency). Each has a matching MCP tool parameter and a `contextnest
   <verb> [--markdown|--json]` CLI flag. See "Prose-shaped views" below.
+- **Neural-field substrate runtime reconciliation** — the
+  [`epics/neural-field-real.md`](epics/neural-field-real.md) roadmap is
+  complete in code. The runtime now has a background consolidation worker,
+  decay/recency scoring, real attractor basins at `/field/basins`,
+  basin and connection-aware retrieval expansion, chain-query
+  auto-reconstruction, `/api/v1/substrate/health`, and the
+  `make cn-curl-health` operator shortcut. The grep-verification recipe
+  lives in [`../architecture-honest.md`](../architecture-honest.md).
 
 ## Prose-shaped views convention
 
