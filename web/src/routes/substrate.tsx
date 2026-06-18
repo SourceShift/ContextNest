@@ -33,6 +33,10 @@ const KIND_COLOR: Record<string, string> = {
 function SubstratePage() {
   const health = useQuery({ queryKey: ['health'], queryFn: () => api.health() });
   const status = useQuery({ queryKey: ['status'], queryFn: () => api.status() });
+  const substrateHealth = useQuery({
+    queryKey: ['substrate-health'],
+    queryFn: () => api.substrateHealth(),
+  });
   const stats = useStats();
 
   const down = health.isError || (!health.isLoading && !health.data?.healthy);
@@ -116,6 +120,56 @@ function SubstratePage() {
           </div>
         </div>
       </div>
+
+      <div className="section-h">
+        <h3>Runtime substrate</h3>
+        <span className="hint">GET /api/v1/substrate/health</span>
+      </div>
+      <div className="grid-4">
+        <HealthMetric
+          label="fragments"
+          value={substrateHealth.data?.fragments.total}
+          detail={
+            substrateHealth.data
+              ? `${substrateHealth.data.fragments.consolidated.toLocaleString()} consolidated · ${substrateHealth.data.fragments.lag.toLocaleString()} lag`
+              : 'loading'
+          }
+        />
+        <HealthMetric
+          label="basins"
+          value={substrateHealth.data?.basins.count}
+          detail={
+            substrateHealth.data
+              ? `avg mass ${formatFixed(substrateHealth.data.basins.avg_mass)} · max ${substrateHealth.data.basins.max_mass.toLocaleString()}`
+              : 'loading'
+          }
+        />
+        <HealthMetric
+          label="connections"
+          value={substrateHealth.data?.connections.edges}
+          detail={
+            substrateHealth.data
+              ? `${substrateHealth.data.connections.nodes.toLocaleString()} nodes · degree ${formatFixed(substrateHealth.data.connections.avg_degree)}`
+              : 'loading'
+          }
+        />
+        <HealthMetric
+          label="decay"
+          value={substrateHealth.data?.decay.half_life_days}
+          suffix="d"
+          detail={
+            substrateHealth.data
+              ? `median age ${formatFixed(substrateHealth.data.decay.median_fragment_age_days)}d`
+              : 'loading'
+          }
+        />
+      </div>
+      {substrateHealth.isError ? (
+        <div className="inline-error">
+          Substrate health snapshot unavailable. Check the backend route
+          <span className="mono"> /api/v1/substrate/health</span>.
+        </div>
+      ) : null}
 
       <div className="section-h">
         <h3>Fragments by kind</h3>
@@ -204,14 +258,43 @@ function SubstratePage() {
           <div className="empty-title">No activity log yet</div>
           <div className="empty-sub">
             Per-operation timing isn't tracked server-side in v0.1. Check
-            <span className="mono"> ~/.contextnest/wal.jsonl</span> for the append-only history
-            of every successful store, or watch the server stdout for the
+            <span className="mono"> ~/.contextnest/wal.jsonl</span> for the append-only history of
+            every successful store, or watch the server stdout for the
             <span className="mono"> Request completed</span> tracing lines.
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+function HealthMetric({
+  label,
+  value,
+  suffix = '',
+  detail,
+}: {
+  label: string;
+  value: number | undefined;
+  suffix?: string;
+  detail: string;
+}) {
+  return (
+    <div className="card metric-card">
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">
+        {value === undefined ? '...' : value.toLocaleString()}
+        {value !== undefined && suffix ? <span>{suffix}</span> : null}
+      </div>
+      <div className="metric-detail">{detail}</div>
+    </div>
+  );
+}
+
+function formatFixed(value: number) {
+  return value.toLocaleString(undefined, {
+    maximumFractionDigits: 1,
+  });
 }
 
 function HookRow({ event, url, wired }: { event: string; url: string; wired: boolean }) {

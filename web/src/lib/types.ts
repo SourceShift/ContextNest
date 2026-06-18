@@ -96,6 +96,31 @@ export type SubstrateConfigResponse = {
   };
 };
 
+/** Body of `GET /api/v1/substrate/health` — operator snapshot for
+ * the neural-field runtime path: consolidation lag, attractor basins,
+ * connection-network shape, and retrieve decay settings. */
+export type SubstrateHealthResponse = {
+  fragments: {
+    total: number;
+    consolidated: number;
+    lag: number;
+  };
+  basins: {
+    count: number;
+    avg_mass: number;
+    max_mass: number;
+  };
+  connections: {
+    edges: number;
+    nodes: number;
+    avg_degree: number;
+  };
+  decay: {
+    half_life_days: number;
+    median_fragment_age_days: number;
+  };
+};
+
 /** Body of `GET /llm/v1/cache/stats` — LLM proxy cache counters.
  * Used by /llm-cache dashboard page (Ticket #5) to answer
  * "is the cache actually saving us money?". Field names mirror
