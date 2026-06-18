@@ -13,8 +13,8 @@ use contextnest::cli::{Cli, Commands, IngestSource, McpCommands, PromptContextCo
 use contextnest::config::Config;
 use contextnest::inbox::{render_json, render_markdown, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
-    discover_sessions, ingest_session_file, parse_since, redactor::Redactor, sink::RedactingSink,
-    DryRunSink, HttpSink, Sink, SinkReport,
+    discover_codex_sessions, discover_sessions, ingest_session_file, parse_since,
+    redactor::Redactor, sink::RedactingSink, DryRunSink, HttpSink, Sink, SinkReport,
 };
 use contextnest::services::ContextNestServices;
 use serde_json::{json, Value};
@@ -392,6 +392,14 @@ async fn ingest(source: IngestSource) -> Result<(), Box<dyn std::error::Error>> 
             }
             ingest_claude_code(project, session_id, since, dry_run, substrate, projects_dir).await
         }
+        IngestSource::Codex {
+            project,
+            session_id,
+            since,
+            dry_run,
+            substrate,
+            sessions_dir,
+        } => ingest_codex(project, session_id, since, dry_run, substrate, sessions_dir).await,
     }
 }
 
@@ -723,6 +731,113 @@ async fn ingest_claude_code(
     Ok(())
 }
 
+/// Walk `~/.codex/sessions/`, filter by the user's flags, push memories
+/// from matching Codex transcripts to the chosen sink.
+async fn ingest_codex(
+    project: Option<String>,
+    session_id: Option<String>,
+    since: Option<String>,
+    dry_run: bool,
+    substrate: String,
+    sessions_dir: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sessions_root = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
+    if !sessions_root.exists() {
+        return Err(format!(
+            "Codex sessions directory not found: {}",
+            sessions_root.display()
+        )
+        .into());
+    }
+
+    let since_cutoff = match since.as_deref() {
+        None => None,
+        Some(s) => match parse_since(s) {
+            Some(dur) => Some(SystemTime::now() - dur),
+            None => {
+                return Err(format!(
+                    "Invalid --since value '{}'. Use a number + unit, e.g. '7d', '24h', '30m'.",
+                    s
+                )
+                .into());
+            }
+        },
+    };
+
+    let sessions = if let Some(uuid_filter) = session_id.as_deref() {
+        let all = discover_codex_sessions(&sessions_root, None, None)?;
+        let want = uuid_filter.to_lowercase();
+        all.into_iter()
+            .filter(|s| s.session_uuid.to_lowercase().contains(&want))
+            .collect()
+    } else {
+        discover_codex_sessions(&sessions_root, project.as_deref(), since_cutoff)?
+    };
+
+    if sessions.is_empty() {
+        println!(
+            "No matching Codex sessions in {}. (project={:?}, since={:?}, session_id={:?})",
+            sessions_root.display(),
+            project,
+            since,
+            session_id
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Discovered {} Codex session(s) under {}",
+        sessions.len(),
+        sessions_root.display()
+    );
+    for s in &sessions {
+        let mb = s.size_bytes as f64 / 1_048_576.0;
+        println!(
+            "  • {}  ({:.2} MB)  project: {}",
+            s.session_uuid, mb, s.project_cwd
+        );
+    }
+    println!();
+
+    let redactor_config = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".contextnest")
+        .join("redact.toml");
+    let redactor = Redactor::from_config(&redactor_config);
+
+    if dry_run {
+        let dry = DryRunSink::new();
+        let sink = RedactingSink::new(dry, redactor);
+        let total = process_sessions(&sessions, &sink).await?;
+        let skipped = sink.skipped_count();
+        report_summary(total, &std::collections::HashMap::new(), true);
+        if skipped > 0 {
+            println!(
+                "  Privacy filter: {} record{} dropped (>75% redacted)",
+                skipped,
+                if skipped == 1 { "" } else { "s" }
+            );
+        }
+    } else {
+        let http = HttpSink::new(&substrate);
+        let sink = RedactingSink::new(http, redactor);
+        println!("Pushing to substrate at {}", substrate);
+        let total = process_sessions(&sessions, &sink).await?;
+        let skipped = sink.skipped_count();
+        report_summary(total, &std::collections::HashMap::new(), false);
+        if skipped > 0 {
+            println!(
+                "  Privacy filter: {} record{} dropped (>75% redacted)",
+                skipped,
+                if skipped == 1 { "" } else { "s" }
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Run `ingest_session_file` over a list of sessions and aggregate the
 /// reports. Errors on individual sessions are logged and counted; we
 /// don't abort the whole batch.
@@ -793,6 +908,13 @@ fn default_projects_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".claude").join("projects")
+}
+
+fn default_codex_sessions_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex").join("sessions")
 }
 
 /// Start the HTTP server (seven-tool memory API + health/status).

@@ -91,10 +91,16 @@ pub fn parse_session_string(content: &str) -> (Vec<RawEvent>, SessionMetadata) {
         match serde_json::from_str::<RawEvent>(line) {
             Ok(ev) => {
                 if metadata.session_uuid.is_none() {
-                    metadata.session_uuid.clone_from(&ev.session_id);
+                    metadata.session_uuid = ev
+                        .session_id
+                        .clone()
+                        .or_else(|| codex_payload_str(&ev, "id").map(str::to_string));
                 }
                 if metadata.cwd.is_none() {
-                    metadata.cwd.clone_from(&ev.cwd);
+                    metadata.cwd = ev
+                        .cwd
+                        .clone()
+                        .or_else(|| codex_payload_str(&ev, "cwd").map(str::to_string));
                 }
                 if metadata.first_timestamp.is_none() {
                     metadata.first_timestamp.clone_from(&ev.timestamp);
@@ -115,6 +121,14 @@ pub fn parse_session_string(content: &str) -> (Vec<RawEvent>, SessionMetadata) {
     }
 
     (events, metadata)
+}
+
+fn codex_payload_str<'a>(ev: &'a RawEvent, key: &str) -> Option<&'a str> {
+    ev.extra
+        .get("payload")
+        .and_then(|payload| payload.get(key))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 /// Extract every `<z-insight>{...}</z-insight>` block from an assistant
@@ -223,6 +237,26 @@ mod tests {
             Some("2026-01-01T00:00:00Z")
         );
         assert_eq!(meta.ai_title.as_deref(), Some("my title"));
+    }
+
+    #[test]
+    fn parse_session_string_recovers_codex_session_meta() {
+        let content = concat!(
+            r#"{"timestamp":"2026-06-11T08:00:00.000Z","type":"session_meta","payload":{"id":"019eb19a-2774-7172-884c-394ac6495ea4","cwd":"/Volumes/docker-ssd/ps/mini-ork"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-06-11T08:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+        );
+        let (events, meta) = parse_session_string(content);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            meta.session_uuid.as_deref(),
+            Some("019eb19a-2774-7172-884c-394ac6495ea4")
+        );
+        assert_eq!(meta.cwd.as_deref(), Some("/Volumes/docker-ssd/ps/mini-ork"));
+        assert_eq!(
+            meta.first_timestamp.as_deref(),
+            Some("2026-06-11T08:00:00.000Z")
+        );
     }
 
     #[test]

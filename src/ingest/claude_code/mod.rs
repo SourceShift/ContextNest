@@ -161,6 +161,99 @@ pub fn discover_sessions(
     Ok(out)
 }
 
+/// Walk a Codex sessions directory (typically `~/.codex/sessions/`) and
+/// return every `.jsonl` transcript it finds.
+///
+/// Codex stores sessions under date directories (`YYYY/MM/DD`) rather
+/// than per-project encoded cwd directories, so discovery parses each
+/// transcript's `session_meta` event to recover the canonical session id
+/// and cwd. `project_filter` is matched against that recovered cwd.
+pub fn discover_codex_sessions(
+    sessions_dir: &Path,
+    project_filter: Option<&str>,
+    since: Option<SystemTime>,
+) -> ContextNestResult<Vec<DiscoveredSession>> {
+    let project_filter_lc = project_filter.map(|s| s.to_lowercase());
+    let mut out = Vec::new();
+    discover_codex_sessions_inner(sessions_dir, &project_filter_lc, since, &mut out)?;
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(out)
+}
+
+fn discover_codex_sessions_inner(
+    dir: &Path,
+    project_filter_lc: &Option<String>,
+    since: Option<SystemTime>,
+    out: &mut Vec<DiscoveredSession>,
+) -> ContextNestResult<()> {
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        ContextNestError::Api(format!(
+            "discover_codex_sessions: cannot read dir {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_codex_sessions_inner(&path, project_filter_lc, since, out)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let ext_ok = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x == "jsonl")
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = metadata.modified().ok();
+        if let Some(since_t) = since {
+            if let Some(mt) = modified {
+                if mt < since_t {
+                    continue;
+                }
+            }
+        }
+
+        let (_events, session_meta) = match parse_session_file(&path) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let project_cwd = session_meta.cwd.unwrap_or_default();
+        if let Some(filter) = project_filter_lc {
+            if !project_cwd.to_lowercase().contains(filter) {
+                continue;
+            }
+        }
+        let session_uuid = session_meta.session_uuid.unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string()
+        });
+
+        out.push(DiscoveredSession {
+            jsonl_path: path,
+            project_cwd,
+            session_uuid,
+            modified,
+            size_bytes: metadata.len(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Read one `.jsonl`, extract memories, push them via the given sink.
 ///
 /// Equivalent to [`ingest_session_file_with_embedder`] with no embedder —

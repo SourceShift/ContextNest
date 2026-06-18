@@ -165,16 +165,30 @@ impl SessionTracker {
 /// can add fields without breaking us.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookPayload {
-    #[serde(default)]
+    #[serde(default, alias = "sessionId")]
     pub session_id: String,
     #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "agent_transcript_path", alias = "transcript")]
     pub transcript_path: Option<PathBuf>,
     #[serde(default)]
     pub hook_event_name: Option<String>,
     #[serde(flatten, default)]
     pub extra: HashMap<String, Value>,
+}
+
+impl HookPayload {
+    fn tracker_session_id(&self) -> String {
+        if !self.session_id.is_empty() {
+            return self.session_id.clone();
+        }
+        self.transcript_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    }
 }
 
 /// Build the cc-hooks router. Expects the wrapping app to
@@ -200,7 +214,7 @@ async fn dispatch(
 ) -> StatusCode {
     match event.as_str() {
         "session_start" => {
-            let sid = payload.session_id.clone();
+            let sid = payload.tracker_session_id();
             tokio::spawn(async move {
                 tracker.set(&sid, 0).await;
             });
@@ -440,7 +454,8 @@ async fn tail_and_ingest(
     };
     let total_len = bytes.len() as u64;
 
-    let last_offset = tracker.get(&payload.session_id).await;
+    let tracker_session_id = payload.tracker_session_id();
+    let last_offset = tracker.get(&tracker_session_id).await;
 
     // Two interesting cases when `total_len < last_offset`:
     //
@@ -461,13 +476,13 @@ async fn tail_and_ingest(
     //    grown; nothing to do.
     if total_len < last_offset {
         tracing::warn!(
-            session_id = %payload.session_id,
+            session_id = %tracker_session_id,
             path = %transcript_path.display(),
             old_offset = last_offset,
             new_len = total_len,
             "cc_hooks: transcript shrank (likely truncation or /clear); resetting offset to 0",
         );
-        tracker.set(&payload.session_id, 0).await;
+        tracker.set(&tracker_session_id, 0).await;
         // Fall through with last_offset effectively reset; the
         // alignment block below treats 0 as "start of file".
     } else if total_len == last_offset {
@@ -504,11 +519,18 @@ async fn tail_and_ingest(
     let (events, metadata) = parse_session_string(chunk);
     if events.is_empty() {
         // Bump the offset so we don't keep re-reading the same chunk.
-        tracker.set(&payload.session_id, total_len).await;
+        tracker.set(&tracker_session_id, total_len).await;
         return Ok(());
     }
 
-    let session_uuid = payload.session_id.as_str();
+    let session_uuid = if !payload.session_id.is_empty() {
+        payload.session_id.as_str()
+    } else {
+        metadata
+            .session_uuid
+            .as_deref()
+            .unwrap_or(tracker_session_id.as_str())
+    };
     let project_cwd = payload
         .cwd
         .as_deref()
@@ -544,7 +566,7 @@ async fn tail_and_ingest(
     // (Claude killed mid-curl, session abandoned, server restart, etc).
     tracker
         .record(
-            &payload.session_id,
+            &tracker_session_id,
             total_len,
             Some(transcript_path.clone()),
             payload
