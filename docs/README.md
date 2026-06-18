@@ -20,8 +20,8 @@ Curated entry points for understanding and using ContextNest.
 ## Where this is going
 
 - [**roadmap/**](roadmap/) — forward-looking design + sequencing. Strategic
-  five-milestone plan (v0.2 → v1.0) plus concrete spec for the next
-  milestone (v0.3 self-caching LLM proxy).
+  five-milestone plan (v0.2 → v1.0), shipped neural-field/runtime
+  reconciliation notes, and concrete specs for upcoming milestones.
 
 ## Repository docs
 

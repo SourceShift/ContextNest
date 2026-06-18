@@ -1,13 +1,30 @@
 # Epic — Make the Neural-Field Substrate Real
 
-**Status:** Proposal. ~2-3 weeks engineering across 7 PRs. Each phase
-independently shippable; no big-bang merge.
+**Status:** Shipped. The seven-phase runtime reconciliation is complete
+in `main`; see `docs/architecture-honest.md` for the grep-auditable
+runtime model and verification recipe.
 
 **Owner:** TBA.
 
-**Last updated:** 2026-05-21.
+**Last updated:** 2026-06-08.
+
+## Shipped evidence
+
+| Phase | Runtime surface | Verification |
+|---|---|---|
+| Phase 1 — background consolidation | `src/services/consolidation.rs`, `GET /api/v1/substrate/consolidation` | `tests/consolidation_worker_test.rs` |
+| Phase 2 — decay at retrieve time | `src/api/tools.rs::decay_multiplier`, `last_accessed` writeback | `tests/retrieve_decay_test.rs` |
+| Phase 3 — real field basins | `GET /api/v1/field/basins` with `source: "attractor"` once consolidated | `tests/field_basins_real_test.rs` |
+| Phase 4 — basin-aware retrieve | `src/api/tools.rs::basin_aware_expand` | `tests/retrieve_basin_expansion_test.rs` |
+| Phase 5 — connection-aware retrieve | `src/api/tools.rs::connection_aware_expand` | `tests/retrieve_connection_expansion_test.rs` |
+| Phase 6 — auto reconstruction | chain query detection + `reconstruction` on retrieve responses | `tests/retrieve_auto_reconstruct_test.rs` |
+| Phase 7 — substrate health | `GET /api/v1/substrate/health`, `make cn-curl-health`, dashboard health stats | `tests/substrate_health_test.rs` |
 
 ## The honest problem
+
+This section records the original pre-epic baseline. It is retained so
+future contributors can understand why the reconciliation work mattered;
+the shipped runtime is summarized above and in `docs/architecture-honest.md`.
 
 ContextNest's tagline — *"neural-field attractor memory substrate"* —
 describes the codebase's *aspiration*, not its *runtime behavior*.
@@ -108,15 +125,15 @@ and ConnectionNetwork insertion without blocking ingest.
 
 **Acceptance criteria:**
 
-- [ ] After server restart with N=25k WAL records, worker
+- [x] After server restart with N=25k WAL records, worker
       consolidates 100% within 30 minutes (or shorter on local
       embedder).
-- [ ] Basin count climbs as work progresses; visible at the new
+- [x] Basin count climbs as work progresses; visible at the new
       observability endpoint.
-- [ ] ServicesSink (live cc_hooks) writes a fragment id into the
+- [x] ServicesSink (live cc_hooks) writes a fragment id into the
       worker's queue immediately, but does not block on its
       processing.
-- [ ] Restart mid-consolidation → resume from watermark, no
+- [x] Restart mid-consolidation → resume from watermark, no
       duplicate work.
 
 **Files touched (estimate):**
@@ -154,11 +171,11 @@ forgets stale stuff" promise becomes real.
 
 **Acceptance criteria:**
 
-- [ ] A 90-day-old fragment with same content as a 1-day-old
+- [x] A 90-day-old fragment with same content as a 1-day-old
       fragment scores ~70% of the new one.
-- [ ] Retrieving a fragment bumps its `last_accessed`; next
+- [x] Retrieving a fragment bumps its `last_accessed`; next
       retrieve gives it a boost.
-- [ ] Test: store fragment with `ts = 100 days ago`, retrieve
+- [x] Test: store fragment with `ts = 100 days ago`, retrieve
       with query that matches → similarity in response is
       explicitly lower than for an identical fragment with
       `ts = today`.
@@ -191,12 +208,12 @@ populated them).
 
 **Acceptance criteria:**
 
-- [ ] After Phase 1 has consolidated some fragments, the
+- [x] After Phase 1 has consolidated some fragments, the
       `/field` viz shows basin halos whose positions are the
       learned centroids, not project means.
-- [ ] Basins that merge (Phase 1's merge_with logic) reflect that
+- [x] Basins that merge (Phase 1's merge_with logic) reflect that
       in the next field refresh.
-- [ ] Sidebar count for the Phases nav shows real basin count.
+- [x] Sidebar count for the Phases nav shows real basin count.
 
 **Files touched (estimate):**
 `src/api/field.rs`, `web/src/routes/field.tsx` (handle new fields).
@@ -222,11 +239,11 @@ basin-siblings (cluster reinforcement).
 
 **Acceptance criteria:**
 
-- [ ] Query that matches a single fragment in a 20-member basin
+- [x] Query that matches a single fragment in a 20-member basin
       now returns multiple basin members in the top-K.
-- [ ] Query that matches across multiple basins still surfaces
+- [x] Query that matches across multiple basins still surfaces
       diverse hits, not just one cluster.
-- [ ] Variance ratio in `/field`'s PCA improves (fewer outliers
+- [x] Variance ratio in `/field`'s PCA improves (fewer outliers
       because basins have stronger cohesion in returned sets).
 
 **Files touched (estimate):**
@@ -249,11 +266,11 @@ expansion). This is co-retrieval resonance applied at retrieve time.
 
 **Acceptance criteria:**
 
-- [ ] Hover-neighbor highlighting in `/field` (the existing
+- [x] Hover-neighbor highlighting in `/field` (the existing
       cosine-nearest-5 interaction) gains a complementary
       "connection-nearest" mode showing learned graph adjacency
       instead of pure embedding similarity.
-- [ ] /retrieve returns 1-hop neighbors of the top hit when they
+- [x] /retrieve returns 1-hop neighbors of the top hit when they
       exceed an edge-weight threshold.
 
 **Files touched (estimate):**
@@ -280,9 +297,9 @@ and becomes part of retrieve when the query asks for a chain.
 
 **Acceptance criteria:**
 
-- [ ] Query "what was the context around the auth decision" returns
+- [x] Query "what was the context around the auth decision" returns
       both regular hits AND a chain reconstruction in the response.
-- [ ] Chain reconstruction visibly orders the contributing
+- [x] Chain reconstruction visibly orders the contributing
       fragments by their position in the inferred sequence.
 
 **Files touched (estimate):**
@@ -319,11 +336,11 @@ documentation to match.
 
 **Acceptance criteria:**
 
-- [ ] `make cn-curl-health` (a new Makefile target) returns the
+- [x] `make cn-curl-health` returns the
       full substrate health snapshot.
-- [ ] README's tagline survives a grep audit — every claim is
+- [x] README's tagline survives a grep audit — every claim is
       reachable from an HTTP entry point.
-- [ ] Dashboard substrate page shows live basin/connection/decay
+- [x] Dashboard substrate page shows live basin/connection/decay
       stats so operators can see the substrate consolidating.
 
 **Files touched (estimate):**
