@@ -673,18 +673,37 @@ impl AttractorBasinManager {
     ) -> Option<(String, f32)> {
         let basins = self.basins.read().await;
 
+        // Nearest-basin scan is O(basins) per fragment (95k+ basins on the
+        // live substrate), the single largest consolidation-worker CPU cost.
+        // Two exact optimisations — identical result, no recall loss:
+        //   1. Compare *squared* distance, deferring the sqrt to the single
+        //      winner. sqrt over 768 dims per basin dominated the loop.
+        //   2. Early-exit the per-dim accumulation once it exceeds the best
+        //      squared distance so far. For normalised 768-d embeddings most
+        //      basins are far and bail out after a handful of dims.
         let mut nearest_id = None;
-        let mut min_distance = f32::INFINITY;
+        let mut min_sq = f32::INFINITY;
 
         for (id, basin) in basins.iter() {
-            let distance = utils::euclidean_distance(position, &basin.center);
-            if distance < min_distance {
-                min_distance = distance;
+            let center = &basin.center;
+            if center.len() != position.len() {
+                continue; // parity with euclidean_distance's mismatch guard
+            }
+            let mut sq = 0.0f32;
+            for (x, y) in position.iter().zip(center.iter()) {
+                let d = x - y;
+                sq += d * d;
+                if sq >= min_sq {
+                    break; // can't beat the current best; stop early
+                }
+            }
+            if sq < min_sq {
+                min_sq = sq;
                 nearest_id = Some(id.clone());
             }
         }
 
-        nearest_id.map(|id| (id, min_distance))
+        nearest_id.map(|id| (id, min_sq.sqrt()))
     }
 
     /// Converge a position to the nearest attractor basin
