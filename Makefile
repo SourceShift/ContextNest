@@ -130,7 +130,7 @@ SINCE         ?= 7d
 PROJECT       ?=
 
 .PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev \
-        cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config
+        cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config
 
 cn-help:
 	@echo "ContextNest substrate targets"
@@ -141,6 +141,7 @@ cn-help:
 	@echo "  make cn-test            — cargo test --tests (full integration suite)"
 	@echo "  make cn-lint            — cargo clippy --tests (correctness gate)"
 	@echo "  make cn-serve           — run the release binary, WAL on, config.toml loaded"
+	@echo "  make cn-redeploy        — rebuild release + restart cn-serve (deploys a code change)"
 	@echo "  make cn-serve-dev       — cargo run --profile fast (auto-rebuilds, target/fast/)"
 	@echo "  make cn-watch           — auto-rebuild + restart on .rs changes (needs cargo-watch)"
 	@echo "  make cn-ingest          — backfill Claude Code sessions; vars: SINCE PROJECT"
@@ -189,6 +190,17 @@ cn-serve: $(CN_BIN)
 	fi
 	mkdir -p $(dir $(CN_WAL))
 	CONTEXTNEST_WAL_PATH=$(CN_WAL) $(CN_BIN) serve --bind $(CN_BIND)
+
+# Deploy a code change to the running substrate: rebuild the release binary,
+# stop the instance currently bound to CN_BIND, then start the fresh one.
+# The stop step is why this exists as its own target — `cn-serve` alone would
+# fail to bind while the old process still holds the port. Foreground, so it
+# blocks the terminal like `cn-serve` does.
+cn-redeploy: ## Rebuild release + restart cn-serve (stops the running instance first).
+	cargo build --release
+	@echo "stopping running contextnest on $(CN_BIND) (if any)…"
+	-@pkill -f 'contextnest serve' 2>/dev/null; sleep 1
+	$(MAKE) cn-serve
 
 cn-ingest: $(CN_BIN)
 	$(CN_BIN) ingest claude-code \
