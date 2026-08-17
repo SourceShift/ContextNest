@@ -886,16 +886,24 @@ impl MemoryGraph {
 
     fn update_metrics(&mut self) {
         self.metrics.total_nodes = self.nodes.len();
-        self.metrics.total_edges = self.edges.values().map(|edges| edges.len()).sum();
 
-        // Calculate average degree
+        // Edge count is `edges.len()`, not a `.values().map(len).sum()` scan:
+        // `create_connection` stores every edge as its own single-element Vec,
+        // so the map length equals the edge total exactly. At 1.5M edges the
+        // old O(E) sum — invoked up to MAX_CONNECTIONS_PER_NODE times per
+        // ingested fragment via `create_connection` — was ~40% of the
+        // consolidation worker's pegged core.
+        self.metrics.total_edges = self.edges.len();
+
+        // avg_degree via a closed form instead of an O(V) sum over the
+        // adjacency lists. Every edge is bidirectional and contributes exactly
+        // one adjacency entry to each endpoint, so total adjacency degree is
+        // always 2 * total_edges. This invariant holds through both
+        // `create_connection` (+1 edge, +2 entries) and `remove_node`
+        // (-d edges, -2d entries), so the result is identical to the old scan.
         if self.metrics.total_nodes > 0 {
-            let total_degree: usize = self
-                .adjacency_list
-                .values()
-                .map(|neighbors| neighbors.len())
-                .sum();
-            self.metrics.avg_degree = total_degree as f32 / self.metrics.total_nodes as f32;
+            self.metrics.avg_degree =
+                (2 * self.metrics.total_edges) as f32 / self.metrics.total_nodes as f32;
         }
 
         // Calculate graph density. Guard against the zero-node case: `total_nodes - 1`
