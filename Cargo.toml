@@ -108,7 +108,7 @@ ordered-float = { version = "5.0", features = ["serde"] }
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"], optional = true }
 
 # Security headers and validation
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 
 # Cryptographic utilities
 rand = "0.10"
