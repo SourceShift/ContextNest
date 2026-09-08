@@ -146,7 +146,7 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_RETRIEVE_TRUST_CLAIMED` | 0.4 | Trust multiplier for `provenance=claimed` (no command cited; self-report only) |
 | `CONTEXTNEST_RETRIEVE_TRUST_ABSENT` | 0.4 | Trust multiplier for `provenance=absent` (command cited but no matching receipt; fabricated reference) |
 | `CONTEXTNEST_RETRIEVE_TRUST_CONTRADICTED` | 0.25 | Trust multiplier for `provenance=contradicted` (receipt disproved the claim). Set 0.0 to bury falsified claims. |
-| `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | Worker tick |
+| `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | Minimum post-batch pause and backoff base |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | In-flight embedder calls |
 | `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` | 32 | Top-K cap on edges created per new fragment in `create_connections_for_node`. Bounds avg_degree growth as the substrate fills. Lower → faster ingest, smaller graph; higher → richer connection-aware retrieval. |
 | `CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD` | 0.7 | Cosine-similarity floor for a peer to qualify as a connection candidate. Raise to 0.8 during backlog drain to halve fan-out. |
@@ -158,8 +158,9 @@ Full list in `docs/architecture-honest.md`.
 - **Single-fragment guard**: `process_memories` skips Step 3 (full reconstruction
   ingest) when `fragments.len() == 1` — every live `store` hits this path.
   Reconstruction runs on-demand via `reconstruct` or Phase 6 auto-attach.
-- **Embedder model swaps invalidate basins** — there's no re-consolidation
-  worker for that case yet.
+- **Embedding-space changes invalidate canonical state** — operator checkpoint
+  recovery rebuilds it; application tenants require a policy version increase
+  and reuse vectors only when the embedding space is unchanged.
 - **`cargo run -- serve` vs `make cn-serve`** bind to different ports (see Quick start).
 - **`profile.release` has `incremental = true`** (overrides upstream default) —
   the per-edit re-codegen drops from ~3min to ~20-30s.
@@ -167,7 +168,9 @@ Full list in `docs/architecture-honest.md`.
   ~5-15% slower runtime than release, ~6x faster compile; default for dev loop.
 - **`cn-serve` warns but doesn't fail** when neither `DEEPINFRA_API_KEY` nor
   `OPENAI_API_KEY` is set; remote ingest will fail loudly at first call.
-- **WAL is single-file persistence at `~/.contextnest/wal.jsonl`** — back it
+- **Operator input WAL is `~/.contextnest/wal.jsonl`**; canonical state now has
+  a sibling `wal.canonical.sqlite` checkpoint. Application tenants use separate
+  databases. See `docs/tenant-session-memory.md`. Back the input WAL
   up to a `.bak-pre-<refactor>` sibling before any code change that touches
   WAL schema, session-id format, or migration logic. The migrator writes
   `.new` then renames original → `.bak` → new atomically; that `.bak` is

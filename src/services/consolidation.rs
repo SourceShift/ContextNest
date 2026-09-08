@@ -1,58 +1,12 @@
-//! Background consolidation worker — Phase 1 of the neural-field epic
-//! (`docs/roadmap/epics/neural-field-real.md`).
-//!
-//! ## Why this exists
-//!
-//! The cc_hooks ingest path ([`crate::ingest::claude_code::ServicesSink`])
-//! and the WAL-replay path ([`crate::api::tools::restore_sidecars_bulk`])
-//! both deliberately skip [`crate::memory::attractors::MemoryAttractorManager::process_memories`]
-//! because each call costs an embedding round-trip (~250 ms on
-//! DeepInfra) plus basin / connection / reconstruction work. For 25k
-//! fragments that's hours of latency in the ingest hot path.
-//!
-//! The result is correct ingest (sidecars hydrated, inbox works,
-//! retrieve sees fragments) but a **dormant attractor pipeline**:
-//! basins never form, the connection network has zero nodes, the
-//! reconstruction store is empty. The README's "neural-field substrate"
-//! tagline doesn't survive a `grep` of the runtime.
-//!
-//! This module fixes the gap without re-introducing the latency. It
-//! runs in the background, lazily processing fragments through the
-//! attractor pipeline at the embedder's natural pace. Live ingest stays
-//! fast; the substrate fills in behind it.
-//!
-//! ## Architecture
-//!
-//! - A [`ConsolidationQueue`] dedup'd via a `HashSet` lives inside
-//!   [`crate::services::ContextNestServices`]. Every code path that
-//!   creates a sidecar-only fragment enqueues its id.
-//! - One worker task spawned at server startup (see
-//!   `src/bin/contextnest.rs`) ticks every `interval_ms`, drains up to
-//!   `batch_size` ids, and processes them through
-//!   `process_memories` with conservative `ProcessingOptions` (one
-//!   fragment per request keeps the O(N²) Step 3 disabled, but
-//!   Step 1 + Step 1.5 still run — basin + connection-network node
-//!   formation).
-//! - Persistence: a fragment is "consolidated" when its sidecar
-//!   metadata contains `_cn_consolidated == true`. This survives
-//!   restart naturally — no separate watermark file. On startup the
-//!   worker scans `fragment_metadata` once and enqueues every id
-//!   that's missing the flag.
-//! - Concurrency: `buffer_unordered(config.concurrency)` caps in-flight
-//!   embedding calls to avoid hammering the network when the
-//!   embedder is remote.
-//!
-//! ## What's intentionally NOT here
-//!
-//! - **No re-consolidation.** Once flagged, a fragment is left alone
-//!   even if its embedding drifts (e.g. the embedder model changes).
-//!   That's a separate epic — re-embed-on-model-change.
-//! - **No backpressure to ingest.** Live ingest never blocks on
-//!   consolidation. The queue is unbounded; in pathological cases the
-//!   only signal is the lag visible at `/api/v1/substrate/consolidation`.
-//! - **No retry on failure.** A failed `process_memories` call logs
-//!   warn-level and the id stays unflagged, so the next startup scan
-//!   re-enqueues it.
+//! Bounded background consolidation for the legacy operator transcript store.
+//! Input sidecars remain immediately visible. A durable SQLite checkpoint saves
+//! canonical vectors, basins, edges and completion together; startup restores
+//! them without provider calls. Pending IDs are deduplicated against in-flight
+//! work, limited to 4096, and replenished from durable inputs when drained.
+//! Transient provider failures receive at most five attempts with persisted
+//! backoff; invalid inputs stop immediately. Every successful batch is paced,
+//! with a proportional pause based on canonical processing time (20% default).
+//! Application tenants use the separate fair, session-scoped SQLite scheduler.
 
 use crate::memory::attractors::memory_attractor_manager::{
     MemoryProcessingRequest, ProcessingOptions, ProcessingPriority,
@@ -134,17 +88,20 @@ impl ConsolidationConfig {
             interval_ms: std::env::var("CONTEXTNEST_CONSOLIDATION_INTERVAL_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(d.interval_ms),
+                .unwrap_or(d.interval_ms)
+                .clamp(50, 60_000),
             concurrency: std::env::var("CONTEXTNEST_CONSOLIDATION_CONCURRENCY")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|n: &usize| *n > 0)
-                .unwrap_or(d.concurrency),
+                .unwrap_or(d.concurrency)
+                .min(16),
             batch_size: std::env::var("CONTEXTNEST_CONSOLIDATION_BATCH_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|n: &usize| *n > 0)
-                .unwrap_or(d.batch_size),
+                .unwrap_or(d.batch_size)
+                .min(128),
             enabled: std::env::var("CONTEXTNEST_CONSOLIDATION_ENABLED")
                 .ok()
                 .map(|s| s != "false" && s != "0")
@@ -160,7 +117,8 @@ impl ConsolidationConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|n: &usize| *n > 0)
-            .unwrap_or(d.backoff_concurrency_floor),
+            .unwrap_or(d.backoff_concurrency_floor)
+            .min(16),
         }
     }
 }
@@ -183,6 +141,22 @@ pub struct ConsolidationMetrics {
     /// poll this to know when "everything that existed at startup has
     /// been queued" is true.
     pub initial_scan_complete: bool,
+    /// Time inside canonical processing, excluding embedding/network waits.
+    pub processing_ms: u64,
+    /// Invalid records or exhausted retry budgets, including restored failures.
+    pub terminal_failed: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RetryState {
+    pub attempts: u32,
+    pub retry_at_ms: i64,
+    pub terminal: bool,
+}
+impl RetryState {
+    fn ready(&self) -> bool {
+        !self.terminal && self.retry_at_ms <= Utc::now().timestamp_millis()
+    }
 }
 
 /// Dedup'd queue of fragment ids waiting for the consolidation worker.
@@ -192,6 +166,8 @@ pub struct ConsolidationMetrics {
 pub struct ConsolidationQueue {
     pending: Mutex<HashSet<String>>,
     metrics: Mutex<ConsolidationMetrics>,
+    in_flight: Mutex<HashSet<String>>,
+    attempts: Mutex<HashMap<String, RetryState>>,
 }
 
 impl Default for ConsolidationQueue {
@@ -205,6 +181,8 @@ impl ConsolidationQueue {
         Self {
             pending: Mutex::new(HashSet::new()),
             metrics: Mutex::new(ConsolidationMetrics::default()),
+            in_flight: Mutex::new(HashSet::new()),
+            attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -214,6 +192,17 @@ impl ConsolidationQueue {
     /// hot paths.
     pub fn enqueue(&self, id: String) {
         let mut p = self.pending.lock().expect("consolidation queue poisoned");
+        if p.len() >= 4096
+            || self.in_flight.lock().unwrap().contains(&id)
+            || self
+                .attempts
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|state| !state.ready())
+        {
+            return;
+        }
         p.insert(id);
         // Keep the queued counter consistent with pending size so the
         // metrics endpoint doesn't lag a full tick.
@@ -228,12 +217,57 @@ impl ConsolidationQueue {
         let take: Vec<String> = p.iter().take(max).cloned().collect();
         for id in &take {
             p.remove(id);
+            self.in_flight.lock().unwrap().insert(id.clone());
         }
         // Update queued counter under the same lock to avoid a
         // race-window where two callers see different sizes.
         let mut m = self.metrics.lock().expect("metrics lock poisoned");
         m.queued = p.len();
         take
+    }
+
+    fn finish(&self, id: &str, failure: Option<RetryState>) {
+        let mut pending = self.pending.lock().unwrap();
+        self.in_flight.lock().unwrap().remove(id);
+        let mut attempts = self.attempts.lock().unwrap();
+        if let Some(state) = failure {
+            if state.ready() && pending.len() < 4096 {
+                pending.insert(id.to_owned());
+            }
+            attempts.insert(id.to_owned(), state);
+        } else {
+            attempts.remove(id);
+        }
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.queued = pending.len();
+        metrics.terminal_failed = attempts.values().filter(|s| s.terminal).count();
+    }
+
+    pub fn restore_retries(&self, states: HashMap<String, RetryState>) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|id| states.get(id).map_or(true, RetryState::ready));
+        let mut attempts = self.attempts.lock().unwrap();
+        *attempts = states;
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.terminal_failed = attempts.values().filter(|s| s.terminal).count();
+        metrics.queued = pending.len();
+    }
+
+    fn failed_state(&self, id: &str, error: &str) -> RetryState {
+        let attempts = self
+            .attempts
+            .lock()
+            .unwrap()
+            .get(id)
+            .map_or(1, |s| s.attempts + 1);
+        let transient = looks_transient(error);
+        RetryState {
+            attempts,
+            retry_at_ms: Utc::now().timestamp_millis()
+                + (1_i64 << attempts.min(5)) * 1000
+                + i64::from(rand::random::<u8>()),
+            terminal: !transient || attempts >= 5,
+        }
     }
 
     pub fn snapshot_metrics(&self) -> ConsolidationMetrics {
@@ -409,9 +443,16 @@ async fn consolidate_one(
         created_at: now,
     };
 
-    services
-        .attractor_manager
-        .process_memories(req)
+    let _canonical = services.canonical_gate.lock().await;
+    if !services.fragment_texts.read().await.contains_key(id) {
+        return Ok(ConsolidationOutcome::Skipped);
+    }
+    if let Some(session) = services.session_index.find_session(id).await {
+        if !services.session_index.is_active(&session, id).await {
+            return Ok(ConsolidationOutcome::Skipped);
+        }
+    }
+    let result = crate::services::compute::process(services.attractor_manager.clone(), req)
         .await
         .map_err(|e| format!("process_memories: {e}"))?;
 
@@ -421,6 +462,25 @@ async fn consolidate_one(
     // write so a concurrent retrieve never sees the consolidated flag
     // without the density paired alongside it.
     let density = crate::services::content_density::content_density(&text);
+
+    let mut completed_meta = existing_meta.clone();
+    completed_meta.insert(CONSOLIDATED_FLAG.into(), Value::Bool(true));
+    completed_meta.insert(
+        CONSOLIDATED_AT_FIELD.into(),
+        Value::String(now.to_rfc3339()),
+    );
+    completed_meta.insert(CONTENT_DENSITY_FIELD.into(), Value::from(density));
+    services
+        .consolidation_queue
+        .metrics
+        .lock()
+        .unwrap()
+        .processing_ms += result.processing_time.as_millis() as u64;
+    if !result.success {
+        return Err("canonical processing failed".into());
+    }
+    crate::services::checkpoint::persist(services, id, &result.created_basins, completed_meta)
+        .await?;
 
     // Flip the flag on success. Preserves any pre-existing metadata
     // (kind, ts, src_session, project_cwd, etc.) by updating the
@@ -439,6 +499,7 @@ async fn consolidate_one(
         );
     }
 
+    services.invalidate_health();
     Ok(ConsolidationOutcome::Done)
 }
 
@@ -508,6 +569,26 @@ pub(crate) fn looks_rate_limited(err: &str) -> bool {
     false
 }
 
+pub(crate) fn looks_transient(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    looks_rate_limited(error)
+        || [
+            "timeout",
+            "timed out",
+            "connection",
+            "transport",
+            "temporar",
+            "502",
+            "503",
+            "504",
+            "500",
+            "database is locked",
+            "database is busy",
+        ]
+        .iter()
+        .any(|s| lower.contains(s))
+}
+
 /// Drive one batch through `consolidate_one` with bounded concurrency.
 /// Returns a [`BatchOutcome`] so the caller can fold it into metrics
 /// AND decide whether to back off on the next tick.
@@ -529,7 +610,22 @@ async fn process_batch(
     let results: Vec<Tag> = stream::iter(batch.into_iter().map(|id| {
         let services = services.clone();
         async move {
-            match consolidate_one(&services, &id).await {
+            let outcome = consolidate_one(&services, &id).await;
+            let mut failure = outcome.as_ref().err().map(|e| services.consolidation_queue.failed_state(&id, e));
+            if let Some(checkpoint) = services.checkpoint.get() {
+                let checkpoint = checkpoint.clone();
+                let record_id = id.clone();
+                let state = failure.clone();
+                let saved = crate::services::compute::run(move || checkpoint.save_retry(&record_id, state.as_ref()).map_err(|e| e.to_string())).await;
+                if !matches!(saved, Ok(Ok(()))) {
+                    // Stop this record locally when its retry budget cannot be
+                    // persisted. Restart recovery retries the durable input.
+                    failure = Some(RetryState { attempts: 5, retry_at_ms: 0, terminal: true });
+                    tracing::error!(fragment_id = %id, "consolidation: retry checkpoint failed; record paused");
+                }
+            }
+            services.consolidation_queue.finish(&id, failure);
+            match outcome {
                 Ok(ConsolidationOutcome::Done) => Tag::Done,
                 Ok(ConsolidationOutcome::Skipped) => Tag::Skipped,
                 Err(e) => {
@@ -582,6 +678,11 @@ pub async fn run_worker(
 
     initial_scan(&services, &queue).await;
 
+    let duty_percent = std::env::var("CONTEXTNEST_CONSOLIDATION_DUTY_PERCENT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
     let base_interval = Duration::from_millis(config.interval_ms);
     let max_backoff = Duration::from_millis(config.max_backoff_ms);
     // Exponential backoff state. Each consecutive rate-limited batch
@@ -596,7 +697,8 @@ pub async fn run_worker(
             // state across an idle period — by the time work returns,
             // the embedder's rate limit window has likely reset.
             consecutive_rl_batches = 0;
-            tokio::time::sleep(base_interval).await;
+            tokio::time::sleep(base_interval.max(Duration::from_secs(5))).await;
+            initial_scan(&services, &queue).await;
             continue;
         }
 
@@ -612,6 +714,7 @@ pub async fn run_worker(
         };
 
         let start = Instant::now();
+        let work_before = queue.metrics.lock().unwrap().processing_ms;
         let outcome = process_batch(&services, batch, effective_concurrency).await;
         let lap_ms = start.elapsed().as_millis() as u64;
 
@@ -628,6 +731,14 @@ pub async fn run_worker(
 
         // Update backoff state BEFORE the post-batch sleep so the sleep
         // duration reflects the most recent batch's outcome.
+        let processing_ms = queue
+            .metrics
+            .lock()
+            .unwrap()
+            .processing_ms
+            .saturating_sub(work_before);
+        let duty_pause =
+            Duration::from_millis(processing_ms.saturating_mul(100 - duty_percent) / duty_percent);
         if outcome.rate_limited > 0 {
             consecutive_rl_batches = consecutive_rl_batches.saturating_add(1);
             // 2^N can grow fast; cap shift to 16 (= 65536x base) to
@@ -646,7 +757,7 @@ pub async fn run_worker(
                 backoff_ms = backoff.as_millis() as u64,
                 "consolidation: batch hit rate-limit — backing off"
             );
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(backoff.max(duty_pause)).await;
         } else {
             // Reset backoff on a clean (or merely-data-failed) batch.
             if consecutive_rl_batches > 0 {
@@ -672,11 +783,9 @@ pub async fn run_worker(
                     "consolidation: batch completed"
                 );
             }
-            // No post-batch sleep on clean runs — keep draining work as
-            // fast as the embedder allows. The base_interval sleep
-            // happens only on empty queues (above) and after rate-limit
-            // backoff. This matches the pre-PR-2 hot-loop behavior so
-            // we don't slow steady-state throughput.
+            // Successful graph work also consumes CPU. Pace every batch;
+            // interval is a soft work budget, not a hard CPU percentage cap.
+            tokio::time::sleep(base_interval.max(duty_pause)).await;
         }
     }
 }

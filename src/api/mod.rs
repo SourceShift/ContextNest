@@ -1,3 +1,4 @@
+pub mod tenants;
 use crate::error::ContextNestResult;
 use axum::Router;
 use std::sync::Arc;

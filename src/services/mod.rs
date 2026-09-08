@@ -35,11 +35,14 @@ use crate::Config;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+pub mod checkpoint;
+pub mod compute;
 pub mod consolidation;
 pub mod content_density;
 pub mod context;
 pub mod embedding;
 pub mod embedding_providers;
+pub mod exact;
 pub mod fragment_id;
 pub mod graph;
 pub mod graph_enhanced;
@@ -50,6 +53,8 @@ pub mod llm_cache_crypto;
 pub mod llm_cache_redactor;
 pub mod parser;
 pub mod session_index;
+pub mod tenants;
+pub mod transcript_tail;
 pub mod wal;
 
 pub use context::ContextManagerService;
@@ -159,6 +164,12 @@ pub struct ContextNestServices {
     /// shared maps so all clones see the writer the moment it's set
     /// post-replay.
     pub wal: Arc<tokio::sync::OnceCell<wal::Wal>>,
+    pub checkpoint: Arc<tokio::sync::OnceCell<Arc<checkpoint::CheckpointStore>>>,
+    pub ingest_gate: Arc<tokio::sync::Mutex<()>>,
+    pub canonical_gate: Arc<tokio::sync::Mutex<()>>,
+    pub health_revision: Arc<std::sync::atomic::AtomicU64>,
+    pub health_cache: Arc<tokio::sync::Mutex<Option<crate::api::substrate::HealthCacheEntry>>>,
+
     /// Background consolidation queue — Phase 1 of the neural-field
     /// epic. ServicesSink + WAL replay enqueue fragment ids here after
     /// writing sidecars; the worker drains the queue off the hot path
@@ -202,6 +213,11 @@ pub struct ContextNestServices {
 }
 
 impl ContextNestServices {
+    pub fn invalidate_health(&self) {
+        self.health_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Create a new container with the given configuration.
     pub async fn new(config: Config) -> ContextNestResult<Self> {
         tracing::info!("Initializing ContextNest services");
@@ -332,6 +348,11 @@ impl ContextNestServices {
             session_intent_embeddings,
             consolidation_queue,
             wal: wal_cell,
+            checkpoint: Arc::new(tokio::sync::OnceCell::new()),
+            ingest_gate: Arc::new(tokio::sync::Mutex::new(())),
+            canonical_gate: Arc::new(tokio::sync::Mutex::new(())),
+            health_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             llm,
             llm_cache,
             coord_leases: Arc::new(tokio::sync::RwLock::new(Vec::new())),

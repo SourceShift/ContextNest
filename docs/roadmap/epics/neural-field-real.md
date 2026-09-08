@@ -1,12 +1,17 @@
 # Epic — Make the Neural-Field Substrate Real
 
-**Status:** Shipped. The seven-phase runtime reconciliation is complete
-in `main`; see `docs/architecture-honest.md` for the grep-auditable
-runtime model and verification recipe.
+**Status:** Runtime shipped; durable consolidation resume implemented in the
+2026-09-08 CPU repair worktree and covered by canonical restart fixtures.
+
+**2026-09-08 audit follow-up:** the in-memory completion gap is repaired by
+`src/services/checkpoint.rs`. Vectors, basins, graph state and completion commit
+together; retry budgets and transcript offsets also persist. See the
+[implementation audit](../../reports/2026-09-08-tenant-session-implementation-audit.md).
+Live restart/workload validation remains operator-controlled.
 
 **Owner:** TBA.
 
-**Last updated:** 2026-06-08.
+**Last updated:** 2026-09-08.
 
 ## Shipped evidence
 
@@ -133,8 +138,9 @@ and ConnectionNetwork insertion without blocking ingest.
 - [x] ServicesSink (live cc_hooks) writes a fragment id into the
       worker's queue immediately, but does not block on its
       processing.
-- [x] Restart mid-consolidation → resume from watermark, no
-      duplicate work.
+- [x] Restart after canonical completion → restore matching vectors, basins
+      and nodes without repeating completed work. Verified by
+      `tests/canonical_checkpoint_test.rs`; live workload replay remains separate.
 
 **Files touched (estimate):**
 `src/services/consolidation.rs` (new), `src/services/mod.rs`,

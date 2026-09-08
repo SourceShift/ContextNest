@@ -2,8 +2,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-const VOLATILE_METADATA_KEYS: &[&str] =
-    &["last_accessed", "_cn_consolidated", "_cn_consolidated_at"];
+const VOLATILE_METADATA_KEYS: &[&str] = &[
+    "last_accessed",
+    "_cn_consolidated",
+    "_cn_consolidated_at",
+    "_cn_content_density",
+];
 
 /// Build a deterministic fragment id for logical-memory writes.
 ///

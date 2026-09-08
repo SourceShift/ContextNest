@@ -227,6 +227,18 @@ pub struct ProcessingQualityMetrics {
     pub consistency: f32,
 }
 
+/// Canonical state, persisted atomically with processing completion. Search
+/// caches are derived and intentionally excluded; restore never embeds again.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalSnapshot {
+    pub fragments: Vec<MemoryFragment>,
+    pub basins: Vec<super::attractor_basin::AttractorBasin>,
+    pub nodes: Vec<super::connection_network::MemoryNode>,
+    pub edges: Vec<super::connection_network::ConnectionEdge>,
+    #[serde(default)]
+    pub norms: HashMap<String, f32>,
+}
+
 impl MemoryAttractorManager {
     /// Create a new memory attractor manager
     pub fn new(config: MemoryAttractorConfig) -> Self {
@@ -267,6 +279,10 @@ impl MemoryAttractorManager {
         &self,
         request: MemoryProcessingRequest,
     ) -> ContextNestResult<MemoryProcessingResult> {
+        // Validate before basin mutation; a provider dimension error must not
+        // leave a partially-created canonical fragment or basin.
+        self.connection_network
+            .validate_vectors(request.fragments.iter().map(|f| f.content.as_slice()))?;
         let start_time = Utc::now();
 
         // Update metrics
@@ -792,7 +808,11 @@ impl MemoryAttractorManager {
     pub async fn discard_fragment(&self, id: &str) -> ContextNestResult<bool> {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let mut store = store_arc.write().await;
-        Ok(store.remove(id).is_some())
+        let removed = store.remove(id).is_some();
+        drop(store);
+        self.basin_manager.discard_member(id).await;
+        let _ = self.connection_network.remove_node(id).await;
+        Ok(removed)
     }
 
     /// List all fragment IDs currently in the canonical store.
@@ -805,6 +825,55 @@ impl MemoryAttractorManager {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let store = store_arc.read().await;
         store.keys().cloned().collect()
+    }
+
+    /// Configure this session's graph before publishing its manager.
+    pub fn set_connection_policy(&self, max: usize, threshold: f32) {
+        self.connection_network
+            .set_connection_policy(max, threshold);
+    }
+
+    pub async fn basin_membership_statistics(&self) -> (usize, usize, usize) {
+        self.basin_manager.membership_statistics().await
+    }
+
+    pub async fn durable_snapshot(
+        &self,
+        fragment_id: Option<&str>,
+        basin_ids: Option<&[String]>,
+    ) -> CanonicalSnapshot {
+        let store = self.reconstruction_protocol.fragment_store();
+        let store = store.read().await;
+        let fragments: Vec<MemoryFragment> = match fragment_id {
+            Some(id) => store.get(id).cloned().into_iter().collect(),
+            None => store.values().cloned().collect(),
+        };
+        drop(store);
+        let basins = self.basin_manager.durable_basins(basin_ids).await;
+        let (nodes, edges) = self.connection_network.durable_graph(fragment_id);
+        let norms = fragments
+            .iter()
+            .filter_map(|f| crate::services::exact::norm(&f.content).map(|n| (f.id.clone(), n)))
+            .collect();
+        CanonicalSnapshot {
+            fragments,
+            basins,
+            nodes,
+            edges,
+            norms,
+        }
+    }
+
+    pub async fn restore_snapshot(&self, snapshot: CanonicalSnapshot) {
+        let store = self.reconstruction_protocol.fragment_store();
+        let mut store = store.write().await;
+        for fragment in snapshot.fragments {
+            store.insert(fragment.id.clone(), fragment);
+        }
+        drop(store);
+        self.basin_manager.restore_basins(snapshot.basins).await;
+        self.connection_network
+            .restore_graph(snapshot.nodes, snapshot.edges);
     }
 
     // Helper methods

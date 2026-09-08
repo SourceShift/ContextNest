@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// Connection network for optimized memory retrieval
 #[derive(Debug)]
 pub struct ConnectionNetwork {
+    connection_policy: RwLock<(usize, f32)>,
     /// Configuration
     config: MemoryAttractorConfig,
     /// Network graph
@@ -37,6 +38,8 @@ pub struct ConnectionNetwork {
 pub struct MemoryGraph {
     /// Nodes (memories)
     nodes: HashMap<String, MemoryNode>,
+    norms: HashMap<String, f32>,
+    incident_edges: HashMap<String, Vec<String>>,
     /// Edges (connections)
     edges: HashMap<String, Vec<ConnectionEdge>>,
     /// Adjacency list for fast lookup
@@ -352,6 +355,16 @@ impl ConnectionNetwork {
         Self {
             config: config.clone(),
             graph: Arc::new(RwLock::new(MemoryGraph::new())),
+            connection_policy: RwLock::new((
+                std::env::var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(32),
+                std::env::var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.7),
+            )),
             connection_weights: Arc::new(RwLock::new(HashMap::new())),
             retrieval_optimizer: Arc::new(RetrievalOptimizer::new()),
             path_finder: Arc::new(PathFinder::new()),
@@ -384,6 +397,19 @@ impl ConnectionNetwork {
                     node_id
                 )));
             }
+            let norm = crate::services::exact::norm(&node.content)
+                .ok_or_else(|| ContextNestError::Validation("invalid memory vector".into()))?;
+            if graph
+                .nodes
+                .values()
+                .next()
+                .is_some_and(|n| n.content.len() != node.content.len())
+            {
+                return Err(ContextNestError::Validation(
+                    "memory vector dimension mismatch".into(),
+                ));
+            }
+            graph.norms.insert(node_id.clone(), norm);
             graph.nodes.insert(node_id.clone(), node);
             graph.adjacency_list.insert(node_id.clone(), Vec::new());
         }
@@ -421,6 +447,8 @@ impl ConnectionNetwork {
 
         // Remove node
         graph.nodes.remove(node_id);
+        graph.norms.remove(node_id);
+        graph.incident_edges.remove(node_id);
 
         // Remove all edges connected to this node
         let edges_to_remove: Vec<String> = graph
@@ -435,7 +463,15 @@ impl ConnectionNetwork {
             .collect();
 
         for edge_id in edges_to_remove {
-            graph.edges.remove(&edge_id);
+            if let Some(edges) = graph.edges.remove(&edge_id) {
+                for edge in edges {
+                    for endpoint in [edge.source, edge.target] {
+                        if let Some(ids) = graph.incident_edges.get_mut(&endpoint) {
+                            ids.retain(|id| id != &edge_id);
+                        }
+                    }
+                }
+            }
         }
 
         // Remove from adjacency list
@@ -501,6 +537,16 @@ impl ConnectionNetwork {
 
         // Add edge
         graph.edges.insert(edge_id.clone(), vec![edge.clone()]);
+        graph
+            .incident_edges
+            .entry(source_id.to_owned())
+            .or_default()
+            .push(edge_id.clone());
+        graph
+            .incident_edges
+            .entry(target_id.to_owned())
+            .or_default()
+            .push(edge_id.clone());
 
         // Update adjacency lists
         graph
@@ -543,7 +589,13 @@ impl ConnectionNetwork {
     pub async fn neighbors_of(&self, node_id: &str) -> Vec<(String, f32)> {
         let graph = self.graph.read().unwrap();
         let mut out: Vec<(String, f32)> = Vec::new();
-        for edges in graph.edges.values() {
+        for edges in graph
+            .incident_edges
+            .get(node_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| graph.edges.get(id))
+        {
             for edge in edges {
                 if edge.source == node_id {
                     out.push((edge.target.clone(), edge.weight));
@@ -739,65 +791,126 @@ impl ConnectionNetwork {
         self.retrieval_optimizer.metrics()
     }
 
+    pub(crate) fn validate_vectors<'a>(
+        &self,
+        vectors: impl Iterator<Item = &'a [f32]>,
+    ) -> ContextNestResult<()> {
+        let graph = self.graph.read().unwrap();
+        let mut dimensions = graph.nodes.values().next().map(|n| n.content.len());
+        for vector in vectors {
+            if vector.len() > 8192
+                || crate::services::exact::norm(vector).is_none()
+                || dimensions.is_some_and(|dim| dim != vector.len())
+            {
+                return Err(ContextNestError::Validation(
+                    "invalid vector or embedding dimension mismatch".into(),
+                ));
+            }
+            dimensions = Some(vector.len());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_connection_policy(&self, max: usize, threshold: f32) {
+        *self.connection_policy.write().unwrap() = (max, threshold);
+    }
+
+    pub(crate) fn durable_graph(&self, id: Option<&str>) -> (Vec<MemoryNode>, Vec<ConnectionEdge>) {
+        let graph = self.graph.read().unwrap();
+        match id {
+            None => (
+                graph.nodes.values().cloned().collect(),
+                graph.edges.values().flatten().cloned().collect(),
+            ),
+            Some(id) => (
+                graph.nodes.get(id).cloned().into_iter().collect(),
+                graph
+                    .incident_edges
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| graph.edges.get(id))
+                    .flatten()
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn restore_graph(&self, nodes: Vec<MemoryNode>, edges: Vec<ConnectionEdge>) {
+        let mut graph = self.graph.write().unwrap();
+        for node in nodes {
+            if let Some(norm) = crate::services::exact::norm(&node.content) {
+                graph.norms.insert(node.id.clone(), norm);
+                graph.adjacency_list.entry(node.id.clone()).or_default();
+                graph.nodes.insert(node.id.clone(), node);
+            }
+        }
+        for edge in edges {
+            if graph.edges.contains_key(&edge.id) {
+                continue;
+            }
+            graph
+                .adjacency_list
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+            graph
+                .adjacency_list
+                .entry(edge.target.clone())
+                .or_default()
+                .push(edge.source.clone());
+            graph
+                .incident_edges
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.id.clone());
+            graph
+                .incident_edges
+                .entry(edge.target.clone())
+                .or_default()
+                .push(edge.id.clone());
+            self.update_connection_weight(&edge.id, edge.weight);
+            graph.edges.insert(edge.id.clone(), vec![edge]);
+        }
+        graph.update_metrics();
+    }
+
     // Helper methods
 
     async fn create_connections_for_node(&self, node_id: &str) -> ContextNestResult<()> {
-        // Connection-creation knobs. Read per-call because env can be
-        // hot-reloaded between substrate restarts; reads are cheap and the
-        // values are stable within a single consolidation tick.
-        //
-        // CONTEXTNEST_MAX_CONNECTIONS_PER_NODE caps the fan-out per new
-        // fragment. Without it, `create_connections_for_node` issues one
-        // `create_connection` per peer above the similarity threshold,
-        // letting avg_degree (and per-insert CPU) grow monotonically with
-        // substrate size. Production substrate hit avg_degree=204 / 7M
-        // edges / 75% sustained CPU before this cap landed.
-        //
-        // CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD raises the floor
-        // when operators want fewer but stronger edges (e.g. during
-        // backlog drain). Defaults preserve the pre-cap connectivity for
-        // small substrates: most fragments have <32 peers above 0.7, so
-        // the cap is a no-op there and only bites at scale.
-        let max_connections = std::env::var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
-        let similarity_threshold = std::env::var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(0.7);
+        let (max_connections, similarity_threshold) = *self.connection_policy.read().unwrap();
 
         // Phase 1: snapshot similarity candidates under a read lock. We
         // collect owned `(other_id, similarity)` pairs and release the read
         // lock by letting `graph` drop. Without this snapshot, the inner
         // `create_connection` call below tries to take a `write()` while we
         // still hold the `read()`, which deadlocks `std::sync::RwLock`.
-        let mut candidates: Vec<(String, f32)> = {
+        let candidates = {
             let graph = self.graph.read().unwrap();
-            let new_node = match graph.nodes.get(node_id) {
-                Some(node) => node,
-                None => return Ok(()), // Race: node was removed before we connected.
+            let Some(new_node) = graph.nodes.get(node_id) else {
+                return Ok(());
             };
-            graph
-                .nodes
-                .iter()
-                .filter(|(other_id, _)| other_id.as_str() != node_id)
-                .filter_map(|(other_id, other_node)| {
-                    let sim = utils::cosine_similarity(&new_node.content, &other_node.content);
-                    (sim > similarity_threshold).then(|| (other_id.clone(), sim))
-                })
-                .collect()
+            let Some(&new_norm) = graph.norms.get(node_id) else {
+                return Ok(());
+            };
+            crate::services::exact::top_k(
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|(id, _)| id.as_str() != node_id)
+                    .filter_map(|(id, node)| {
+                        let score = crate::services::exact::cosine(
+                            &new_node.content,
+                            new_norm,
+                            &node.content,
+                            *graph.norms.get(id)?,
+                        )?;
+                        (score > similarity_threshold).then_some((id.as_str(), score))
+                    }),
+                max_connections,
+            )
         };
-
-        // Top-K cap: sort strongest-first and truncate. The strongest-K
-        // peers carry almost all of the basin signal — empirically the
-        // similarity distribution has a long thin tail past rank ~20, so
-        // dropping the tail loses little retrieval quality while bounding
-        // per-insert cost from O(N) to O(K).
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if candidates.len() > max_connections {
-            candidates.truncate(max_connections);
-        }
 
         // Phase 2: issue connection creates with no read lock held.
         for (other_id, similarity) in candidates {
@@ -878,6 +991,8 @@ impl MemoryGraph {
     fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            norms: HashMap::new(),
+            incident_edges: HashMap::new(),
             edges: HashMap::new(),
             adjacency_list: HashMap::new(),
             metrics: GraphMetrics::default(),

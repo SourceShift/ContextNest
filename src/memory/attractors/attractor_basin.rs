@@ -652,6 +652,42 @@ impl AttractorBasinManager {
             .collect()
     }
 
+    /// A health projection that never copies vectors or membership strings.
+    pub async fn membership_statistics(&self) -> (usize, usize, usize) {
+        let basins = self.basins.read().await;
+        let (total, max) = basins
+            .values()
+            .map(|b| b.associated_fragments.len())
+            .fold((0, 0), |(sum, max), n| (sum + n, max.max(n)));
+        (basins.len(), total, max)
+    }
+
+    pub(crate) async fn durable_basins(&self, ids: Option<&[String]>) -> Vec<AttractorBasin> {
+        let basins = self.basins.read().await;
+        match ids {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| basins.get(id).cloned())
+                .collect(),
+            None => basins.values().cloned().collect(),
+        }
+    }
+
+    pub(crate) async fn restore_basins(&self, restored: Vec<AttractorBasin>) {
+        let mut basins = self.basins.write().await;
+        for basin in restored {
+            basins.insert(basin.id.clone(), basin);
+        }
+    }
+
+    pub(crate) async fn discard_member(&self, id: &str) {
+        let mut basins = self.basins.write().await;
+        basins.retain(|_, b| {
+            b.remove_fragment(id);
+            !b.associated_fragments.is_empty()
+        });
+    }
+
     /// Find nearest basin to a position
 
     pub async fn find_nearest_basin(&self, position: &[f32]) -> ContextNestResult<Option<String>> {
@@ -681,7 +717,10 @@ impl AttractorBasinManager {
         //   2. Early-exit the per-dim accumulation once it exceeds the best
         //      squared distance so far. For normalised 768-d embeddings most
         //      basins are far and bail out after a handful of dims.
-        let mut nearest_id = None;
+        if position.is_empty() || position.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let mut nearest_id: Option<&String> = None;
         let mut min_sq = f32::INFINITY;
 
         for (id, basin) in basins.iter() {
@@ -693,17 +732,19 @@ impl AttractorBasinManager {
             for (x, y) in position.iter().zip(center.iter()) {
                 let d = x - y;
                 sq += d * d;
-                if sq >= min_sq {
+                if sq > min_sq {
                     break; // can't beat the current best; stop early
                 }
             }
-            if sq < min_sq {
+            if sq.is_finite()
+                && (sq < min_sq || (sq == min_sq && nearest_id.map_or(true, |best| id < best)))
+            {
                 min_sq = sq;
-                nearest_id = Some(id.clone());
+                nearest_id = Some(id);
             }
         }
 
-        nearest_id.map(|id| (id, min_sq.sqrt()))
+        nearest_id.map(|id| (id.clone(), min_sq.sqrt()))
     }
 
     /// Converge a position to the nearest attractor basin

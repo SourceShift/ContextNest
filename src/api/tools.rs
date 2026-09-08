@@ -478,10 +478,18 @@ pub async fn restore_sidecars_bulk(
         let mut metadata = services.fragment_metadata.write().await;
         for (frag_id, _, _, meta) in &records {
             if !meta.is_empty() {
-                metadata.insert(frag_id.clone(), meta.clone());
+                metadata.insert(
+                    frag_id.clone(),
+                    meta.iter()
+                        .filter(|(key, _)| !key.starts_with("_cn_"))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                );
             }
         }
     }
+
+    services.invalidate_health();
 
     // SessionIndex.add internally takes its own three write locks
     // (active/deleted/reverse) per call. Could be made bulk too if it
@@ -545,11 +553,27 @@ pub async fn store_with_id(
         priority: ProcessingPriority::Medium,
         created_at: now,
     };
-    services
-        .attractor_manager
-        .process_memories(process_req)
+    let _canonical = services.canonical_gate.lock().await;
+    let result = crate::services::compute::process(services.attractor_manager.clone(), process_req)
         .await
         .map_err(|e| format!("process_memories: {e}"))?;
+    if !result.success {
+        return Err("canonical processing failed".into());
+    }
+    let mut metadata = metadata;
+    metadata.retain(|key, _| !key.starts_with("_cn_"));
+    metadata.insert("_cn_consolidated".into(), serde_json::Value::Bool(true));
+    metadata.insert(
+        "_cn_consolidated_at".into(),
+        serde_json::Value::String(now.to_rfc3339()),
+    );
+    crate::services::checkpoint::persist(
+        services,
+        fragment_id,
+        &result.created_basins,
+        metadata.clone(),
+    )
+    .await?;
 
     // Sidecars: text first, metadata second, index last. Same order as the
     // pre-extraction handler — see the original comment for the
@@ -569,6 +593,7 @@ pub async fn store_with_id(
     }
 
     services.session_index.add(session_id, fragment_id).await;
+    services.invalidate_health();
 
     Ok(())
 }
@@ -1863,6 +1888,7 @@ pub async fn update(
     }
 
     if touched {
+        services.invalidate_health();
         (StatusCode::OK, Json(UpdateResponse { updated: true }))
     } else {
         // No-op (caller passed neither importance nor content) — still 200
@@ -2116,6 +2142,26 @@ pub async fn discard(
         );
     }
 
+    let _canonical = services.canonical_gate.lock().await;
+    if let Some(checkpoint) = services.checkpoint.get() {
+        let checkpoint = checkpoint.clone();
+        let id = req.attractor_id.clone();
+        if !matches!(
+            crate::services::compute::run(move || checkpoint
+                .forget(&id)
+                .map_err(|e| e.to_string()))
+            .await,
+            Ok(Ok(()))
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DiscardResponse {
+                    discarded: false,
+                    soft_delete: req.soft_delete,
+                }),
+            );
+        }
+    }
     let discarded = if req.soft_delete {
         services
             .session_index
@@ -2163,6 +2209,7 @@ pub async fn discard(
         removed_from_index || removed_from_manager
     };
 
+    services.invalidate_health();
     let status = if discarded {
         StatusCode::OK
     } else {

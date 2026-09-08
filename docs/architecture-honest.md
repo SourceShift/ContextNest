@@ -34,7 +34,7 @@ Claude Code Stop hook
       └─ wal.append(WalRecord::Store)                [best-effort]
   ← 204 No Content                                   [< 5ms typically]
 
-... time passes (worker tick interval, default 500ms) ...
+... time passes (paced batches, minimum 500ms plus proportional CPU-work pause) ...
 
 Consolidation worker
   → drain_batch(32 ids)
@@ -115,10 +115,12 @@ All optional, env-overridable, sensible defaults:
 | Env var | Default | Phase | Purpose |
 |---|---|---|---|
 | `CONTEXTNEST_DECAY_HALF_LIFE_DAYS` | 60 | 2 | Half-life for the age-based decay multiplier |
-| `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | 1 | Worker tick interval |
+| `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | 1 | Post-batch minimum delay and rate-limit backoff base; empty queues reconcile every at least 5 seconds |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | 1 | In-flight embedder calls |
 | `CONTEXTNEST_CONSOLIDATION_BATCH_SIZE` | 32 | 1 | Max ids per tick |
 | `CONTEXTNEST_CONSOLIDATION_ENABLED` | true | 1 | Master kill switch |
+| `CONTEXTNEST_CONSOLIDATION_DUTY_PERCENT` | 20 | CPU repair | Soft canonical-work duty target; successful batches are paced too |
+| `CONTEXTNEST_CPU_WORKERS` | 2 | CPU repair | Shared bounded blocking-compute capacity |
 | `CONTEXTNEST_RETRIEVE_BASIN_BOOST` | 0.7 | 4 | Outer multiplier on basin expansion |
 | `CONTEXTNEST_RETRIEVE_BASIN_MAX_EXPANSION` | 20 | 4 | Cap on basin siblings appended |
 | `CONTEXTNEST_RETRIEVE_CONNECTION_BOOST` | 0.5 | 5 | Outer multiplier on graph expansion |
@@ -172,9 +174,9 @@ claim has lost its caller and the README needs to be revised.
 
 - It's not a multi-machine distributed memory yet — everything
   lives in one process.
-- It's not a long-horizon learning system; basins don't survive
-  embedder model swaps, and there's no re-consolidation worker for
-  that case.
+- Canonical state is tied to embedding-space and pipeline identity. A model
+  change invalidates incompatible vectors and schedules reconstruction. Tenant
+  policy changes require a version increase; unchanged spaces reuse vectors.
 - The reconstruction proxy is not the full canonical chain
   (`docs/00_COURSE/05_memory_systems/04_reconstructive_memory.md`).
   Steps 1, 1.5, 1.6 of `process_memories` run; Step 2 (full
@@ -187,3 +189,24 @@ claim has lost its caller and the README needs to be revised.
 If you find a tagline claim that fails the grep recipe, please open
 an issue — the README has to track the runtime, not the other way
 around.
+
+## Application tenants and durable CPU repair (2026-09-08)
+
+The diagrams above describe the legacy operator substrate. Application memory
+uses `src/services/tenants/` and `/api/v2/`: verified tenant/session capabilities,
+one SQLite database per application, session-local exact graphs/basins, and
+bounded shared CPU/provider work. All legacy memory surfaces become operator-only
+when tenant mode is configured. See [setup and API](tenant-session-memory.md).
+
+The operator store now has a canonical SQLite checkpoint beside its JSONL WAL.
+Vectors, affected basins/edges and completion are committed together. Restart
+restores completed state without re-embedding; persisted failures retain their
+retry budget. Transcript tails use durable complete-line offsets and bounded
+reads. Identical ingestion preserves canonical metadata and does not requeue work.
+
+Health reads scalar basin statistics instead of cloning vectors, caches age
+distributions, and exposes cumulative process CPU seconds. Tenant health reports
+only scoped counts and queue/embedding/processing durations. Exact graph scans
+use cached norms, bounded top-K selection and incident-edge lookup. Legacy basin
+attachment remains an exact scan; lowering live CPU on the existing large WAL
+still requires an operator-controlled workload replay after activation.
