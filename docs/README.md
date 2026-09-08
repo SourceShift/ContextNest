@@ -4,9 +4,6 @@ Curated entry points for understanding and using ContextNest.
 
 ## Core reading
 
-- [**Application tenant and session setup**](tenant-session-memory.md) — activation,
-  operator authentication, LibWit sessions, CPU controls and durable recovery.
-
 - [**architecture.md**](architecture.md) — how the substrate works under the
   seven-tool API. Mental model, sequence diagrams for each tool, why
   neural-field attractors beat a flat vector store, concurrency contract.
@@ -23,8 +20,8 @@ Curated entry points for understanding and using ContextNest.
 ## Where this is going
 
 - [**Tenant and session memory repair design**](roadmap/epics/tenant-session-memory.md)
-  — application tenants, isolated LibWit sessions, and a concrete repair for
-  each diagnosed CPU issue; implementation and local verification are recorded in the audit.
+  — application tenants, isolated sessions, and a concrete repair for
+  each diagnosed CPU issue.
 
 - [**CPU investigation: `make cn-serve`**](reports/2026-09-08-cn-serve-cpu.md)
   — live profiling, graph-scan costs, transcript and health-polling overhead,

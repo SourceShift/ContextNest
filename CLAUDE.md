@@ -170,7 +170,7 @@ Full list in `docs/architecture-honest.md`.
   `OPENAI_API_KEY` is set; remote ingest will fail loudly at first call.
 - **Operator input WAL is `~/.contextnest/wal.jsonl`**; canonical state now has
   a sibling `wal.canonical.sqlite` checkpoint. Application tenants use separate
-  databases. See `docs/tenant-session-memory.md`. Back the input WAL
+  databases. See `docs/roadmap/epics/tenant-session-memory.md`. Back the input WAL
   up to a `.bak-pre-<refactor>` sibling before any code change that touches
   WAL schema, session-id format, or migration logic. The migrator writes
   `.new` then renames original → `.bak` → new atomically; that `.bak` is

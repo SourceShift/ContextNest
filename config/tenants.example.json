@@ -3,8 +3,8 @@
   "operator_token_env": "CONTEXTNEST_OPERATOR_TOKEN",
   "tenants": [
     {
-      "id": "libwit",
-      "token_env": "CONTEXTNEST_LIBWIT_TOKEN",
+      "id": "app",
+      "token_env": "CONTEXTNEST_APP_TOKEN",
       "policy": {
         "version": 1,
         "retention_days": 90,

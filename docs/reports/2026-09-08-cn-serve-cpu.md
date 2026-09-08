@@ -3,8 +3,8 @@
 Date: 2026-09-08, Europe/Berlin. Status: diagnosis complete; optimizations below are proposed, not implemented.
 
 **Repair design:** [Tenant and session memory](../roadmap/epics/tenant-session-memory.md)
-extends these findings with the requested application tenants and isolated
-LibWit sessions. Scope-local exact search is the first repair; approximate
+extends these findings with application tenants and isolated
+sessions. Scope-local exact search is the first repair; approximate
 indexing is conditional on measured session size and cost.
 
 **The sampled CPU hotspot is background consolidation comparing each new fragment with the existing graph.** The graph scan happens before the 32-connection cap. A second search walks all attractor basins. At the observed substrate size, small arrivals can occupy most of one CPU core for several seconds.
@@ -40,7 +40,7 @@ During the later 30-second window, `succeeded_total` increased from 378,015 to 3
 
 This evidence does **not** establish a current massive backlog or a rate-limit retry storm. The lag of 84 is also not proof of 84 actively retried items: failures leave the queue and are reconsidered at startup, and the status endpoint does not expose in-flight or terminally failed IDs.
 
-[Recorded measurements](2026-09-08-cn-serve-cpu-evidence.json) preserve both CPU windows and the diagnostic API responses. The full stack sample is at `/tmp/contextnest-cpu-20260908.rSdFFT/contextnest-sample.txt` on this machine.
+[Recorded measurements](2026-09-08-cn-serve-cpu-evidence.json) preserve both CPU windows and the diagnostic API responses.
 
 ## Execution path
 
@@ -171,7 +171,5 @@ PIDs change after restart. Record process CPU-time deltas over a window, not onl
 ## Implementation follow-through
 
 These measurements describe the original running binary, before the repair.
-The implemented changes, local verification and remaining live replay are in
-[the implementation audit](2026-09-08-tenant-session-implementation-audit.md);
-activation is described in [the tenant/session guide](../tenant-session-memory.md).
+The concrete repairs are in the [tenant/session repair design](../roadmap/epics/tenant-session-memory.md).
 No after-restart production CPU reduction is claimed by this report.

@@ -105,17 +105,16 @@ async fn reset_delete_and_failed_old_jobs_cannot_publish_into_new_generation() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = open_db(&dir);
     let p = TenantPolicy::default();
-    let old = db.open_session("app", "interview", "create", &p).unwrap();
-    db.accept(&old, record("turn-1", "old interview"), &p)
-        .unwrap();
+    let old = db.open_session("app", "chat", "create", &p).unwrap();
+    db.accept(&old, record("turn-1", "old chat"), &p).unwrap();
     let job = db.claim("app").unwrap().unwrap();
     let result = compute_job(job.clone(), vec![1., 0.], p.clone())
         .await
         .unwrap();
     db.transition(&old, "reset").unwrap();
     assert!(db.verify(&old).is_err());
-    let current = db.open_session("app", "interview", "resume", &p).unwrap();
-    db.accept(&current, record("turn-1", "new interview"), &p)
+    let current = db.open_session("app", "chat", "resume", &p).unwrap();
+    db.accept(&current, record("turn-1", "new chat"), &p)
         .unwrap();
     let newer = db.claim("app").unwrap().unwrap();
     db.fail(&job, true).unwrap();
@@ -135,8 +134,8 @@ async fn reset_delete_and_failed_old_jobs_cannot_publish_into_new_generation() {
         .accept(&current, record("turn-1", "resurrection"), &p)
         .is_err());
     db.transition(&current, "delete").unwrap();
-    assert!(db.open_session("app", "interview", "create", &p).is_err());
-    assert!(db.open_session("app", "interview", "resume", &p).is_err());
+    assert!(db.open_session("app", "chat", "create", &p).is_err());
+    assert!(db.open_session("app", "chat", "resume", &p).is_err());
 }
 
 #[tokio::test]
@@ -144,7 +143,7 @@ async fn atomic_commit_fault_recovery_and_retry_keep_acknowledged_input() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = open_db(&dir);
     let p = TenantPolicy::default();
-    let scope = db.open_session("app", "interview", "create", &p).unwrap();
+    let scope = db.open_session("app", "chat", "create", &p).unwrap();
     db.accept(&scope, record("one", "durably accepted record"), &p)
         .unwrap();
     let job = db.claim("app").unwrap().unwrap();

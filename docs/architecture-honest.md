@@ -196,7 +196,7 @@ The diagrams above describe the legacy operator substrate. Application memory
 uses `src/services/tenants/` and `/api/v2/`: verified tenant/session capabilities,
 one SQLite database per application, session-local exact graphs/basins, and
 bounded shared CPU/provider work. All legacy memory surfaces become operator-only
-when tenant mode is configured. See [setup and API](tenant-session-memory.md).
+when tenant mode is configured. See the [tenant/session repair design](roadmap/epics/tenant-session-memory.md).
 
 The operator store now has a canonical SQLite checkpoint beside its JSONL WAL.
 Vectors, affected basins/edges and completion are committed together. Restart

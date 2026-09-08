@@ -1,27 +1,26 @@
 # Tenant and session memory: CPU repair design
 
-**Status:** Implemented in task worktrees; local verification recorded in the [implementation audit](../../reports/2026-09-08-tenant-session-implementation-audit.md). Live activation and workload acceptance remain operator-controlled.
-**Operator guide:** [Tenant/session setup](../../tenant-session-memory.md).
+**Status:** Implemented in a feature branch; live activation and workload acceptance remain operator-controlled.
 **Date:** 2026-09-08.
-**Requirements:** Explain the proper repairs for the [CPU findings](../../reports/2026-09-08-cn-serve-cpu.md), support applications such as LibWit as tenants, and isolate the individual sessions those applications create.
+**Requirements:** Explain the proper repairs for the [CPU findings](../../reports/2026-09-08-cn-serve-cpu.md), support application-side integrations as tenants, and isolate the individual sessions those applications create.
 
 ## The boundary
 
 A **memory scope** is one authenticated application tenant and one authorized application session: `(tenant_id, session_id)`.
 
-LibWit owns its tenant. Each interview or practice session owns its memories. Neither another application nor another LibWit session participates in that session's retrieval, basins, graph, summaries, reconstruction, caches, or consolidation. Individual-user tenancy is not a requirement of this design; user authorization can be added above the session ownership model later.
+Each application tenant owns its scope. Each session under that tenant owns its memories. Neither another application nor another session of the same application participates in that session's retrieval, basins, graph, summaries, reconstruction, caches, or consolidation. Individual-user tenancy is not a requirement of this design; user authorization can be added above the session ownership model later.
 
-The repository path `~/ps/libwit_v1` identifies a development checkout, not an authorization credential. Its current resolved path is `/Volumes/docker-ssd/ps/libwit_v1`. Register an application identifier such as `libwit` independently of that path, so moving the checkout does not move or rename its memory.
+Register an application identifier independently of any local checkout path, so moving or renaming a development directory does not move or rename memory.
 
-Keep application runtime memory separate from coding-agent transcripts about that application. LibWit's conversation memory should start as a new, empty scope; existing project-tagged developer transcripts are not automatically imported into it.
+Keep application runtime memory separate from coding-agent transcripts about that application. A new application tenant's conversation memory should start as a new, empty scope; existing project-tagged developer transcripts are not automatically imported into it.
 
 ```mermaid
 flowchart TD
-    LW["LibWit application"] --> Auth["Verify tenant identity and session authorization"]
+    LW["Application tenant"] --> Auth["Verify tenant identity and session authorization"]
     Other["Other applications"] --> Auth
     Auth --> Router["Resolve MemoryScope"]
-    Router --> A["libwit / interview A<br/>records, vectors, basins, graph, caches"]
-    Router --> B["libwit / interview B<br/>records, vectors, basins, graph, caches"]
+    Router --> A["tenant / session A<br/>records, vectors, basins, graph, caches"]
+    Router --> B["tenant / session B<br/>records, vectors, basins, graph, caches"]
     Router --> C["other tenant / session C<br/>separate memory"]
     A --> Work["Bounded shared scheduler<br/>fair tenant and session queues"]
     B --> Work
@@ -40,17 +39,17 @@ The service may share transport clients and bounded compute capacity. Memory sta
 | `src/api/tools.rs::retrieve` | Missing session means global search; optional `session_ids` enables cross-session search | Session-bound callers cannot select global or foreign-session scope |
 | `src/api/middleware/request_context.rs::extract_user_id_from_auth` | Returns `None`; built-in authentication is not implemented | Verify tenant credentials before constructing a memory scope |
 | `src/services/consolidation.rs::consolidate_one` | Operates on global manager, keyed by fragment ID | Carry scope and content/model revisions through the complete job |
-| LibWit `electron/services/memory/ContextNestMemory.ts` | Sends a session ID but no tenant credential; defaults to port 8080 | Bind the adapter to authenticated application/session context; explicitly configure the cn-serve URL |
-| LibWit `electron/services/system-design/SystemDesignInterviewerBrain.ts::createInterviewerBrain` | Generates an `sd-practice-<UUID>` archive ID in the factory | Accept the application's canonical session ID, with clear new/resume semantics |
-| LibWit `electron/services/voice-agent/IncomingVoiceAgentService.ts` | Uses `live-interview-<instanceId>` for its archive | Verify that archive identity follows the interview lifecycle rather than incidental service recreation |
+| Example application memory adapter | Sends a session ID but no tenant credential; defaults to port 8080 | Bind the adapter to authenticated application/session context; explicitly configure the cn-serve URL |
+| Example session-factory pattern in an application | Generates an ephemeral archive ID inside the factory | Accept the application's canonical session ID, with clear new/resume semantics |
+| Example live-session pattern in an application | Uses a per-instance archive ID | Verify that archive identity follows the session lifecycle rather than incidental service recreation |
 
-These are the pre-repair source observations that motivated the implementation, not current v2 behavior or proof of a live LibWit-to-ContextNest connection. The adapter is opt-in through `CONVERSATION_MEMORY=contextnest`; its 300 ms recall timeout, 1,500 ms store timeout, eight-store in-flight cap, and fail-soft behavior are existing product constraints.
+These are the pre-repair source observations that motivated the implementation, not current v2 behavior. An application adapter is opt-in via its own configuration; typical constraints include short recall timeouts, bounded in-flight stores, and fail-soft behavior.
 
 ## 1. Enforce tenant and session ownership before accessing memory
 
 Use a server-verified tenant credential and a typed `MemoryScope` passed to repositories and workers. Do not derive authorization from a caller-provided `project_cwd`, metadata field, or unverified tenant header. This follows the trust-boundary guidance in the [OWASP multi-tenant security guide](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html).
 
-For local application integration, a registered application credential can create sessions. A session registration returns a credential/capability restricted to that session's read/write operations. LibWit's memory adapter then holds only that session capability. A body or route session selector must match the verified scope. A session-bound token can supply its session implicitly; an otherwise unscoped request must be rejected rather than defaulting to global search.
+For local application integration, a registered application credential can create sessions. A session registration returns a credential/capability restricted to that session's read/write operations. An application's memory adapter then holds only that session capability. A body or route session selector must match the verified scope. A session-bound token can supply its session implicitly; an otherwise unscoped request must be rejected rather than defaulting to global search.
 
 Keep credentials in trusted application-side configuration, not hard-coded into the distributed renderer bundle or logged with requests. Session IDs identify records; knowing an ID must not authorize access.
 
@@ -70,7 +69,7 @@ The conceptual names above map to `Registry`, `Tenant`, `MemoryScope` and per-se
 Move per-tenant choices into a versioned `TenantPolicy`: permitted ingestion
 adapters, memory kinds, retention, embedding-space identity, graph settings,
 and work limits. Process-wide environment variables cannot express different
-policies for simultaneous tenants. LibWit's initial profile is a conversation
+policies for simultaneous tenants. A typical initial profile is a conversation
 archive with session isolation and no implicit cross-session recall.
 
 Every derived-cache identity includes its scope and the relevant content/model
@@ -79,11 +78,11 @@ response cache. Jobs, file offsets, and deduplication keys carry scope too.
 
 An ownership audit must cover store, retrieve, update, discard, summarize, reconstruct, resonate, fragments, sessions, features, inbox, field views, exports, LLM caches, hooks, coordination, and background work. Each surface is either scoped to the caller or explicitly restricted to an operator capability. Global operator views need deliberate authorization; the current unauthenticated global behavior cannot remain a back door into new tenants.
 
-**Example:** a capability for `libwit/interview-A` cannot use `session_id=interview-B`, a `session_ids` list, or a known foreign fragment ID to read or change B. A summary or graph expansion from A also cannot inspect B.
+**Example:** a capability for `tenant/session-A` cannot use `session_id=session-B`, a `session_ids` list, or a known foreign fragment ID to read or change B. A summary or graph expansion from A also cannot inspect B.
 
 ## 2. Fix graph and basin CPU at the same boundary
 
-For LibWit, first use **exact search inside one session**, with cached vector norms and bounded top-K selection. This reduces the number of candidates while preserving exact scoring within the intended scope. A hypothetical 500-record interview compares at most its own 500 records, rather than the approximately 148,000 graph nodes observed in the diagnostic run. That is a candidate-count comparison, not a claimed runtime speedup.
+For a session-bound conversation adapter, first use **exact search inside one session**, with cached vector norms and bounded top-K selection. This reduces the number of candidates while preserving exact scoring within the intended scope. A hypothetical 500-record session compares at most its own 500 records, rather than the approximately 148,000 graph nodes observed in the diagnostic run. That is a candidate-count comparison, not a claimed runtime speedup.
 
 Maintain scope-local basin and graph indexes. Keep a single authoritative vector representation where practical and share immutable vector buffers within the scope, rather than repeatedly copying vectors between sidecars and temporary scan results. Cached norms must be invalidated with vector revision; zero, nonfinite, and wrong-dimension vectors need explicit handling.
 
@@ -97,7 +96,7 @@ For approximate basin lookup, a false negative can create an unnecessary new bas
 
 **Acceptance:** session A's results and processing cost are independent of added records in session B, except for shared resource contention. Exact mode matches a reference implementation. Approximate mode, if introduced, reports recall and basin behavior on representative data before activation.
 
-## 3. Bound work without delaying the interview
+## 3. Bound work without delaying the session
 
 Separate network concurrency from CPU concurrency. Keep an async coordinator for embeddings and a bounded CPU executor for graph/basin computation. Acquire admission before spawning work; otherwise a semaphore can merely hide an unbounded queue of waiting tasks. Use tenant fairness and session fairness within each tenant so one import cannot monopolize execution.
 
@@ -109,13 +108,13 @@ Carry cancellation, session generation, content revision, and model revision thr
 
 Use a durable pending-work record if accepted work must survive saturation or restart. A full in-memory notification channel should leave durable work pending, not silently lose it. Otherwise return explicit overload before acknowledging acceptance. Retry transient failures with capped backoff and jitter; surface terminal failures separately from queued and in-flight counts.
 
-LibWit's direct HTTP `store` path currently performs canonical processing synchronously. Optimizing only the hook consolidation worker would miss that path. Preserve the existing `stored: true` visibility contract on the legacy endpoint. If LibWit needs asynchronous acceptance, introduce an explicitly documented response such as `202` with `indexing_status=pending`, after durable acceptance, and update the adapter deliberately. Do not silently redefine an existing successful response as "possibly queued."
+The direct HTTP `store` path currently performs canonical processing synchronously. Optimizing only the hook consolidation worker would miss that path. Preserve the existing `stored: true` visibility contract on the legacy endpoint. If an application needs asynchronous acceptance, introduce an explicitly documented response such as `202` with `indexing_status=pending`, after durable acceptance, and update the adapter deliberately. Do not silently redefine an existing successful response as "possibly queued."
 
-The current lossy archive contract remains: recall failure returns no extra context, and memory cannot delay audio or answer publication. Preserve bounded stores, combine caller cancellation with the request timeout, and verify caller session identity before using a late recall result. Fast local search alone does not guarantee a 300 ms end-to-end recall when query embedding uses a remote provider; measure that round trip too. Provider/model changes require an explicit tenant policy and reindex, not a hidden fallback.
+A lossy-archive adapter contract remains: recall failure returns no extra context, and memory cannot delay audio or answer publication. Preserve bounded stores, combine caller cancellation with the request timeout, and verify caller session identity before using a late recall result. Fast local search alone does not guarantee sub-second end-to-end recall when query embedding uses a remote provider; measure that round trip too. Provider/model changes require an explicit tenant policy and reindex, not a hidden fallback.
 
 ## 4. Tail only new transcript data
 
-LibWit runtime tenants that store structured turns through the API do not need the coding-agent transcript sweeper. Enable that ingestion adapter only for tenants that use it, with registered source roots and ownership. An ordinary tenant request must not cause the server to read an arbitrary host filesystem path.
+Application runtime tenants that store structured turns through the API do not need the coding-agent transcript sweeper. Enable that ingestion adapter only for tenants that use it, with registered source roots and ownership. An ordinary tenant request must not cause the server to read an arbitrary host filesystem path.
 
 For enabled transcript ingestion:
 
@@ -142,7 +141,7 @@ Track CPU seconds, queue wait, embedding latency, candidates scored, consolidati
 
 ## 6. Make duplicate delivery harmless
 
-Use `(tenant_id, session_id, source_event_id)` as the logical event identity. A transcript adapter may derive the event ID from source generation and record identity; LibWit should use its existing turn/event ID. Content alone is insufficient because the same sentence can legitimately occur twice.
+Use `(tenant_id, session_id, source_event_id)` as the logical event identity. A transcript adapter may derive the event ID from source generation and record identity; an application should use its existing turn/event ID. Content alone is insufficient because the same sentence can legitimately occur twice.
 
 Keep caller metadata separate from server-owned processing metadata. An identical redelivery preserves embeddings, completion status, basin membership, and edges. It does not schedule another consolidation. An existing event ID with a different payload is either an explicit new revision or a conflict; it must not silently overwrite completed state.
 
@@ -165,17 +164,17 @@ Native search indexes are derived accelerators. Tag snapshots with their scope a
 
 A session-only store may not need an ANN file at all. Tenant databases can contain many sessions; use lazy loading and a bounded cache of active session indexes rather than allocating a thread or opening a database for every session.
 
-Migration must use a copy of the existing JSONL WAL and an explicit legacy operator tenant. Validate ownership before moving any legacy records. Unclassified records remain in the legacy scope. Do not infer a security owner solely from `project_cwd` or mix legacy coding-agent data into LibWit runtime sessions. Choose and test the database durability settings; the repaired JSONL append calls `flush()` followed by `sync_data()`; v2 durable acceptance uses a SQLite commit.
+Migration must use a copy of the existing JSONL WAL and an explicit legacy operator tenant. Validate ownership before moving any legacy records. Unclassified records remain in the legacy scope. Do not infer a security owner solely from `project_cwd` or mix legacy coding-agent data into application runtime sessions. Choose and test the database durability settings; the repaired JSONL append calls `flush()` followed by `sync_data()`; v2 durable acceptance uses a SQLite commit.
 
 **Acceptance:** crash/restart around each commit boundary, no foreign-session restoration, no lost acknowledged durable records, no resurrection after deletion, and no unnecessary re-embedding of completed records. A model or pipeline-version change rebuilds only affected scopes.
 
-## 8. Tie LibWit memory to the actual session lifecycle
+## 8. Tie application memory to the actual session lifecycle
 
-Create the archive identity in LibWit's session lifecycle owner and pass it into both the interviewer-brain and voice-service factories. A new interview gets a new scope; recreating a service inside the same interview keeps the scope. Explicit resume reuses the saved session identity after authorization. Closing, deleting, and resuming are distinct operations.
+Create the archive identity in the application's session lifecycle owner and pass it into any downstream service factories. A new session gets a new scope; recreating a service inside the same session keeps the scope. Explicit resume reuses the saved session identity after authorization. Closing, deleting, and resuming are distinct operations.
 
-The existing adapter should receive a session-bound ContextNest client rather than constructing authorization and scope from arbitrary per-call options. The client carries the same scope for stores and recalls. Keep `CONVERSATION_MEMORY` opt-in and use `CONTEXTNEST_URL=http://127.0.0.1:28080` for the current `make cn-serve` endpoint; the repaired adapter defaults to that same port 28080.
+An application adapter should receive a session-bound ContextNest client rather than constructing authorization and scope from arbitrary per-call options. The client carries the same scope for stores and recalls. Keep the adapter opt-in via application configuration and point it at `CONTEXTNEST_URL=http://127.0.0.1:28080` for the current `make cn-serve` endpoint.
 
-A future tenant-wide knowledge library is a separately authorized collection. It is not implicit access to all interview histories. Any explicit promotion from a session must preserve provenance and the intended retention policy.
+A future tenant-wide knowledge library is a separately authorized collection. It is not implicit access to all session histories. Any explicit promotion from a session must preserve provenance and the intended retention policy.
 
 ## 9. Make build and runtime identity dependable
 
@@ -187,21 +186,21 @@ Production can continue to run an immutable prebuilt artifact directly. Restart 
 
 | Phase | Deliverable | Required evidence before marking implemented |
 |---|---|---|
-| 1 | `MemoryScope` ownership and an empty LibWit tenant with session lifecycle | Negative cross-tenant and cross-session cases for every data surface; missing/mismatched scope cannot enable global access |
+| 1 | `MemoryScope` ownership and an empty application tenant with session lifecycle | Negative cross-tenant and cross-session cases for every data surface; missing/mismatched scope cannot enable global access |
 | 2 | Scope-local exact graph/basin search, idempotent ingest, cheap health reads, incremental transcript reads | Reference-result parity, unchanged-file no-read behavior, duplicates produce no extra work, allocation/candidate-count reduction |
-| 3 | Bounded fair processing and LibWit adapter integration | Saturate another tenant while an interview remains within its recall budget; close/reset cannot publish stale results; dropped stores remain observable |
+| 3 | Bounded fair processing and application adapter integration | Saturate another tenant while a session remains within its recall budget; close/reset cannot publish stale results; dropped stores remain observable |
 | 4 | Tenant persistence and restart recovery | Isolated copied-data migration, fault-injection restart tests, canonical/checkpoint consistency, per-session deletion and resume |
 | 5 | Optional large-scope approximate indexing | Measured benefit over exact scoped search, declared recall/attachment targets, safe update/removal, and index-rebuild behavior |
 | Throughout | Build identity and reproducible performance measurements | Intended artifact visible at runtime; comparisons use the same data, arrivals, embedding behavior, and session layout |
 
-Phase 1 is initially a test/local prototype boundary, not permission to expose an unfinished tenant service. All relevant phase gates are required before production use. Lower CPU alone is insufficient if memory isolation, retrieval quality, durable acceptance, or interview responsiveness regress.
+Phase 1 is initially a test/local prototype boundary, not permission to expose an unfinished tenant service. All relevant phase gates are required before production use. Lower CPU alone is insufficient if memory isolation, retrieval quality, durable acceptance, or session responsiveness regress.
 
-The user requirement and relevant docs were reviewed twice: first to map the diagnostic findings to concrete repairs, then against the clarified application-plus-session boundary and LibWit's existing adapter contract. This document satisfies the design/explanation task. The implementation task subsequently added the v2 scoped API, canonical persistence, bounded CPU/ingestion work and LibWit lifecycle integration. See the implementation audit for its two review passes, test receipts and the separate live activation gate. No live-data migration has been performed.
+The design was reviewed against the diagnostic findings and against the application-plus-session boundary described above. The implementation task added the v2 scoped API, canonical persistence, bounded CPU/ingestion work, and an application lifecycle integration contract. No live-data migration is performed by this change.
 
 ## Examples across application domains
 
-For an AIDolFin assistant, the application tenant could own a separate case session for each document-analysis conversation. A memory derived from one case must not influence another case's retrieval through a shared basin. This is an isolation example, not tax advice.
+For a document-analysis assistant, the application tenant could own a separate case session for each conversation. A memory derived from one case must not influence another case's retrieval through a shared basin.
 
-For a Flutter app-building agent, the application tenant could isolate each app-building session. Replaying a widget decision should not create repeated processing, and resetting the session must reject late results from the previous generation.
+For a UI-building code agent, the application tenant could isolate each build session. Replaying a widget decision should not create repeated processing, and resetting the session must reject late results from the previous generation.
 
-Both follow the same practical pattern as LibWit: authenticated scope first, small local search space, revision-aware background work, and persistence aligned with the session lifecycle.
+Both follow the same practical pattern: authenticated scope first, small local search space, revision-aware background work, and persistence aligned with the session lifecycle.

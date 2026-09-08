@@ -286,5 +286,5 @@ dev-fe: ## Run the web dashboard (vite). Hot-reload via Vite HMR.
 	@cd web && pnpm dev
 
 .PHONY: cn-tenant-config
-cn-tenant-config: ## Write private server/LibWit configuration, without restarting either app.
+cn-tenant-config: ## Write private server + application-tenant configuration files, without restarting the service.
 	python3 scripts/configure_tenants.py

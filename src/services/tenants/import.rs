@@ -202,7 +202,7 @@ use rusqlite::OptionalExtension;
 mod tests {
     use super::*;
     #[test]
-    fn copied_wal_migration_is_explicit_and_never_assigns_libwit_ownership() {
+    fn copied_wal_migration_is_explicit_and_never_assigns_named_tenant_ownership() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("wal.copy.jsonl");
         let output = dir.path().join("migrated");
@@ -212,7 +212,7 @@ mod tests {
             content: "coding memory".into(),
             importance: 0.5,
             metadata: std::collections::HashMap::from([
-                ("project_cwd".into(), "/ps/libwit_v1".into()),
+                ("project_cwd".into(), "/tmp/example-app".into()),
                 ("_cn_consolidated".into(), true.into()),
             ]),
         };
@@ -227,7 +227,7 @@ mod tests {
         let report = migrate_copy(&source, &output, "local-test-space", true).unwrap();
         assert!(report.applied);
         assert_eq!(report.tenant, "legacy-operator");
-        assert!(!output.join("libwit.sqlite").exists());
+        assert!(!output.join("example-app.sqlite").exists());
         let db = rusqlite::Connection::open(output.join("legacy-operator.sqlite")).unwrap();
         let state: String = db
             .query_row("SELECT state FROM records", [], |r| r.get(0))

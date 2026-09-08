@@ -3,7 +3,7 @@
 ContextNest accepts operator-authorized hook events at
 `/api/v1/cc/hook/<event>` and tails only newly committed transcript bytes.
 This ingestion path belongs to the operator store; it cannot write into an
-application tenant such as LibWit. See [tenant setup](../tenant-session-memory.md).
+application tenant. See the [tenant/session repair design](../roadmap/epics/tenant-session-memory.md).
 
 ## Install or upgrade
 
