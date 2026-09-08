@@ -24,6 +24,23 @@ use crate::services::ContextNestServices;
 /// Domain-specific routes should be registered via the plugin system.
 /// See examples/domains/ for domain implementations.
 pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<Router> {
+    let embedding = services.embedding.clone();
+    let tenant_registry = crate::services::compute::run(move || {
+        crate::services::tenants::Registry::from_env(embedding)
+    })
+    .await
+    .map_err(crate::error::ContextNestError::Validation)?
+    .map_err(|e| crate::error::ContextNestError::Validation(e.to_string()))?;
+    if let Some(registry) = tenant_registry.as_ref() {
+        registry.spawn_worker();
+    }
+    create_simple_app_with_tenants(services, tenant_registry).await
+}
+
+pub async fn create_simple_app_with_tenants(
+    services: ContextNestServices,
+    tenant_registry: Option<Arc<crate::services::tenants::Registry>>,
+) -> crate::Result<Router> {
     // Create service container for dependency injection
     let service_container = ServiceContainer::new().await?;
 
@@ -53,11 +70,13 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
     // session abandoned before Stop fires) cannot strand a session's
     // recent z-insight blocks out of the inbox. The hook path remains
     // the primary delivery channel; this is the "pull" backstop.
-    cc_hooks::spawn_sweeper(
-        services.clone(),
-        session_tracker.clone(),
-        std::time::Duration::from_secs(30),
-    );
+    if std::env::var("CONTEXTNEST_TRANSCRIPT_SWEEPER").as_deref() != Ok("false") {
+        cc_hooks::spawn_sweeper(
+            services.clone(),
+            session_tracker.clone(),
+            std::time::Duration::from_secs(30),
+        );
+    }
 
     let base_router = Router::new()
         .route("/api/health", get(health_check))
@@ -76,14 +95,28 @@ pub async fn create_simple_app(services: ContextNestServices) -> crate::Result<R
         .layer(Extension(session_tracker))
         .with_state(services);
 
+    let base_router = if let Some(registry) = tenant_registry {
+        base_router
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(axum::middleware::from_fn_with_state(
+                registry.clone(),
+                crate::api::tenants::operator_gate,
+            ))
+            .merge(crate::api::tenants::router(registry))
+    } else {
+        base_router
+    };
+
     info!("Core API initialized (domain-agnostic)");
     info!("Delete endpoints registered");
 
-    Ok(base_router.layer(
-        ServiceBuilder::new()
-            .layer(TraceLayer::new_for_http())
-            .layer(CorsLayer::permissive()),
-    ))
+    Ok(base_router
+        .layer(axum::middleware::from_fn(request_budget))
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(CorsLayer::permissive()),
+        ))
 }
 
 /// Simple health check endpoint
@@ -119,4 +152,18 @@ struct StatusResponse {
     version: String,
     name: String,
     description: String,
+}
+
+/// Admission happens before a CPU permit can be awaited or a body processed.
+async fn request_budget(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    static LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let budget = LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64)));
+    let Ok(_permit) = budget.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    next.run(request).await
 }

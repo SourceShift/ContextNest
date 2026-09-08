@@ -1,0 +1,434 @@
+{
+  "investigation": "ContextNest make cn-serve CPU investigation",
+  "captured_on": "2026-09-08",
+  "timezone": "Europe/Berlin",
+  "source_commit": "ca817d854f769811a6ff1aeb300a7dad60d2ea87",
+  "source_branch": "fix/consolidation-drain-cpu",
+  "process": {
+    "pid": 79463,
+    "parent_pid": 79438,
+    "launch_local": "2026-09-02T10:01:41+02:00",
+    "command": "./target/release/contextnest serve --bind 127.0.0.1:28080",
+    "binary_mtime_local": "2026-08-17T20:17:54.099361+02:00"
+  },
+  "sample": {
+    "command": "sample 79463 12 10 -file /tmp/contextnest-cpu-20260908.rSdFFT/contextnest-sample.txt",
+    "raw_path": "/tmp/contextnest-cpu-20260908.rSdFFT/contextnest-sample.txt",
+    "header": [
+      "Analysis of sampling contextnest (pid 79463) every 10 milliseconds",
+      "Process:         contextnest [79463]",
+      "Path:            /Volumes/VOLUME/*/contextnest",
+      "Load Address:    0x1008f4000",
+      "Identifier:      contextnest",
+      "Version:         0",
+      "Code Type:       ARM64",
+      "Platform:        macOS",
+      "Parent Process:  make [79438]",
+      "Target Type:     live task",
+      "",
+      "Date/Time:       2026-09-08 09:49:39.248 +0200",
+      "Launch Time:     2026-09-02 10:01:41.376 +0200",
+      "OS Version:      macOS 15.4.1 (24E263)",
+      "Report Version:  7",
+      "Analysis Tool:   /usr/bin/sample",
+      "",
+      "Physical footprint:         5.4G",
+      "Physical footprint (peak):  6.1G",
+      "Idle exit:                  untracked",
+      "----",
+      ""
+    ],
+    "collapsed_leaf_summary": [
+      "Sort by top of stack, same collapsed (when >= 5):",
+      "        __psynch_cvwait  (in libsystem_kernel.dylib)        12993",
+      "        kevent  (in libsystem_kernel.dylib)        1092",
+      "        __workq_kernreturn  (in libsystem_kernel.dylib)        808",
+      "        contextnest::memory::attractors::utils::cosine_similarity::h42f4867a456719c9  (in contextnest)        582",
+      "        read  (in libsystem_kernel.dylib)        138",
+      "        contextnest::memory::attractors::memory_attractor_manager::MemoryAttractorManager::process_memories::_$u7b$$u7b$closure$u7d$$u7d$::h3bea1e525ee564c8  (in contextnest)        132",
+      "        _platform_memcmp  (in libsystem_platform.dylib)        36",
+      "        __open  (in libsystem_kernel.dylib)        8",
+      ""
+    ]
+  },
+  "profiled_window": {
+    "note": "Includes stack profiling and diagnostic GETs near the end; not comparable as a controlled experiment with the later window.",
+    "summary": {
+      "wall_seconds": 20.224416790995747,
+      "cpu_seconds": 9.970000000001164,
+      "average_core_percent": 49.2968479785285,
+      "peak_ps_percent": 91.0
+    },
+    "samples": [
+      {
+        "at": "2026-09-08T09:49:39.216357+02:00",
+        "monotonic": 560515.2080645,
+        "ps": "79463 769:56.46   0.0 4006128"
+      },
+      {
+        "at": "2026-09-08T09:49:40.225223+02:00",
+        "monotonic": 560516.216809583,
+        "ps": "79463 769:56.46   0.0 4006240"
+      },
+      {
+        "at": "2026-09-08T09:49:41.232698+02:00",
+        "monotonic": 560517.224272916,
+        "ps": "79463 769:56.46   0.0 4006240"
+      },
+      {
+        "at": "2026-09-08T09:49:42.247877+02:00",
+        "monotonic": 560518.239446916,
+        "ps": "79463 769:56.78  34.1 4291040"
+      },
+      {
+        "at": "2026-09-08T09:49:43.261589+02:00",
+        "monotonic": 560519.253496291,
+        "ps": "79463 769:57.32  70.0 3156336"
+      },
+      {
+        "at": "2026-09-08T09:49:44.275524+02:00",
+        "monotonic": 560520.267078,
+        "ps": "79463 769:58.14  84.7 3622112"
+      },
+      {
+        "at": "2026-09-08T09:49:45.282167+02:00",
+        "monotonic": 560521.273793041,
+        "ps": "79463 769:58.90  75.6 3537616"
+      },
+      {
+        "at": "2026-09-08T09:49:46.289416+02:00",
+        "monotonic": 560522.280898625,
+        "ps": "79463 769:59.43  59.5 3507936"
+      },
+      {
+        "at": "2026-09-08T09:49:47.303738+02:00",
+        "monotonic": 560523.295205166,
+        "ps": "79463 770:00.24  81.1 3512624"
+      },
+      {
+        "at": "2026-09-08T09:49:48.323193+02:00",
+        "monotonic": 560524.314630333,
+        "ps": "79463 770:01.16  91.0 3515392"
+      },
+      {
+        "at": "2026-09-08T09:49:49.336503+02:00",
+        "monotonic": 560525.327968166,
+        "ps": "79463 770:02.04  86.4 3488384"
+      },
+      {
+        "at": "2026-09-08T09:49:50.350437+02:00",
+        "monotonic": 560526.343526208,
+        "ps": "79463 770:02.84  87.6 3445344"
+      },
+      {
+        "at": "2026-09-08T09:49:51.360592+02:00",
+        "monotonic": 560527.35197325,
+        "ps": "79463 770:03.55  73.7 3287312"
+      },
+      {
+        "at": "2026-09-08T09:49:52.373026+02:00",
+        "monotonic": 560528.364399583,
+        "ps": "79463 770:04.41  88.4 3431072"
+      },
+      {
+        "at": "2026-09-08T09:49:53.381287+02:00",
+        "monotonic": 560529.372626125,
+        "ps": "79463 770:05.31  90.6 3435392"
+      },
+      {
+        "at": "2026-09-08T09:49:54.393984+02:00",
+        "monotonic": 560530.385381583,
+        "ps": "79463 770:05.70  12.4 3437248"
+      },
+      {
+        "at": "2026-09-08T09:49:55.405597+02:00",
+        "monotonic": 560531.396906833,
+        "ps": "79463 770:05.70   0.2 3437248"
+      },
+      {
+        "at": "2026-09-08T09:49:56.414763+02:00",
+        "monotonic": 560532.406039958,
+        "ps": "79463 770:05.70   0.0 3437248"
+      },
+      {
+        "at": "2026-09-08T09:49:57.426310+02:00",
+        "monotonic": 560533.417569916,
+        "ps": "79463 770:06.00  50.2 3763648"
+      },
+      {
+        "at": "2026-09-08T09:49:58.430532+02:00",
+        "monotonic": 560534.421766291,
+        "ps": "79463 770:06.43  19.0 4271936"
+      },
+      {
+        "at": "2026-09-08T09:49:59.441252+02:00",
+        "monotonic": 560535.432481291,
+        "ps": "79463 770:06.43   0.4 4271936"
+      }
+    ]
+  },
+  "unprofiled_window": {
+    "summary": {
+      "wall_seconds": 30.27815691602882,
+      "cpu_seconds": 2.1900000000023283,
+      "average_core_percent": 7.232936952126614,
+      "peak_ps_percent": 80.7,
+      "before": {
+        "at": "2026-09-08T09:51:02.940280+02:00",
+        "elapsed_seconds": 0.30959920899476856,
+        "data": {
+          "total_fragments": 148308,
+          "consolidated_count": 148224,
+          "lag": 84,
+          "queued": 0,
+          "succeeded_total": 378015,
+          "failed_total": 35,
+          "last_lap_ms": 11305,
+          "initial_scan_complete": true
+        }
+      },
+      "after": {
+        "at": "2026-09-08T09:51:33.335021+02:00",
+        "elapsed_seconds": 0.11172362498473376,
+        "data": {
+          "total_fragments": 148309,
+          "consolidated_count": 148225,
+          "lag": 84,
+          "queued": 0,
+          "succeeded_total": 378016,
+          "failed_total": 35,
+          "last_lap_ms": 4201,
+          "initial_scan_complete": true
+        }
+      }
+    },
+    "samples": [
+      {
+        "at": "2026-09-08T09:51:02.940420+02:00",
+        "monotonic": 560598.93036725,
+        "ps": "79463 770:10.61  39.4 714368"
+      },
+      {
+        "at": "2026-09-08T09:51:03.950138+02:00",
+        "monotonic": 560599.940279083,
+        "ps": "79463 770:10.61   1.7 521136"
+      },
+      {
+        "at": "2026-09-08T09:51:04.960593+02:00",
+        "monotonic": 560600.950585083,
+        "ps": "79463 770:10.61   0.0 470272"
+      },
+      {
+        "at": "2026-09-08T09:51:05.970309+02:00",
+        "monotonic": 560601.960278625,
+        "ps": "79463 770:10.61   0.0 468432"
+      },
+      {
+        "at": "2026-09-08T09:51:06.979471+02:00",
+        "monotonic": 560602.969396208,
+        "ps": "79463 770:10.61   0.0 468432"
+      },
+      {
+        "at": "2026-09-08T09:51:07.988791+02:00",
+        "monotonic": 560603.978684541,
+        "ps": "79463 770:10.61   0.0 470512"
+      },
+      {
+        "at": "2026-09-08T09:51:08.995855+02:00",
+        "monotonic": 560604.98594775,
+        "ps": "79463 770:10.61   0.8 474000"
+      },
+      {
+        "at": "2026-09-08T09:51:10.005367+02:00",
+        "monotonic": 560605.995233208,
+        "ps": "79463 770:10.61   0.0 474000"
+      },
+      {
+        "at": "2026-09-08T09:51:11.014392+02:00",
+        "monotonic": 560607.004237458,
+        "ps": "79463 770:10.61   0.0 474000"
+      },
+      {
+        "at": "2026-09-08T09:51:12.024354+02:00",
+        "monotonic": 560608.014185666,
+        "ps": "79463 770:10.96  41.3 823776"
+      },
+      {
+        "at": "2026-09-08T09:51:13.038711+02:00",
+        "monotonic": 560609.028516833,
+        "ps": "79463 770:11.24  21.6 586080"
+      },
+      {
+        "at": "2026-09-08T09:51:14.046032+02:00",
+        "monotonic": 560610.035856583,
+        "ps": "79463 770:11.24   0.2 476016"
+      },
+      {
+        "at": "2026-09-08T09:51:15.058940+02:00",
+        "monotonic": 560611.048690583,
+        "ps": "79463 770:11.25   0.4 322016"
+      },
+      {
+        "at": "2026-09-08T09:51:16.068238+02:00",
+        "monotonic": 560612.058002083,
+        "ps": "79463 770:11.25   0.0 322000"
+      },
+      {
+        "at": "2026-09-08T09:51:17.077169+02:00",
+        "monotonic": 560613.06689625,
+        "ps": "79463 770:11.25   0.0 305952"
+      },
+      {
+        "at": "2026-09-08T09:51:18.086155+02:00",
+        "monotonic": 560614.07585,
+        "ps": "79463 770:11.84  80.7 2326944"
+      },
+      {
+        "at": "2026-09-08T09:51:19.093875+02:00",
+        "monotonic": 560615.083553958,
+        "ps": "79463 770:12.42  31.6 3598624"
+      },
+      {
+        "at": "2026-09-08T09:51:20.103720+02:00",
+        "monotonic": 560616.093381333,
+        "ps": "79463 770:12.42   0.6 3599552"
+      },
+      {
+        "at": "2026-09-08T09:51:21.112026+02:00",
+        "monotonic": 560617.101670125,
+        "ps": "79463 770:12.43   1.6 3625616"
+      },
+      {
+        "at": "2026-09-08T09:51:22.122380+02:00",
+        "monotonic": 560618.11199775,
+        "ps": "79463 770:12.59   2.1 3989792"
+      },
+      {
+        "at": "2026-09-08T09:51:23.132315+02:00",
+        "monotonic": 560619.1219585,
+        "ps": "79463 770:12.59   0.0 3989792"
+      },
+      {
+        "at": "2026-09-08T09:51:24.141184+02:00",
+        "monotonic": 560620.130772416,
+        "ps": "79463 770:12.59   0.0 3989776"
+      },
+      {
+        "at": "2026-09-08T09:51:25.149321+02:00",
+        "monotonic": 560621.138878625,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:26.158861+02:00",
+        "monotonic": 560622.148411416,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:27.169663+02:00",
+        "monotonic": 560623.159198791,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:28.177344+02:00",
+        "monotonic": 560624.166910958,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:29.185719+02:00",
+        "monotonic": 560625.175202166,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:30.195099+02:00",
+        "monotonic": 560626.184599833,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:31.205180+02:00",
+        "monotonic": 560627.194626708,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:32.211660+02:00",
+        "monotonic": 560628.201142208,
+        "ps": "79463 770:12.59   0.0 3989744"
+      },
+      {
+        "at": "2026-09-08T09:51:33.219054+02:00",
+        "monotonic": 560629.208524166,
+        "ps": "79463 770:12.80   9.6 4040160"
+      }
+    ]
+  },
+  "initial_consolidation": {
+    "url": "http://127.0.0.1:28080/api/v1/substrate/consolidation",
+    "at": "2026-09-08T09:49:57.342978+02:00",
+    "status": 200,
+    "elapsed_seconds": 0.3117710000369698,
+    "data": {
+      "total_fragments": 148308,
+      "consolidated_count": 148224,
+      "lag": 84,
+      "queued": 0,
+      "succeeded_total": 378015,
+      "failed_total": 35,
+      "last_lap_ms": 11305,
+      "initial_scan_complete": true
+    }
+  },
+  "initial_health": {
+    "url": "http://127.0.0.1:28080/api/v1/substrate/health",
+    "at": "2026-09-08T09:49:57.946620+02:00",
+    "status": 200,
+    "elapsed_seconds": 0.6028726249933243,
+    "data": {
+      "fragments": {
+        "total": 148308,
+        "consolidated": 148224,
+        "lag": 84
+      },
+      "basins": {
+        "count": 85435,
+        "avg_mass": 1.736279,
+        "max_mass": 2501
+      },
+      "connections": {
+        "edges": 3199761,
+        "avg_degree": 43.158653,
+        "nodes": 148279
+      },
+      "decay": {
+        "half_life_days": 60.0,
+        "median_fragment_age_days": 10.94082175925926
+      }
+    }
+  },
+  "runtime_config": {
+    "url": "http://127.0.0.1:28080/api/v1/substrate/config",
+    "at": "2026-09-08T09:51:20.072364+02:00",
+    "status": 200,
+    "data": {
+      "version": "0.1.0",
+      "git_commit": "unknown",
+      "embedding": {
+        "model": "qwen3-deepinfra"
+      },
+      "llm": {
+        "enabled": true,
+        "default_provider": "openai",
+        "configured_providers": [
+          "openai"
+        ]
+      },
+      "llm_cache": {
+        "encryption_enabled": false,
+        "similarity_threshold": 0.92,
+        "default_ttl_secs": 3600,
+        "total_entries": 0,
+        "redactor_enabled": true,
+        "redactor_rule_count": 3
+      }
+    }
+  },
+  "configuration_note": "Local config.toml specifies embedding dimensions 1024; actual live vector lengths were not enumerated."
+}

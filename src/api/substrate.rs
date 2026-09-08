@@ -55,6 +55,8 @@ pub struct ConsolidationStatus {
     /// Cumulative failures since startup. Each one is a warn-level log
     /// line with the fragment id + error.
     pub failed_total: usize,
+    pub terminal_failed: usize,
+    pub processing_ms: u64,
     /// Wall-clock duration of the most recent non-empty batch (ms).
     /// Useful for spotting embedder slowdowns.
     pub last_lap_ms: u64,
@@ -106,6 +108,8 @@ pub async fn get_consolidation_status(
         queued: metrics.queued,
         succeeded_total: metrics.consolidated,
         failed_total: metrics.failed,
+        terminal_failed: metrics.terminal_failed,
+        processing_ms: metrics.processing_ms,
         last_lap_ms: metrics.last_lap_ms,
         initial_scan_complete: metrics.initial_scan_complete,
     }))
@@ -121,22 +125,24 @@ pub async fn get_consolidation_status(
 /// (c) the decay knob is set sanely. Failure mode: if any nested
 /// stat is zero on a populated substrate, the corresponding code
 /// path is dormant.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SubstrateHealth {
+    pub collected_at: String,
+    pub process_cpu_seconds: Option<f64>,
     pub fragments: FragmentStats,
     pub basins: BasinStats,
     pub connections: ConnectionStats,
     pub decay: DecayStats,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FragmentStats {
     pub total: usize,
     pub consolidated: usize,
     pub lag: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BasinStats {
     /// Count of basins currently in `MemoryAttractorManager.basin_manager`.
     /// Zero on a cold substrate; rises as the worker drains.
@@ -148,7 +154,7 @@ pub struct BasinStats {
     pub max_mass: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConnectionStats {
     /// Edge count in the learned-graph. Forms automatically via
     /// similarity-driven auto-connection inside `add_node` calls
@@ -161,8 +167,9 @@ pub struct ConnectionStats {
     pub nodes: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DecayStats {
+    pub collected_at: String,
     /// Currently-active half-life (env-overridable). Defaults to
     /// the same 60-day default the retrieve handler uses.
     pub half_life_days: f64,
@@ -173,9 +180,48 @@ pub struct DecayStats {
     pub median_fragment_age_days: f64,
 }
 
+pub struct HealthCacheEntry {
+    pub collected: std::time::Instant,
+    pub ages_collected: std::time::Instant,
+    pub revision: u64,
+    pub health: SubstrateHealth,
+}
+
 pub async fn get_substrate_health(
     State(services): State<ContextNestServices>,
 ) -> Result<Json<SubstrateHealth>, StatusCode> {
+    let mut cache = services.health_cache.lock().await;
+    let revision = services
+        .health_revision
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(entry) = cache.as_ref() {
+        if entry.revision == revision
+            && entry.collected.elapsed() < std::time::Duration::from_secs(5)
+        {
+            return Ok(Json(entry.health.clone()));
+        }
+    }
+    let previous_age = cache
+        .as_ref()
+        .filter(|entry| entry.ages_collected.elapsed() < std::time::Duration::from_secs(60));
+    let ages_collected = previous_age
+        .map(|e| e.ages_collected)
+        .unwrap_or_else(std::time::Instant::now);
+    let decay = previous_age.map(|e| e.health.decay.clone());
+    let health = collect_substrate_health(&services, decay).await?;
+    *cache = Some(HealthCacheEntry {
+        collected: std::time::Instant::now(),
+        ages_collected,
+        revision,
+        health: health.clone(),
+    });
+    Ok(Json(health))
+}
+
+async fn collect_substrate_health(
+    services: &ContextNestServices,
+    previous_decay: Option<DecayStats>,
+) -> Result<SubstrateHealth, StatusCode> {
     // Fragments — same union-of-sidecars logic as the
     // /consolidation endpoint, plus consolidation flag.
     let metadata = services.fragment_metadata.read().await;
@@ -195,7 +241,11 @@ pub async fn get_substrate_health(
             {
                 consolidated += 1;
             }
-            if let Some(ts) = meta.get("ts").and_then(|v| v.as_str()) {
+            if let Some(ts) = meta
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .filter(|_| previous_decay.is_none())
+            {
                 if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
                     let secs = (now - parsed.with_timezone(&chrono::Utc)).num_seconds() as f64;
                     if secs >= 0.0 {
@@ -211,12 +261,10 @@ pub async fn get_substrate_health(
     let lag = total.saturating_sub(consolidated);
 
     // Basins.
-    let snapshots = services.attractor_manager.list_basin_snapshots().await;
-    let basin_count = snapshots.len();
-    let (basin_total_members, basin_max_mass) = snapshots
-        .iter()
-        .map(|s| s.fragment_ids.len())
-        .fold((0usize, 0usize), |(sum, max), n| (sum + n, max.max(n)));
+    let (basin_count, basin_total_members, basin_max_mass) = services
+        .attractor_manager
+        .basin_membership_statistics()
+        .await;
     let basin_avg_mass = if basin_count > 0 {
         basin_total_members as f32 / basin_count as f32
     } else {
@@ -257,7 +305,9 @@ pub async fn get_substrate_health(
         }
     };
 
-    Ok(Json(SubstrateHealth {
+    Ok(SubstrateHealth {
+        collected_at: chrono::Utc::now().to_rfc3339(),
+        process_cpu_seconds: crate::services::compute::process_cpu_seconds(),
         fragments: FragmentStats {
             total,
             consolidated,
@@ -275,9 +325,15 @@ pub async fn get_substrate_health(
         },
         decay: DecayStats {
             half_life_days,
-            median_fragment_age_days: median_age,
+            median_fragment_age_days: previous_decay
+                .as_ref()
+                .map(|d| d.median_fragment_age_days)
+                .unwrap_or(median_age),
+            collected_at: previous_decay
+                .map(|d| d.collected_at)
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         },
-    }))
+    })
 }
 
 /// Admin endpoint that collapses near-duplicate basins via
@@ -361,6 +417,8 @@ pub struct SubstrateConfigResponse {
     /// CONTEXTNEST_GIT_COMMIT env var at build time), else "unknown".
     /// Lets the operator confirm which binary is running.
     pub git_commit: &'static str,
+    pub build_dirty: &'static str,
+    pub build_profile: &'static str,
     pub embedding: EmbeddingConfigView,
     pub llm: LlmConfigView,
     pub llm_cache: LlmCacheConfigView,
@@ -422,7 +480,9 @@ pub async fn get_substrate_config(
     let configured_providers = services.llm.configured_provider_kinds();
     Json(SubstrateConfigResponse {
         version: env!("CARGO_PKG_VERSION"),
-        git_commit: option_env!("CONTEXTNEST_GIT_COMMIT").unwrap_or("unknown"),
+        git_commit: env!("CONTEXTNEST_GIT_COMMIT"),
+        build_dirty: env!("CONTEXTNEST_BUILD_DIRTY"),
+        build_profile: env!("CONTEXTNEST_BUILD_PROFILE"),
         embedding: EmbeddingConfigView {
             model: services.embedding.configured_model_name().to_string(),
         },

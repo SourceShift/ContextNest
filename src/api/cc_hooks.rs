@@ -75,6 +75,7 @@ struct TrackedSession {
     offset: u64,
     transcript_path: Option<PathBuf>,
     cwd: Option<String>,
+    last_changed: Option<std::time::Instant>,
 }
 
 /// Per-session byte offset tracker for incremental `.jsonl` tailing.
@@ -82,9 +83,24 @@ struct TrackedSession {
 /// Wrap with `Arc` and install via `.layer(Extension(Arc::new(...)))`.
 /// All access is async (RwLock) — hook handlers hold the lock for
 /// microseconds only, never across a `.jsonl` read.
-#[derive(Default)]
 pub struct SessionTracker {
+    ingest_slots: Arc<tokio::sync::Semaphore>,
     inner: tokio::sync::RwLock<HashMap<String, TrackedSession>>,
+    tails: tokio::sync::Mutex<
+        HashMap<String, Arc<tokio::sync::Mutex<crate::services::transcript_tail::Checkpoint>>>,
+    >,
+    file_gates: tokio::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl Default for SessionTracker {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            tails: Default::default(),
+            file_gates: Default::default(),
+            ingest_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+        }
+    }
 }
 
 impl SessionTracker {
@@ -106,7 +122,14 @@ impl SessionTracker {
     /// carry a transcript path) and by the truncation-recovery path.
     pub async fn set(&self, session_id: &str, offset: u64) {
         let mut guard = self.inner.write().await;
+        if guard.len() >= 2048 && !guard.contains_key(session_id) {
+            guard.retain(|_, entry| entry.transcript_path.is_some());
+            if guard.len() >= 2048 {
+                return;
+            }
+        }
         let entry = guard.entry(session_id.to_string()).or_default();
+        entry.last_changed = Some(std::time::Instant::now());
         entry.offset = offset;
     }
 
@@ -121,7 +144,13 @@ impl SessionTracker {
         cwd: Option<String>,
     ) {
         let mut guard = self.inner.write().await;
+        if guard.len() >= 2048 && !guard.contains_key(session_id) {
+            return;
+        }
         let entry = guard.entry(session_id.to_string()).or_default();
+        if entry.offset != offset || entry.last_changed.is_none() {
+            entry.last_changed = Some(std::time::Instant::now());
+        }
         entry.offset = offset;
         if transcript_path.is_some() {
             entry.transcript_path = transcript_path;
@@ -146,6 +175,33 @@ impl SessionTracker {
                     .map(|p| (sid.clone(), p.clone(), t.cwd.clone()))
             })
             .collect()
+    }
+
+    async fn evict_inactive(&self) {
+        let mut inner = self.inner.write().await;
+        let mut tails = self.tails.lock().await;
+        let mut candidates: Vec<_> = inner
+            .iter()
+            .filter_map(|(id, t)| t.last_changed.map(|at| (id.clone(), at)))
+            .collect();
+        candidates.sort_by_key(|(_, at)| *at);
+        for (id, at) in candidates {
+            if inner.len() < 2048 && at.elapsed() < std::time::Duration::from_secs(86400) {
+                continue;
+            }
+            let removable = tails.get(&id).is_some_and(|state| {
+                Arc::strong_count(state) == 1
+                    && state.try_lock().is_ok_and(|c| c.offset == c.length)
+            });
+            if removable {
+                inner.remove(&id);
+                tails.remove(&id);
+            }
+        }
+        self.file_gates
+            .lock()
+            .await
+            .retain(|_, gate| gate.strong_count() > 0);
     }
 
     /// Best-effort introspection for tests / debug.
@@ -215,9 +271,7 @@ async fn dispatch(
     match event.as_str() {
         "session_start" => {
             let sid = payload.tracker_session_id();
-            tokio::spawn(async move {
-                tracker.set(&sid, 0).await;
-            });
+            tracker.set(&sid, 0).await;
         }
         // user_prompt_submit, stop, and subagent_stop all share the same
         // ingest path: read whatever's new in the (sub)session's transcript
@@ -234,16 +288,33 @@ async fn dispatch(
         // subagent's own session id distinct from the parent's, so
         // offsets don't collide.
         "user_prompt_submit" | "stop" | "subagent_stop" => {
+            let sid = payload.tracker_session_id();
+            tracker
+                .record(
+                    &sid,
+                    tracker.get(&sid).await,
+                    payload.transcript_path.clone(),
+                    payload.cwd.clone(),
+                )
+                .await;
+            let Ok(permit) = tracker.ingest_slots.clone().try_acquire_owned() else {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            };
             let services = services.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = tail_and_ingest(&services, &tracker, &payload).await {
                     tracing::warn!(?event, error = %e, "cc_hooks: tail_and_ingest failed");
                 }
             });
         }
         "task_completed" => {
+            let Ok(permit) = tracker.ingest_slots.clone().try_acquire_owned() else {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            };
             let services = services.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = store_task_completion(&services, &payload).await {
                     tracing::warn!(error = %e, "cc_hooks: store_task_completion failed");
                 }
@@ -423,6 +494,28 @@ fn truncate_for_gate(content: &str) -> String {
 /// parse the new content, extract memories, push them to the substrate
 /// via [`ServicesSink`]. Updates the tracker's offset to the new file
 /// length on success.
+async fn commit_tail_checkpoint(
+    services: &ContextNestServices,
+    id: &str,
+    current: &mut crate::services::transcript_tail::Checkpoint,
+    next: crate::services::transcript_tail::Checkpoint,
+) -> Result<(), String> {
+    if *current == next {
+        return Ok(());
+    }
+    if let Some(store) = services.checkpoint.get() {
+        let store = store.clone();
+        let id = id.to_owned();
+        let checkpoint = next.clone();
+        crate::services::compute::run(move || {
+            store.save_tail(&id, &checkpoint).map_err(|e| e.to_string())
+        })
+        .await??;
+    }
+    *current = next;
+    Ok(())
+}
+
 async fn tail_and_ingest(
     services: &ContextNestServices,
     tracker: &SessionTracker,
@@ -434,92 +527,89 @@ async fn tail_and_ingest(
         return Ok(());
     };
 
-    let bytes = match tokio::fs::read(transcript_path).await {
-        Ok(b) => b,
-        // Transcript file isn't there yet (or was rotated/deleted out from
-        // under us). Claude Code occasionally fires `user_prompt_submit`
-        // with a path that hasn't been flushed, or the session may have
-        // been pruned by the user. Treat as no-op — same shape as the
-        // "no transcript_path" early-return above. We deliberately do NOT
-        // bump the offset tracker: if the file reappears later (rare but
-        // possible on rename-into-place), we'll pick it up from byte 0.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::debug!(
-                path = %transcript_path.display(),
-                "cc_hooks: transcript not found, skipping",
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(format!("read {}: {}", transcript_path.display(), e)),
+    tracker.evict_inactive().await;
+    let file_key = match tokio::fs::canonicalize(transcript_path).await {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
     };
-    let total_len = bytes.len() as u64;
-
+    let file_gate = {
+        let mut gates = tracker.file_gates.lock().await;
+        if let Some(gate) = gates.get(&file_key).and_then(std::sync::Weak::upgrade) {
+            gate
+        } else {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            gates.insert(file_key, Arc::downgrade(&gate));
+            gate
+        }
+    };
+    let _file_guard = file_gate.lock().await;
     let tracker_session_id = payload.tracker_session_id();
-    let last_offset = tracker.get(&tracker_session_id).await;
-
-    // Two interesting cases when `total_len < last_offset`:
-    //
-    // 1. **Truncation / rotation.** Some workflows (notably Claude
-    //    Code's `/clear` in versions that re-use the same session_id,
-    //    or a manual file rotation) shrink the transcript out from
-    //    under us. If we silently early-return here we will never
-    //    catch up; the offset is permanently past the file end. The
-    //    only safe move is to reset the offset to 0 and re-read.
-    //
-    //    We accept the cost: any z-insight blocks that survived the
-    //    truncation may re-ingest (duplicating the substrate side),
-    //    but the dashboard's inbox dedup at view time absorbs that.
-    //    A duplicate fragment is far less harmful than a permanently-
-    //    silent session.
-    //
-    // 2. **No new content** (total_len == last_offset). File hasn't
-    //    grown; nothing to do.
-    if total_len < last_offset {
-        tracing::warn!(
-            session_id = %tracker_session_id,
-            path = %transcript_path.display(),
-            old_offset = last_offset,
-            new_len = total_len,
-            "cc_hooks: transcript shrank (likely truncation or /clear); resetting offset to 0",
-        );
-        tracker.set(&tracker_session_id, 0).await;
-        // Fall through with last_offset effectively reset; the
-        // alignment block below treats 0 as "start of file".
-    } else if total_len == last_offset {
-        // No new content — fast no-op.
+    let checkpoint_lock = {
+        let mut tails = tracker.tails.lock().await;
+        if tails.len() >= 2048 && !tails.contains_key(&tracker_session_id) {
+            return Err("transcript tracking capacity reached".into());
+        }
+        tails.entry(tracker_session_id.clone()).or_default().clone()
+    };
+    // Serializes overlapping Stop / sweep / prompt deliveries through ingest.
+    let mut checkpoint = checkpoint_lock.lock().await;
+    if checkpoint.path.is_empty() {
+        if let Some(store) = services.checkpoint.get() {
+            let store = store.clone();
+            let id = tracker_session_id.clone();
+            if let Some(saved) =
+                crate::services::compute::run(move || store.tail(&id).map_err(|e| e.to_string()))
+                    .await??
+            {
+                *checkpoint = saved;
+            }
+        }
+    }
+    let tail = match crate::services::transcript_tail::read(transcript_path, &checkpoint).await {
+        Ok(tail) => tail,
+        Err(_) if !transcript_path.exists() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let total_len = tail.checkpoint.offset;
+    if tail.bytes.is_empty() {
+        commit_tail_checkpoint(
+            services,
+            &tracker_session_id,
+            &mut checkpoint,
+            tail.checkpoint,
+        )
+        .await?;
+        tracker
+            .record(
+                &tracker_session_id,
+                total_len,
+                Some(transcript_path.clone()),
+                payload.cwd.clone(),
+            )
+            .await;
         return Ok(());
     }
-    let last_offset = if total_len < last_offset {
-        0
-    } else {
-        last_offset
-    };
-
-    // Slice the new portion. `last_offset` was always set to the full
-    // post-read file length, so we should land at a line boundary —
-    // but be defensive: if we somehow start mid-line (e.g. file got
-    // truncated externally), skip to the first '\n' so the parser
-    // doesn't choke on a partial JSON line.
-    let start = last_offset as usize;
-    let tail = &bytes[start..];
-    let aligned: &[u8] = if last_offset == 0 {
-        tail
-    } else if !tail.starts_with(b"{") && !tail.starts_with(b"\n") {
-        // Mid-line — skip to first newline.
-        match tail.iter().position(|&b| b == b'\n') {
-            Some(idx) => &tail[idx + 1..],
-            None => &[], // no newline left — nothing parseable in this window
-        }
-    } else {
-        tail
-    };
-    let chunk = std::str::from_utf8(aligned)
-        .map_err(|e| format!("non-utf8 chunk at offset {}: {}", last_offset, e))?;
+    let chunk = std::str::from_utf8(&tail.bytes).map_err(|e| e.to_string())?;
 
     let (events, metadata) = parse_session_string(chunk);
     if events.is_empty() {
         // Bump the offset so we don't keep re-reading the same chunk.
-        tracker.set(&tracker_session_id, total_len).await;
+        commit_tail_checkpoint(
+            services,
+            &tracker_session_id,
+            &mut checkpoint,
+            tail.checkpoint,
+        )
+        .await?;
+        tracker
+            .record(
+                &tracker_session_id,
+                total_len,
+                Some(transcript_path.clone()),
+                payload.cwd.clone(),
+            )
+            .await;
         return Ok(());
     }
 
@@ -561,6 +651,13 @@ async fn tail_and_ingest(
             .map_err(|e| format!("ServicesSink::store_batch: {e}"))?;
     }
 
+    commit_tail_checkpoint(
+        services,
+        &tracker_session_id,
+        &mut checkpoint,
+        tail.checkpoint,
+    )
+    .await?;
     // Stash the transcript path + cwd alongside the new offset so the
     // sweeper can re-tail this session even if the next hook never fires
     // (Claude killed mid-curl, session abandoned, server restart, etc).

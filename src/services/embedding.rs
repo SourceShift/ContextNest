@@ -46,6 +46,34 @@ impl EmbeddingService {
         })
     }
 
+    /// Reuse the HTTP transport while keeping response-cache ownership local.
+    /// Tenant workers use a short-lived cache; canonical vectors live in SQLite.
+    pub fn isolated_cache(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            client: self.client.clone(),
+            cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn space_identity(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let model = self.config.models.get(&self.config.default_model);
+        let bytes = serde_json::to_vec(&(
+            model,
+            &self.config.base_url,
+            &self.config.provider,
+            &self.config.model,
+            self.config.dimensions,
+        ))
+        .unwrap_or_default();
+        format!(
+            "{}:{}",
+            self.config.default_model,
+            hex::encode(Sha256::digest(bytes))
+        )
+    }
+
     /// Get the default model configuration
     fn get_default_model(&self) -> ContextNestResult<&EmbeddingModelConfig> {
         self.config

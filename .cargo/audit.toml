@@ -20,4 +20,11 @@ ignore = [
     # in transitively through reqwest -> url. The reqwest 0.11 -> 0.12 jump
     # is a breaking change we'll do as part of v0.2's HTTP-client refresh.
     "RUSTSEC-2024-0421",
+
+    # h2 0.3.x — unbounded empty DATA frames (server-side DoS surface).
+    # Fixed in >= 0.4.16. Our h2 0.4.x is already on 0.4.19; the remaining
+    # 0.3.27 copy is pinned by reqwest 0.11.27 with no patched 0.3.x line
+    # available upstream. Resolved by the same reqwest 0.11 -> 0.12 refresh
+    # tracked above for RUSTSEC-2024-0421.
+    "RUSTSEC-2026-0258",
 ]

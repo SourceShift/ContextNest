@@ -129,7 +129,7 @@ CN_BIN        ?= ./target/release/contextnest
 SINCE         ?= 7d
 PROJECT       ?=
 
-.PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev \
+.PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev cn-run-existing \
         cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config
 
 cn-help:
@@ -180,7 +180,11 @@ cn-lint:
 # Refuses to start without an API key in the env, because a silent fall-through
 # to the local TF-IDF default is more confusing than a fast failure when the
 # operator clearly meant to use a real provider (their config.toml sets one).
-cn-serve: $(CN_BIN)
+# Explicit opt-out for operators running an immutable prebuilt artifact.
+cn-run-existing:
+	CONTEXTNEST_WAL_PATH=$(CN_WAL) $(CN_BIN) serve --bind $(CN_BIND)
+
+cn-serve: cn-build
 	@if [ ! -f config.toml ]; then \
 	  echo "no config.toml — copying from example"; $(MAKE) cn-config; \
 	fi
@@ -235,10 +239,10 @@ cn-watch: ## Auto-rebuild + restart on .rs file changes (requires cargo-watch). 
 	  -x 'run --profile fast --bin contextnest -- serve --bind $(CN_BIND)'
 
 cn-curl-health:
-	@curl -fsS $(CN_SUBSTRATE)/api/v1/substrate/health | head -c 1000; echo
+	@./scripts/operator-curl.sh -fsS $(CN_SUBSTRATE)/api/v1/substrate/health | head -c 1000; echo
 
 cn-curl-inbox:
-	@curl -fsS $(CN_SUBSTRATE)/api/v1/inbox | head -c 1000; echo
+	@./scripts/operator-curl.sh -fsS $(CN_SUBSTRATE)/api/v1/inbox | head -c 1000; echo
 
 cn-wal-clear:
 	@printf 'DELETE $(CN_WAL)? This wipes substrate persistence. Confirm with y/Y: '; \
@@ -280,3 +284,7 @@ dev-fe: ## Run the web dashboard (vite). Hot-reload via Vite HMR.
 	  (cd web && pnpm install); \
 	fi
 	@cd web && pnpm dev
+
+.PHONY: cn-tenant-config
+cn-tenant-config: ## Write private server + application-tenant configuration files, without restarting the service.
+	python3 scripts/configure_tenants.py

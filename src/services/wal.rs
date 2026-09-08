@@ -197,6 +197,7 @@ impl Wal {
         let mut w = self.writer.lock().expect("wal writer mutex poisoned");
         writeln!(w, "{line}")?;
         w.flush()?;
+        w.get_ref().sync_data()?;
         Ok(())
     }
 

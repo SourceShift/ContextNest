@@ -19,6 +19,14 @@ Curated entry points for understanding and using ContextNest.
 
 ## Where this is going
 
+- [**Tenant and session memory repair design**](roadmap/epics/tenant-session-memory.md)
+  — application tenants, isolated sessions, and a concrete repair for
+  each diagnosed CPU issue.
+
+- [**CPU investigation: `make cn-serve`**](reports/2026-09-08-cn-serve-cpu.md)
+  — live profiling, graph-scan costs, transcript and health-polling overhead,
+  and proposed fixes (2026-09-08).
+
 - [**roadmap/**](roadmap/) — forward-looking design + sequencing. Strategic
   five-milestone plan (v0.2 → v1.0), shipped neural-field/runtime
   reconciliation notes, and concrete specs for upcoming milestones.

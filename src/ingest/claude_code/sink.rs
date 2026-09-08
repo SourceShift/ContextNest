@@ -108,7 +108,38 @@ impl HttpSink {
     pub fn new(base_url: impl Into<String>) -> Self {
         let url = base_url.into();
         let base_url = url.trim_end_matches('/').to_string();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let header_path = std::env::var_os("CONTEXTNEST_OPERATOR_HEADERS")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                ["http://localhost:28080", "http://127.0.0.1:28080"]
+                    .contains(&base_url.as_str())
+                    .then(|| {
+                        std::env::var_os("HOME").map(|h| {
+                            std::path::PathBuf::from(h)
+                                .join(".contextnest/tenant-auth/operator.headers")
+                        })
+                    })
+                    .flatten()
+            });
+        if let Some(path) = header_path {
+            use std::io::Read;
+            let mut text = String::new();
+            if std::fs::File::open(path)
+                .and_then(|f| f.take(2048).read_to_string(&mut text))
+                .is_ok()
+            {
+                if let Some(value) = text.trim().strip_prefix("Authorization:") {
+                    if let Ok(mut header) = reqwest::header::HeaderValue::from_str(value.trim()) {
+                        header.set_sensitive(true);
+                        headers.insert(reqwest::header::AUTHORIZATION, header);
+                    }
+                }
+            }
+        }
         let client = Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest Client::new should never fail with default config");
@@ -314,20 +345,62 @@ impl Sink for ServicesSink {
     async fn store(&self, record: &MemoryRecord) -> ContextNestResult<()> {
         let fragment_id = stable_fragment_id(&record.session_id_cn, &record.text, &record.metadata);
 
-        // Sidecar inserts only. No embedding, no process_memories, no LLM.
+        if let Some(checkpoint) = self.services.checkpoint.get() {
+            let checkpoint = checkpoint.clone();
+            let id = fragment_id.clone();
+            let deleted = crate::services::compute::run(move || {
+                checkpoint.is_deleted(&id).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(ContextNestError::Validation)?
+            .map_err(ContextNestError::Validation)?;
+            if deleted {
+                return Ok(());
+            }
+        }
+        // Serialize duplicate deliveries through their acceptance boundary.
+        // Caller metadata must never overwrite canonical processing fields.
+        let _ingest = self.services.ingest_gate.lock().await;
+        if self
+            .services
+            .fragment_texts
+            .read()
+            .await
+            .contains_key(&fragment_id)
+        {
+            return Ok(());
+        }
+        let metadata: HashMap<_, _> = record
+            .metadata
+            .iter()
+            .filter(|(key, _)| !key.starts_with("_cn_"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if self.services.wal.get().is_some() {
+            let wal = self.services.wal.clone();
+            let record = crate::services::wal::WalRecord::Store {
+                fragment_id: fragment_id.clone(),
+                session_id: record.session_id_cn.clone(),
+                content: record.text.clone(),
+                importance: record.importance,
+                metadata: metadata.clone(),
+            };
+            crate::services::compute::run(move || {
+                wal.get().expect("WAL initialized").append(&record)
+            })
+            .await
+            .map_err(ContextNestError::Validation)??;
+        }
         self.services
             .fragment_texts
             .write()
             .await
             .insert(fragment_id.clone(), record.text.clone());
-
-        if !record.metadata.is_empty() {
-            self.services
-                .fragment_metadata
-                .write()
-                .await
-                .insert(fragment_id.clone(), record.metadata.clone());
-        }
+        self.services
+            .fragment_metadata
+            .write()
+            .await
+            .insert(fragment_id.clone(), metadata);
 
         self.services
             .session_index
@@ -345,24 +418,7 @@ impl Sink for ServicesSink {
             .consolidation_queue
             .enqueue(fragment_id.clone());
 
-        // Best-effort WAL append. Failures log + continue.
-        if let Some(wal) = self.services.wal.get() {
-            let wal_record = crate::services::wal::WalRecord::Store {
-                fragment_id,
-                session_id: record.session_id_cn.clone(),
-                content: record.text.clone(),
-                importance: record.importance,
-                metadata: record.metadata.clone(),
-            };
-            if let Err(e) = wal.append(&wal_record) {
-                tracing::warn!(
-                    error = %e,
-                    kind = %record.kind.as_str(),
-                    "wal: append failed for ServicesSink::store",
-                );
-            }
-        }
-
+        self.services.invalidate_health();
         Ok(())
     }
 }

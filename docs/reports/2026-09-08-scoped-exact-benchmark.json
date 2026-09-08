@@ -1,0 +1,11 @@
+{
+  "cached_norm_top_k_ms": 53.333040999999994,
+  "dimensions": 256,
+  "global_candidates": 10000,
+  "global_reference_parity": true,
+  "k": 32,
+  "profile": "debug",
+  "reference_ms": 120.09620799999999,
+  "session_candidates": 500,
+  "session_exact_ms": 3.9533750000000003
+}

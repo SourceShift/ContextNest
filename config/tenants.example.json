@@ -1,0 +1,21 @@
+{
+  "data_dir": "/absolute/path/to/contextnest-tenant-data",
+  "operator_token_env": "CONTEXTNEST_OPERATOR_TOKEN",
+  "tenants": [
+    {
+      "id": "app",
+      "token_env": "CONTEXTNEST_APP_TOKEN",
+      "policy": {
+        "version": 1,
+        "retention_days": 90,
+        "max_sessions": 1000,
+        "max_records_per_session": 2000,
+        "max_pending": 4096,
+        "max_connections": 32,
+        "connection_threshold": 0.7,
+        "basin_attach_threshold": 0.4,
+        "kinds": ["conversation-turn"]
+      }
+    }
+  ]
+}
