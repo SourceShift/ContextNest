@@ -532,6 +532,22 @@ impl MemoryAttractorManager {
         self.connection_network.neighbors_of(node_id).await
     }
 
+    /// Return the shortest path between two nodes in the canonical
+    /// connection network. Forwards to
+    /// [`crate::memory::attractors::connection_network::ConnectionNetwork::find_path`].
+    ///
+    /// The two failure shapes carry different meaning and callers must
+    /// not conflate them: `Err(ContextNestError::NotFound)` means an
+    /// endpoint is absent from the graph, while `Ok(None)` means both
+    /// endpoints exist but no route connects them.
+    pub async fn find_graph_path(
+        &self,
+        start_id: &str,
+        end_id: &str,
+    ) -> ContextNestResult<Option<crate::memory::attractors::connection_network::Path>> {
+        self.connection_network.find_path(start_id, end_id).await
+    }
+
     /// Collapse nearby basins. Public-passthrough for the admin cleanup
     /// endpoint that fixes degenerate substrates (every fragment its own
     /// basin) produced by pre-fix process_memories. O(N²) over the basin

@@ -9,6 +9,7 @@ use crate::api::agent_outcome;
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::coord;
 use crate::api::field;
+use crate::api::graph;
 use crate::api::inbox;
 use crate::api::llm_proxy;
 use crate::api::prompt_context;
@@ -60,6 +61,7 @@ pub async fn create_simple_app_with_tenants(
     let stats_router = stats::create_stats_router();
     let substrate_router = substrate::create_substrate_router();
     let field_router = field::create_field_router();
+    let graph_router = graph::create_graph_router();
     let prompt_context_router = prompt_context::create_prompt_context_router();
     let llm_proxy_router = llm_proxy::create_llm_proxy_router();
     let session_tracker = Arc::new(SessionTracker::new());
@@ -90,6 +92,7 @@ pub async fn create_simple_app_with_tenants(
         .merge(stats_router)
         .merge(substrate_router)
         .merge(field_router)
+        .merge(graph_router)
         .merge(prompt_context_router)
         .merge(llm_proxy_router)
         .layer(Extension(session_tracker))
