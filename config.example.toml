@@ -66,3 +66,42 @@ batch_size = 16
 max_input_length = 8192
 normalization = true
 pooling_strategy = "Mean"
+
+# ---------------------------------------------------------------------------
+# Neo4j graph projection (optional, compiled out by default)
+# ---------------------------------------------------------------------------
+#
+# The durable multi-hop agent-memory graph. Off unless BOTH of these hold:
+#
+#   1. the binary was built with the feature — `cargo build --release
+#      --features neo4j-graph` (`make cn-serve` does NOT enable it); and
+#   2. `backend_type` below is `Neo4j`, which is not the default
+#      (`GraphStorageBackend::default()` is `InMemory`).
+#
+# When either is absent the graph routes exist but project nothing:
+# `POST /api/v1/graph/upsert` answers `200 {"skipped": true}` and
+# `GET /api/v1/graph/path` answers `404`. That is deliberate — a best-effort
+# projection must never fail the caller — but it means a disabled graph and
+# an unreachable database are indistinguishable from the client side. If a
+# projection seems to be going nowhere, check the server log for
+# "neo4j-graph: projection enabled" on the `tracing::info` line.
+#
+# The server never fails to boot on this: an unreachable database, a bad
+# driver config, or a failed schema install each log a warning and leave the
+# projection disabled. Uncomment to turn it on.
+
+# [services.graph]
+# enabled = true
+#
+# [services.graph.storage]
+# # Externally-tagged enum — the variant name is a key, not a value.
+# # An empty `url`/`database` falls back to the [database] block below.
+# backend_type = { Neo4j = { url = "neo4j://localhost:7687", database = "neo4j" } }
+
+# Credentials always come from here, even when the variant above sets the URI.
+# Every other [services.graph.*] tunable (pooling, retry, indexing, cache)
+# defaults from GraphServicesConfig::default(), so it need not be spelled out.
+#
+# [database]
+# neo4j_username = "neo4j"
+# neo4j_password = "CHANGEME"

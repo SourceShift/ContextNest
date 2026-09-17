@@ -412,12 +412,63 @@ action needed for normal workloads. If you do want to force a sweep:
 
 In-process attractor state lives in memory; durable persistence is a
 v0.2 work item. For v0.1.0, treat ContextNest as a long-running
-companion process — restart loses state. The Neo4j graph service
-(optional) persists fragment edges but not basin geometry.
+companion process — restart loses state. The optional Neo4j graph
+projection (see below) persists derived *learning* entities — `Run`,
+`Trace`, `GradientTarget`, `TaskClass` and their edges, projected from
+mini-ork — not fragment edges or basin geometry.
 
 For production: deploy behind a supervisor that restarts on crash,
 checkpoint relevant attractors via periodic `summarize` calls into your
 own durable store (e.g., dump the summarize output to S3 hourly).
+
+### Enabling the Neo4j graph projection
+
+Off by default, and off for two independent reasons — both must be
+satisfied before anything is written.
+
+**1. Build with the feature.** `neo4rs` is an optional dependency, so the
+default binary has no driver linked in at all:
+
+```bash
+cargo build --release --features neo4j-graph
+```
+
+`make cn-serve` builds with default features and therefore does *not*
+enable this.
+
+**2. Select the backend.** `GraphStorageBackend::default()` is `InMemory`,
+so a config that never mentions the graph stays inert. The minimal
+enabling config is three keys:
+
+```toml
+[services.graph.storage]
+backend_type = { Neo4j = { url = "neo4j://localhost:7687", database = "neo4j" } }
+```
+
+Every other graph tunable (pooling, retry, indexing, cache) defaults from
+`GraphServicesConfig::default()`, so it need not be spelled out.
+Credentials are read from the `[database]` block
+(`neo4j_username` / `neo4j_password`) even when the URI is given above; an
+empty `url` or `database` in the variant falls back to that block too.
+
+**Failure is always silent to the caller.** `build()` cannot fail: an
+unreachable database, a malformed driver config, a connection-probe
+timeout, or a schema-install error each log a `warn!` and leave the
+projection disabled. The server never refuses to boot over it. That
+protects the caller — a best-effort projection must never fail a learning
+run — but it also means a disabled projection and a healthy one are
+indistinguishable from the client side, since both answer
+`200 {"skipped": true}`. To confirm it actually came up, look for the
+one line that says so:
+
+```
+neo4j-graph: projection enabled   uri=... database=...
+```
+
+That line is emitted only after the `RETURN 1` liveness probe succeeds and
+`ensure_schema` installs the constraints and indexes. The three endpoints
+behind it are `POST /api/v1/graph/upsert`, `GET /api/v1/graph/neighbors`,
+and `GET /api/v1/graph/path`.
 
 ### Authentication
 
@@ -433,7 +484,7 @@ section for the canonical nginx snippet.
 | `summarize` returns statistics, not prose | No `CONTEXTNEST_LLM_PROVIDER` set | Export provider + api key, restart server |
 | `reconstruct` returns confidence < 0.3 consistently | Too few fragments stored — basin geometry is sparse | Either store more fragments or fall back to `retrieve` |
 | Slow `resonate` calls (>500ms) | Large session — coherence detection scales with basin count | Run `summarize` periodically to compact |
-| `cargo run -- serve` panics on Neo4j connection | Optional graph service is enabled but no Neo4j running | Either start Neo4j (`docker-compose up neo4j`) or disable the graph feature in your config |
+| Graph projection appears to do nothing — `upsert` answers `{"skipped": true}` | One of the three gates in `src/services/neo4j_graph/mod.rs::build` failed: the binary lacks the `neo4j-graph` feature, `backend_type` is not `Neo4j`, or the database is unreachable | The server never panics on this — it logs a `neo4j-graph:` warning naming the failed gate. Check the server log; see "Enabling the Neo4j graph projection" above |
 | `Authorization: Bearer ...` header is set but `user_id` stays None | v0.1.0 does not parse JWTs — the auth shim is intentional. JWT/OIDC arrives in v0.5+ | Use a reverse proxy that enforces auth and trust ContextNest behind it |
 
 ## 7. Where to go next

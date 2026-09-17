@@ -685,6 +685,7 @@ pub struct ProtocolExecutionConfig {
 
 /// Retry configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RetryConfig {
     /// Enable automatic retries
     pub enabled: bool,
@@ -840,6 +841,7 @@ pub struct ServicesConfig {
 
 /// Graph services configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphServicesConfig {
     /// Enable graph services
     pub enabled: bool,
@@ -856,6 +858,7 @@ pub struct GraphServicesConfig {
 
 /// Graph storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphStorageConfig {
     /// Storage backend type
     pub backend_type: GraphStorageBackend,
@@ -879,6 +882,7 @@ pub enum GraphStorageBackend {
 
 /// Graph connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphConnectionConfig {
     /// Connection timeout in seconds
     pub timeout_seconds: u64,
@@ -895,6 +899,7 @@ pub struct GraphConnectionConfig {
 
 /// Graph index configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphIndexConfig {
     /// Enable indexing
     pub enabled: bool,
@@ -927,6 +932,7 @@ pub enum IndexUpdateStrategy {
 
 /// Graph algorithms configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphAlgorithmsConfig {
     /// Enable graph algorithms
     pub enabled: bool,
@@ -951,6 +957,7 @@ pub enum GraphAlgorithm {
 
 /// Algorithm performance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AlgorithmPerformanceConfig {
     /// Maximum execution time in seconds
     pub max_execution_seconds: u64,
@@ -964,6 +971,7 @@ pub struct AlgorithmPerformanceConfig {
 
 /// Parallel execution configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ParallelConfig {
     /// Enable parallel execution
     pub enabled: bool,
@@ -977,6 +985,7 @@ pub struct ParallelConfig {
 
 /// Graph performance configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphPerformanceConfig {
     /// Cache settings
     pub cache: CacheConfig,
@@ -990,6 +999,7 @@ pub struct GraphPerformanceConfig {
 
 /// Cache configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CacheConfig {
     /// Enable caching
     pub enabled: bool,
@@ -1016,6 +1026,7 @@ pub enum EvictionPolicy {
 
 /// Connection pooling configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolingConfig {
     /// Enable connection pooling
     pub enabled: bool,
@@ -1032,6 +1043,7 @@ pub struct PoolingConfig {
 
 /// Query optimization configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QueryOptimizationConfig {
     /// Enable query optimization
     pub enabled: bool,
