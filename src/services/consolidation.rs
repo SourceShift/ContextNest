@@ -154,6 +154,20 @@ pub struct ConsolidationMetrics {
     /// See docs/roadmap/epics/2026-arxiv-improvements.md (T1, RecMem).
     #[serde(default)]
     pub deferred_subconscious: usize,
+    /// Cumulative fragments cleared from the subconscious store and
+    /// re-enqueued because a new session peer arrived. Diagnostic
+    /// counter for the reconsideration path (T1 follow-up, v0.1.2).
+    /// Divide by `deferred_subconscious` to get the wake-up rate.
+    #[serde(default)]
+    pub reconsidered_enqueued: usize,
+    /// Subset of `reconsidered_enqueued` that went on to consolidate
+    /// Done on their next pass — the peer arrival was enough to clear
+    /// the gate. When `reconsidered_enqueued` is high but this stays
+    /// low, the workload has too many one-shot fragments; operators
+    /// should raise `CONNECTION_SIMILARITY_THRESHOLD` or lower
+    /// `CONSOLIDATION_RECURRENCE_MIN_COUNT`.
+    #[serde(default)]
+    pub reconsidered_and_passed: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -563,8 +577,12 @@ async fn consolidate_one(
 
     // Flip the flag on success. Preserves any pre-existing metadata
     // (kind, ts, src_session, project_cwd, etc.) by updating the
-    // entry in place rather than replacing it.
-    {
+    // entry in place rather than replacing it. If this fragment was
+    // marked as reconsidered by an earlier reconsideration event,
+    // increment the "reconsidered and passed" counter and drop the
+    // marker — this is the successful-wakeup case that the metric
+    // measures.
+    let was_reconsidered = {
         let mut meta_w = services.fragment_metadata.write().await;
         let entry = meta_w.entry(id.to_string()).or_default();
         entry.insert(CONSOLIDATED_FLAG.to_string(), Value::Bool(true));
@@ -576,6 +594,18 @@ async fn consolidate_one(
             CONTENT_DENSITY_FIELD.to_string(),
             Value::from(density as f64),
         );
+        entry
+            .remove("_cn_recurrence_reconsidered")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    if was_reconsidered {
+        services
+            .consolidation_queue
+            .metrics
+            .lock()
+            .expect("metrics lock poisoned")
+            .reconsidered_and_passed += 1;
     }
 
     services.invalidate_health();
@@ -613,6 +643,11 @@ async fn consolidate_one(
                         .unwrap_or(false);
                     if deferred {
                         entry.remove("_cn_recurrence_deferred");
+                        // Mark that this fragment is being reconsidered
+                        // so the next `consolidate_one` pass can
+                        // increment `reconsidered_and_passed` when it
+                        // reaches Done. Cheap to set; removed at Done.
+                        entry.insert("_cn_recurrence_reconsidered".to_string(), Value::Bool(true));
                         reconsidered.push(peer_id.clone());
                     }
                 }
@@ -621,6 +656,12 @@ async fn consolidate_one(
                 services.consolidation_queue.enqueue(peer_id.clone());
             }
             if !reconsidered.is_empty() {
+                services
+                    .consolidation_queue
+                    .metrics
+                    .lock()
+                    .expect("metrics lock poisoned")
+                    .reconsidered_enqueued += reconsidered.len();
                 tracing::debug!(
                     session = %session_id,
                     trigger = %id,

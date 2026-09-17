@@ -70,6 +70,16 @@ pub struct ConsolidationStatus {
     /// (T1). Zero when the gate is disabled (default).
     #[serde(default)]
     pub deferred_subconscious: usize,
+    /// Cumulative fragments cleared from the subconscious store and
+    /// re-enqueued because a peer arrived. Diagnostic for the
+    /// reconsideration path.
+    #[serde(default)]
+    pub reconsidered_enqueued: usize,
+    /// Subset of `reconsidered_enqueued` that consolidated Done on
+    /// their next pass. A high wake-up-to-pass ratio means the gate
+    /// threshold is well-matched to the workload.
+    #[serde(default)]
+    pub reconsidered_and_passed: usize,
 }
 
 pub async fn get_consolidation_status(
@@ -118,6 +128,8 @@ pub async fn get_consolidation_status(
         last_lap_ms: metrics.last_lap_ms,
         initial_scan_complete: metrics.initial_scan_complete,
         deferred_subconscious: metrics.deferred_subconscious,
+        reconsidered_enqueued: metrics.reconsidered_enqueued,
+        reconsidered_and_passed: metrics.reconsidered_and_passed,
     }))
 }
 
