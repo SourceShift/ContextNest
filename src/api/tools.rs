@@ -1419,6 +1419,25 @@ async fn compute_reconstruction(
         return None;
     }
 
+    // Chain-of-Memory pruning (arXiv:2601.14287). Drop off-topic
+    // candidates BEFORE the top-`depth` truncation so a fragment
+    // whose cosine to the query falls below the floor cannot bleed
+    // into the reconstructed chain. Empty floor (0.0) preserves the
+    // pre-repair behavior for callers who rely on the old "take
+    // top-K unconditionally" semantics. See docs/roadmap/epics/
+    // 2026-arxiv-improvements.md (T4).
+    let cosine_floor: f32 = std::env::var("CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(0.15);
+    if cosine_floor > 0.0 {
+        hydrated.retain(|(sim, _)| *sim >= cosine_floor);
+        if hydrated.is_empty() {
+            return None;
+        }
+    }
+
     // ResonanceActivator equivalent: rank by similarity, keep top-depth.
     hydrated.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     hydrated.truncate(depth);

@@ -505,6 +505,110 @@ pub async fn get_substrate_config(
     })
 }
 
+/// Query parameters for `GET /api/v1/substrate/replay`. Default is a
+/// dry-run that reports what would happen without touching the queue.
+#[derive(Debug, Deserialize)]
+pub struct ReplayQuery {
+    /// When true (default), only report WAL contents; do not enqueue.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReplayResponse {
+    /// Path of the WAL that was read.
+    pub wal_path: String,
+    /// Total `Store` records in the WAL (including duplicates for the
+    /// same fragment_id across revisions).
+    pub store_records: usize,
+    /// LLM proxy cache records (Insert + Discard).
+    pub llm_cache_records: usize,
+    /// Any other record variants (future-proof; today reports 0).
+    pub other_records: usize,
+    /// Distinct fragment ids across all `Store` records — this is the
+    /// number of consolidation enqueues that would happen in a
+    /// non-dry-run replay.
+    pub unique_fragment_ids: usize,
+    /// Actual number of ids pushed onto the consolidation queue.
+    /// Equals `unique_fragment_ids` when `dry_run=false`; zero when
+    /// `dry_run=true`.
+    pub enqueued: usize,
+    pub dry_run: bool,
+}
+
+/// `GET /api/v1/substrate/replay?dry_run=<bool>` — read the input WAL
+/// and (optionally) re-enqueue every stored fragment for background
+/// consolidation. Diagnostic escape hatch: if the canonical SQLite
+/// checkpoint is corrupted or a code path desyncs sidecar metadata
+/// from basin/graph state, this rebuilds derived state from the WAL
+/// alone. Idempotent by design — `consolidate_one` short-circuits on
+/// the `_cn_consolidated` metadata flag, so re-enqueueing fragments
+/// that are already consolidated is a no-op except for the queue-
+/// insert cost.
+///
+/// This handler does NOT truncate or rewrite anything; the WAL is
+/// read-only from its perspective. Callers who want a full rebuild
+/// from zero must additionally delete the canonical SQLite file
+/// while the process is stopped — that's an operator step, not a
+/// runtime concern.
+///
+/// See `docs/roadmap/epics/2026-arxiv-improvements.md` (T3, PROJECTMEM).
+pub async fn substrate_replay(
+    State(services): State<ContextNestServices>,
+    Query(query): Query<ReplayQuery>,
+) -> Result<Json<ReplayResponse>, StatusCode> {
+    // The WAL writer is initialized post-replay-at-boot in
+    // `src/bin/contextnest.rs`, so under normal operation this Wal
+    // handle is always Some. The OnceCell design guarantees every
+    // clone of `services` sees the same writer once init completes.
+    let Some(wal) = services.wal.get() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let wal_path = wal.path().to_path_buf();
+
+    let records = crate::services::wal::Wal::read_records(&wal_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut store_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut store_count = 0usize;
+    let mut llm_count = 0usize;
+    let mut other_count = 0usize;
+    for r in &records {
+        match r {
+            crate::services::wal::WalRecord::Store { fragment_id, .. } => {
+                store_count += 1;
+                store_ids.insert(fragment_id.clone());
+            }
+            crate::services::wal::WalRecord::LlmCacheInsert { .. }
+            | crate::services::wal::WalRecord::LlmCacheDiscard { .. } => {
+                llm_count += 1;
+            }
+        }
+    }
+
+    let mut enqueued = 0usize;
+    if !query.dry_run {
+        for id in &store_ids {
+            services.consolidation_queue.enqueue(id.clone());
+            enqueued += 1;
+        }
+    }
+
+    Ok(Json(ReplayResponse {
+        wal_path: wal_path.display().to_string(),
+        store_records: store_count,
+        llm_cache_records: llm_count,
+        other_records: other_count,
+        unique_fragment_ids: store_ids.len(),
+        enqueued,
+        dry_run: query.dry_run,
+    }))
+}
+
 pub fn create_substrate_router() -> Router<ContextNestServices> {
     Router::new()
         .route(
@@ -513,6 +617,7 @@ pub fn create_substrate_router() -> Router<ContextNestServices> {
         )
         .route("/api/v1/substrate/health", get(get_substrate_health))
         .route("/api/v1/substrate/config", get(get_substrate_config))
+        .route("/api/v1/substrate/replay", get(substrate_replay))
         .route(
             "/api/v1/admin/merge-nearby-basins",
             post(admin_merge_nearby_basins),

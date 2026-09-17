@@ -145,6 +145,15 @@ pub struct ConsolidationMetrics {
     pub processing_ms: u64,
     /// Invalid records or exhausted retry budgets, including restored failures.
     pub terminal_failed: usize,
+    /// Cumulative fragments held in the RecMem subconscious store since
+    /// startup: they passed the sidecar write but did not pass the
+    /// recurrence-density gate at consolidation time. Basin + graph
+    /// work is skipped for these until an operator/reader triggers
+    /// reconsideration. Zero when the gate is disabled
+    /// (`CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT=0`).
+    /// See docs/roadmap/epics/2026-arxiv-improvements.md (T1, RecMem).
+    #[serde(default)]
+    pub deferred_subconscious: usize,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -346,6 +355,15 @@ enum ConsolidationOutcome {
     Done,
     /// Already flagged consolidated; the pipeline did not run.
     Skipped,
+    /// RecMem recurrence gate rejected this fragment: not enough
+    /// similar peers exist in its session yet. The fragment remains
+    /// retrievable via sidecar at similarity 0 (the same fallback
+    /// path a not-yet-consolidated fragment uses today), but no
+    /// basin or graph work runs for it. Metadata flag
+    /// `_cn_recurrence_deferred=true` is written so a future
+    /// reconsideration path can identify these fragments.
+    /// See docs/roadmap/epics/2026-arxiv-improvements.md (T1).
+    Deferred,
 }
 
 /// Process one fragment through the attractor pipeline. Returns the
@@ -408,6 +426,67 @@ async fn consolidate_one(
             emb
         }
     };
+
+    // RecMem recurrence gate (arXiv:2605.16045). Disabled by default
+    // (min_count=0). When on, defer basin + graph work for fragments
+    // that do not yet have `min_count` session peers above the
+    // cosine floor. Reuses `CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD`
+    // as the peer-similarity floor because the RecMem paper's
+    // recommended θ_sim=0.7 already matches ContextNest's default
+    // connection threshold — one knob, two purposes. See
+    // docs/roadmap/epics/2026-arxiv-improvements.md (T1).
+    let recurrence_min_count: usize =
+        std::env::var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+    if recurrence_min_count > 0 {
+        // Fragments whose sidecar carries the "deferred" marker were
+        // gated before. Skip re-gating them so re-enqueues can only
+        // move them forward (once peers arrive) — never sideways.
+        // The reconsideration path (future ticket) is what clears the
+        // marker + re-embeds.
+        let already_deferred = existing_meta
+            .get("_cn_recurrence_deferred")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let session_id = services.session_index.find_session(id).await;
+        if let Some(session_id) = session_id.filter(|_| !already_deferred) {
+            let threshold: f32 = std::env::var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 1.0)
+                .unwrap_or(0.7);
+            let peers = services.session_index.list_active(&session_id).await;
+            let cache = services.embeddings_by_id.read().await;
+            let mut matched = 0usize;
+            for peer_id in peers.iter() {
+                if peer_id == id {
+                    continue;
+                }
+                if let Some(peer_emb) = cache.get(peer_id) {
+                    let sim =
+                        crate::memory::attractors::utils::cosine_similarity(&embedding, peer_emb);
+                    if sim >= threshold {
+                        matched += 1;
+                        if matched >= recurrence_min_count {
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(cache);
+            if matched < recurrence_min_count {
+                // Mark the fragment so a future reconsideration pass
+                // can find it, then return Deferred without running
+                // basin/graph work.
+                let mut metadata = services.fragment_metadata.write().await;
+                let entry = metadata.entry(id.to_string()).or_default();
+                entry.insert("_cn_recurrence_deferred".to_string(), Value::Bool(true));
+                return Ok(ConsolidationOutcome::Deferred);
+            }
+        }
+    }
 
     let now = Utc::now();
     let fragment = MemoryFragment {
@@ -514,6 +593,11 @@ async fn consolidate_one(
 pub struct BatchOutcome {
     pub done: usize,
     pub skipped: usize,
+    /// Fragments held in the RecMem subconscious store this batch —
+    /// they failed the recurrence-density gate. Not an error; the
+    /// worker treats them as "wait for peers, try again later".
+    /// See docs/roadmap/epics/2026-arxiv-improvements.md (T1).
+    pub deferred: usize,
     /// Generic failures (per-fragment data issues, parse errors, etc.).
     pub failed: usize,
     /// Subset of failures that look like embedder rate-limit / overload
@@ -603,6 +687,7 @@ async fn process_batch(
     enum Tag {
         Done,
         Skipped,
+        Deferred,
         Failed,
         RateLimited,
     }
@@ -628,6 +713,7 @@ async fn process_batch(
             match outcome {
                 Ok(ConsolidationOutcome::Done) => Tag::Done,
                 Ok(ConsolidationOutcome::Skipped) => Tag::Skipped,
+                Ok(ConsolidationOutcome::Deferred) => Tag::Deferred,
                 Err(e) => {
                     if looks_rate_limited(&e) {
                         tracing::warn!(fragment_id = %id, error = %e, "consolidation: process rate-limited");
@@ -647,6 +733,10 @@ async fn process_batch(
     BatchOutcome {
         done: results.iter().filter(|t| matches!(t, Tag::Done)).count(),
         skipped: results.iter().filter(|t| matches!(t, Tag::Skipped)).count(),
+        deferred: results
+            .iter()
+            .filter(|t| matches!(t, Tag::Deferred))
+            .count(),
         failed: results.iter().filter(|t| matches!(t, Tag::Failed)).count(),
         rate_limited: results
             .iter()
@@ -721,6 +811,7 @@ pub async fn run_worker(
         {
             let mut m = queue.metrics.lock().expect("metrics lock poisoned");
             m.consolidated += outcome.done;
+            m.deferred_subconscious += outcome.deferred;
             // Rate-limited counts as "failed" in the public metric — it
             // surfaces in /substrate/consolidation so ops can see the
             // pressure, plus the per-batch warn-level logs above
@@ -809,6 +900,7 @@ pub async fn drain_for_test(
         let outcome = process_batch(services, batch, concurrency).await;
         let mut m = queue.metrics.lock().expect("metrics lock poisoned");
         m.consolidated += outcome.done;
+        m.deferred_subconscious += outcome.deferred;
         m.failed += outcome.failed + outcome.rate_limited;
         m.last_lap_ms = start.elapsed().as_millis() as u64;
     }
