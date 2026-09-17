@@ -44,11 +44,14 @@ pub mod embedding;
 pub mod embedding_providers;
 pub mod exact;
 pub mod fragment_id;
+pub mod graph_backend;
 pub mod kind_registry;
 pub mod llm;
 pub mod llm_cache;
 pub mod llm_cache_crypto;
 pub mod llm_cache_redactor;
+#[cfg(feature = "neo4j-graph")]
+pub mod neo4j_graph;
 pub mod parser;
 pub mod session_index;
 pub mod tenants;
@@ -79,6 +82,16 @@ pub struct ContextNestServices {
     /// text content lives in [`Self::fragment_texts`] (canonical
     /// fragments carry embeddings only — text is the API layer's concern).
     pub attractor_manager: Arc<MemoryAttractorManager>,
+    /// Projection of the learning entities onto a property graph, served
+    /// by the `/api/v1/graph` write + traverse routes. Always present:
+    /// when the `neo4j-graph` feature is not compiled in, when the graph
+    /// service is disabled, or when the database could not be reached at
+    /// boot, this is a [`graph_backend::DisabledGraph`] and the routes
+    /// degrade (writes answer `skipped`, reads answer `404`) rather than
+    /// failing. `Arc<dyn …>` and **not** a `OnceCell` so a test — or a
+    /// later caller — can swap in a different backend before the router
+    /// is built.
+    pub graph: Arc<dyn graph_backend::GraphBackend>,
     /// Thin session-to-fragment routing index required by the seven-tool
     /// memory API. The [`MemoryAttractorManager`] is session-agnostic by
     /// design; this index is the complementary layer that lets the API answer
@@ -300,11 +313,19 @@ impl ContextNestServices {
         }
         let llm_cache = llm_cache;
 
+        // Graph projection backend. Cannot fail: an unreachable or
+        // misconfigured database degrades to DisabledGraph with a warn!,
+        // so it can never stop the substrate booting. This is also the
+        // only place the schema DDL runs — a schema fn with no caller
+        // would be dead code that silently leaves the graph unprepared.
+        let graph = graph_backend::build_graph_backend(&config).await;
+
         Ok(Self {
             context_manager,
             parser,
             embedding,
             attractor_manager,
+            graph,
             session_index,
             fragment_texts,
             fragment_metadata,
