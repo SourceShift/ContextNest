@@ -256,6 +256,73 @@ async fn t4_reconstruct_prunes_below_cosine_floor() {
     std::env::remove_var("CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR");
 }
 
+/// T1 reconsideration — when a fragment consolidates Done, deferred
+/// siblings in the same session get their marker cleared and are
+/// re-enqueued. Simulates the sequence: a solo fragment gets
+/// deferred (no peers), then a new fragment arrives + consolidates
+/// normally (gate lowered), which should wake the deferred sibling.
+#[tokio::test]
+async fn t1_reconsideration_wakes_deferred_siblings_when_peer_arrives() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT", "1");
+    // Threshold=0.0 makes anything a valid peer, so the second
+    // fragment to arrive consolidates Done and triggers reconsideration.
+    std::env::set_var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD", "0.0");
+
+    let (services, _server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+
+    // First fragment: alone in its session, gate defers it.
+    sink.store(&rec("first isolated turn", "cn-test-t1-recon"))
+        .await
+        .expect("sink store");
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    let metrics_after_first = services.consolidation_queue.snapshot_metrics();
+    assert!(
+        metrics_after_first.deferred_subconscious >= 1,
+        "first fragment should be deferred; got {metrics_after_first:?}"
+    );
+    let ids_after_first = services.session_index.list_active("cn-test-t1-recon").await;
+    assert_eq!(ids_after_first.len(), 1);
+    let deferred_id = ids_after_first[0].clone();
+
+    {
+        let meta = services.fragment_metadata.read().await;
+        let is_deferred = meta
+            .get(&deferred_id)
+            .and_then(|m| m.get("_cn_recurrence_deferred"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        assert!(is_deferred, "first fragment must carry the deferred marker");
+    }
+
+    // Second fragment: with threshold=0.0 any peer counts, so this
+    // one passes the gate on first try, consolidates Done, and
+    // triggers reconsideration for the deferred sibling.
+    sink.store(&rec("second turn brings a peer", "cn-test-t1-recon"))
+        .await
+        .expect("sink store");
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    // After the second drain: the reconsideration path enqueues the
+    // deferred sibling; that enqueue must have happened before the
+    // drain finished. Verify the marker is cleared.
+    let meta = services.fragment_metadata.read().await;
+    let marker_still_present = meta
+        .get(&deferred_id)
+        .and_then(|m| m.get("_cn_recurrence_deferred"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !marker_still_present,
+        "reconsideration should have cleared the deferred marker"
+    );
+
+    std::env::remove_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT");
+    std::env::remove_var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD");
+}
+
 /// T4 — with the floor at 0 the pre-Sprint-1 behavior is preserved
 /// (top-K is filled up to `depth` regardless of similarity).
 #[tokio::test]

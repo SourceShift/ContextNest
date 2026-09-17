@@ -1,6 +1,6 @@
 # Epic: 2026 arxiv-driven substrate improvements
 
-**Status:** planning (backlog only — no tickets in flight).
+**Status:** Sprint 1 shipped in v0.1.1 (T1 gate + reconsideration, T3 replay, T4 pruning; T2 was already implemented in v0.1.0). Sprint 2 and Sprint 3 remain backlog.
 **Source:** literature survey against 2026 arxiv papers matching ContextNest's problem space (agent memory, consolidation, retrieval quality, provenance).
 **Date opened:** 2026-09-17.
 
@@ -8,9 +8,9 @@ Each ticket below cites its source paper, names the ContextNest primitive it cha
 
 The tickets are grouped into three sprints. Sprint 1 items are independent and can land in parallel. Sprint 2 assumes Sprint 1 is in. Research-tier items are read-only until a scoped design doc lands separately.
 
-## Sprint 1 — high-signal, S-size, independent
+## Sprint 1 — high-signal, S-size, independent — **SHIPPED v0.1.1**
 
-### T1. RecMem recurrence-gated consolidation
+### T1. RecMem recurrence-gated consolidation — **SHIPPED v0.1.1**
 
 - Paper: [RecMem — arXiv:2605.16045](https://arxiv.org/abs/2605.16045)
 - Primitive: pre-pass inside the consolidation batch loop. Before invoking the embedder + basin/graph pipeline for a fragment, count how many peers in the same `(tenant_id, session_id)` already have cosine ≥ `θ_sim` to it. If the count is below `θ_count`, requeue the fragment as "subconscious" (sidecar remains, no basin, no graph node).
@@ -19,7 +19,11 @@ The tickets are grouped into three sprints. Sprint 1 items are independent and c
 - Expected effect: paper reports 87% consolidation-token cut and accuracy 68.8% → 81.1% on LoCoMo. For ContextNest specifically, this trims embedder round-trips and the O(N·D) graph scan on sparse fragments — the two hotspots of the 2026-09-08 CPU report.
 - Test plan: unit test proving a fragment with zero session-peers stays in the queue; integration test that its retrieval still works via sidecar; benchmark harness comparing consolidated-fragment count with/without the gate over a fixed corpus.
 
-### T2. MemClaw pre-filter — move tenant scoping before cosine scan
+### T2. MemClaw pre-filter — move tenant scoping before cosine scan — **SHIPPED v0.1.0**
+
+Already implemented in the v2 tenant API before this epic was opened. `src/api/tenants.rs::retrieve` authenticates the session capability and constructs `MemoryScope` before any similarity scoring runs; the v1 legacy `retrieve` handler in `src/api/tools.rs` also scopes to `active_fragments_session_map()` / `list_active(session_id)` before cosine. Ticket kept in this epic for traceability against the source paper.
+
+
 
 - Paper: [MemClaw governed shared memory — arXiv:2606.24535](https://arxiv.org/html/2606.24535v1)
 - Primitive: today `retrieve` filters by `session_id` post-similarity. The pre-v0.1.0 legacy code path retained global search when session was absent. Move the `(tenant_id, session_id)` filter to run **before** cosine scoring — the scoped candidate set is authoritative, similarity ranks it.
@@ -28,7 +32,7 @@ The tickets are grouped into three sprints. Sprint 1 items are independent and c
 - Expected effect: multi-tenant isolation becomes correct-by-construction rather than probabilistic. Aligns with the v0.1.0 tenant isolation PR (#175). Small perf win: cosine scan is smaller when the scope filter runs first.
 - Test plan: cross-tenant retrieve rejection tests already in `src/services/tenants/tests.rs`; add one that would have passed under the old post-filter but fails under pre-filter (poisoned candidate).
 
-### T3. PROJECTMEM replay endpoint
+### T3. PROJECTMEM replay endpoint — **SHIPPED v0.1.1**
 
 - Paper: [PROJECTMEM — arXiv:2606.12329](https://arxiv.org/html/2606.12329v1)
 - Primitive: expose `GET /api/v1/substrate/replay?since=<ts>` that rebuilds derived state (basins, graph, session_index) from the input WAL alone. Diagnostic-only; does not touch the canonical checkpoint.
@@ -37,7 +41,7 @@ The tickets are grouped into three sprints. Sprint 1 items are independent and c
 - Expected effect: adds a corruption-recovery escape hatch and validates the WAL is truly authoritative (matches the design claim in `docs/architecture-honest.md`). Does not change hot path.
 - Test plan: integration test that seeds a session, deletes the canonical SQLite, calls `/replay`, and verifies retrieval still works.
 
-### T4. Chain-of-Memory pruning on reconstruction
+### T4. Chain-of-Memory pruning on reconstruction — **SHIPPED v0.1.1**
 
 - Paper: [Chain-of-Memory — arXiv:2601.14287](https://arxiv.org/abs/2601.14287)
 - Primitive: in `reconstruct`'s chain assembly, drop path nodes whose cosine to the query exceeds a cutoff. Prevents off-topic fragments from being stitched into the reconstructed chain.

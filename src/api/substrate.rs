@@ -65,6 +65,11 @@ pub struct ConsolidationStatus {
     /// missing the consolidation flag. Tests poll on this before
     /// asserting "everything that existed is queued."
     pub initial_scan_complete: bool,
+    /// Cumulative fragments held in the RecMem subconscious store
+    /// since startup — see `docs/roadmap/epics/2026-arxiv-improvements.md`
+    /// (T1). Zero when the gate is disabled (default).
+    #[serde(default)]
+    pub deferred_subconscious: usize,
 }
 
 pub async fn get_consolidation_status(
@@ -112,6 +117,7 @@ pub async fn get_consolidation_status(
         processing_ms: metrics.processing_ms,
         last_lap_ms: metrics.last_lap_ms,
         initial_scan_complete: metrics.initial_scan_complete,
+        deferred_subconscious: metrics.deferred_subconscious,
     }))
 }
 
