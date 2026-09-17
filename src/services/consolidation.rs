@@ -579,6 +579,58 @@ async fn consolidate_one(
     }
 
     services.invalidate_health();
+
+    // RecMem reconsideration path (T1 follow-up, see
+    // docs/roadmap/epics/2026-arxiv-improvements.md). A fragment that
+    // just Done-consolidated is a new peer for anything in its
+    // session. Wake up to 32 previously-deferred siblings so the next
+    // worker tick re-checks them against the (now-larger) session
+    // peer set. We only clear the marker and enqueue — we do NOT
+    // re-embed here. The reconsideration itself happens in the next
+    // pass through `consolidate_one`, which sees `already_deferred =
+    // false` (marker cleared) and re-runs the gate cleanly.
+    if std::env::var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+        > 0
+    {
+        if let Some(session_id) = services.session_index.find_session(id).await {
+            let peers = services.session_index.list_active(&session_id).await;
+            let mut reconsidered: Vec<String> = Vec::new();
+            {
+                let mut meta_w = services.fragment_metadata.write().await;
+                for peer_id in peers.iter() {
+                    if peer_id == id || reconsidered.len() >= 32 {
+                        continue;
+                    }
+                    let Some(entry) = meta_w.get_mut(peer_id) else {
+                        continue;
+                    };
+                    let deferred = entry
+                        .get("_cn_recurrence_deferred")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if deferred {
+                        entry.remove("_cn_recurrence_deferred");
+                        reconsidered.push(peer_id.clone());
+                    }
+                }
+            }
+            for peer_id in &reconsidered {
+                services.consolidation_queue.enqueue(peer_id.clone());
+            }
+            if !reconsidered.is_empty() {
+                tracing::debug!(
+                    session = %session_id,
+                    trigger = %id,
+                    reconsidered = reconsidered.len(),
+                    "consolidation: reconsidered deferred siblings"
+                );
+            }
+        }
+    }
+
     Ok(ConsolidationOutcome::Done)
 }
 
