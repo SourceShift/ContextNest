@@ -129,6 +129,19 @@ pub fn is_known_node_label(label: &str) -> bool {
     NODE_LABELS.iter().any(|l| l.label == label)
 }
 
+/// The property that identifies a node of `label`, per [`NODE_LABELS`].
+///
+/// A writer must MERGE on this property rather than assuming `id`:
+/// `TaskClass` is identified by `name`, and the DDL's uniqueness
+/// constraint is built on that same property. Merging on `id` there
+/// leaves `name` unset — while `siblings()` reads `c.name`, so the
+/// fan-out returns nothing — and leaves the constraint guarding a
+/// property nothing ever wrote, which is how it ends up rejecting a
+/// second node that merely shares a `name` and failing the transaction.
+pub fn node_key(label: &str) -> Option<&'static str> {
+    NODE_LABELS.iter().find(|l| l.label == label).map(|l| l.key)
+}
+
 /// True when this exact `(type, from_label, to_label)` triple may be
 /// interpolated into a Cypher statement.
 pub fn is_known_edge_type(edge_type: &str, from_label: &str, to_label: &str) -> bool {
@@ -280,5 +293,16 @@ mod tests {
         // Correct type name, wrong endpoint labels.
         assert!(!is_known_edge_type("LINKED_TO", "Run", "GradientTarget"));
         assert!(!is_known_edge_type("Widget", "Trace", "GradientTarget"));
+    }
+
+    #[test]
+    fn node_key_picks_the_property_the_reader_and_ddl_agree_on() {
+        // Three labels merge on `id`; `TaskClass` does not. Merging it on
+        // `id` would leave `name` unset, and `siblings()` reads `c.name`.
+        assert_eq!(node_key("Run"), Some("id"));
+        assert_eq!(node_key("Trace"), Some("id"));
+        assert_eq!(node_key("GradientTarget"), Some("id"));
+        assert_eq!(node_key("TaskClass"), Some("name"));
+        assert_eq!(node_key("Widget"), None);
     }
 }

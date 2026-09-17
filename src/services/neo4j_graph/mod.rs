@@ -24,8 +24,8 @@ pub mod schema;
 use crate::config::{Config, GraphStorageBackend};
 use crate::error::{ContextNestError, ContextNestResult};
 use crate::services::graph_backend::{
-    is_known_edge_type, is_known_node_label, DisabledGraph, GraphBackend, GraphEdge, GraphNode,
-    UpsertCounts,
+    is_known_edge_type, is_known_node_label, node_key, DisabledGraph, GraphBackend, GraphEdge,
+    GraphNode, UpsertCounts,
 };
 use neo4rs::{
     query, BoltBoolean, BoltFloat, BoltInteger, BoltList, BoltMap, BoltNull, BoltString, BoltType,
@@ -210,12 +210,16 @@ impl GraphBackend for Neo4jGraphService {
         }
 
         // Sorted grouping keeps the statement order deterministic, which
-        // keeps retries of the same batch byte-identical.
-        let mut nodes_by_label: BTreeMap<&str, Vec<&GraphNode>> = BTreeMap::new();
+        // keeps retries of the same batch byte-identical. Each group also
+        // carries the label's identity property so the MERGE below keys on
+        // it — `TaskClass` is identified by `name`, not `id`.
+        let mut nodes_by_label: BTreeMap<&str, (&str, Vec<&GraphNode>)> = BTreeMap::new();
         for node in nodes {
+            let key = node_key(&node.label).expect("label validated above");
             nodes_by_label
                 .entry(node.label.as_str())
-                .or_default()
+                .or_insert((key, Vec::new()))
+                .1
                 .push(node);
         }
         let mut edges_by_type: BTreeMap<&str, Vec<&GraphEdge>> = BTreeMap::new();
@@ -231,9 +235,9 @@ impl GraphBackend for Neo4jGraphService {
         let mut txn = self.graph.start_txn().await.map_err(db_error)?;
         let mut counts = UpsertCounts::default();
 
-        for (label, group) in &nodes_by_label {
+        for (label, (key, group)) in &nodes_by_label {
             let cypher =
-                format!("UNWIND $nodes AS n MERGE (x:{label} {{id: n.id}}) SET x += n.props");
+                format!("UNWIND $nodes AS n MERGE (x:{label} {{ {key}: n.id }}) SET x += n.props");
             let payload: Vec<HashMap<String, BoltType>> = group
                 .iter()
                 .map(|node| {
