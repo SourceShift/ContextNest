@@ -60,7 +60,9 @@ async fn make_setup() -> (ContextNestServices, TestServer) {
 /// to the subconscious store. Basin/graph work is skipped.
 #[tokio::test]
 async fn t1_recmem_gate_defers_solo_fragment_when_enabled() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Enable the gate for this test only. The default (unset / 0) is
     // OFF, so existing consolidation behavior is unchanged.
     std::env::set_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT", "1");
@@ -119,7 +121,9 @@ async fn t1_recmem_gate_defers_solo_fragment_when_enabled() {
 /// not opt in.
 #[tokio::test]
 async fn t1_recmem_gate_disabled_default_consolidates_solo_fragment() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Explicitly ensure the gate is off (in case the runner leaks env
     // from another test).
     std::env::remove_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT");
@@ -219,7 +223,9 @@ async fn t3_substrate_replay_without_wal_returns_service_unavailable() {
 /// content strings so we can assert relative ranking.
 #[tokio::test]
 async fn t4_reconstruct_prunes_below_cosine_floor() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A very high floor guarantees nothing survives — the endpoint
     // must return an empty reconstruction rather than the historical
     // top-K "always return something" behavior.
@@ -263,7 +269,9 @@ async fn t4_reconstruct_prunes_below_cosine_floor() {
 /// normally (gate lowered), which should wake the deferred sibling.
 #[tokio::test]
 async fn t1_reconsideration_wakes_deferred_siblings_when_peer_arrives() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT", "1");
     // Threshold=0.0 makes anything a valid peer, so the second
     // fragment to arrive consolidates Done and triggers reconsideration.
@@ -318,6 +326,22 @@ async fn t1_reconsideration_wakes_deferred_siblings_when_peer_arrives() {
         !marker_still_present,
         "reconsideration should have cleared the deferred marker"
     );
+    drop(meta);
+
+    // Reconsideration metrics: exactly one deferred sibling was
+    // woken up. The wake counter increments unconditionally; the
+    // "passed" counter only increments if the reconsidered fragment
+    // reaches Done on its next pass — which requires it to pass the
+    // gate the second time around.
+    let metrics = services.consolidation_queue.snapshot_metrics();
+    assert!(
+        metrics.reconsidered_enqueued >= 1,
+        "at least one sibling should have been re-enqueued; got {metrics:?}"
+    );
+    assert!(
+        metrics.reconsidered_and_passed >= 1,
+        "at least one reconsidered sibling should have Done; got {metrics:?}"
+    );
 
     std::env::remove_var("CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT");
     std::env::remove_var("CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD");
@@ -327,7 +351,9 @@ async fn t1_reconsideration_wakes_deferred_siblings_when_peer_arrives() {
 /// (top-K is filled up to `depth` regardless of similarity).
 #[tokio::test]
 async fn t4_reconstruct_zero_floor_matches_pre_sprint1_behavior() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR", "0.0");
 
     let (services, server) = make_setup().await;
