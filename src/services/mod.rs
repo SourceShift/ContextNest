@@ -44,8 +44,6 @@ pub mod embedding;
 pub mod embedding_providers;
 pub mod exact;
 pub mod fragment_id;
-pub mod graph;
-pub mod graph_enhanced;
 pub mod kind_registry;
 pub mod llm;
 pub mod llm_cache;
@@ -63,8 +61,6 @@ pub use embedding_providers::{
     CustomHttpEmbeddingConfig, CustomHttpEmbeddingProvider, EmbeddingProvider,
     HuggingFaceEmbeddingProvider, OllamaEmbeddingProvider,
 };
-pub use graph::GraphService;
-pub use graph_enhanced::EnhancedGraphService;
 pub use llm::{LlmProvider, LlmService, LlmServiceBuilder};
 pub use llm_cache::LlmCacheService;
 pub use parser::ParserService;
@@ -73,8 +69,6 @@ pub use parser::ParserService;
 #[derive(Clone)]
 pub struct ContextNestServices {
     pub context_manager: ContextManagerService,
-    pub graph: GraphService,
-    pub enhanced_graph: EnhancedGraphService,
     pub parser: ParserService,
     pub embedding: EmbeddingService,
     /// Canonical attractor orchestrator per canon Module 05. Backs all
@@ -222,33 +216,6 @@ impl ContextNestServices {
     pub async fn new(config: Config) -> ContextNestResult<Self> {
         tracing::info!("Initializing ContextNest services");
 
-        let graph = if config.database.use_mock {
-            tracing::info!("GraphService: mock mode");
-            GraphService::new_mock().await?
-        } else {
-            tracing::info!("GraphService: real Neo4j connection");
-            GraphService::new(
-                &config.database.neo4j_uri,
-                &config.database.neo4j_username,
-                &config.database.neo4j_password,
-                &config.database.neo4j_database,
-            )
-            .await?
-        };
-
-        let enhanced_graph = if config.database.use_mock {
-            EnhancedGraphService::new_mock().await?
-        } else {
-            EnhancedGraphService::new(
-                &config.database.neo4j_uri,
-                &config.database.neo4j_username,
-                &config.database.neo4j_password,
-                &config.database.neo4j_database,
-                graph_enhanced::ContextStorageConfig::default(),
-            )
-            .await?
-        };
-
         let parser = ParserService::new(ParserConfig::default())?;
 
         let embedding_config = config
@@ -335,8 +302,6 @@ impl ContextNestServices {
 
         Ok(Self {
             context_manager,
-            graph,
-            enhanced_graph,
             parser,
             embedding,
             attractor_manager,
@@ -371,15 +336,12 @@ impl ContextNestServices {
     }
 
     pub async fn health_check(&self) -> ContextNestResult<HealthStatus> {
-        let graph_ok = self.graph.health_check().await.unwrap_or(false);
-        let enhanced_ok = self.enhanced_graph.get_storage_health().await.is_ok();
         let parser_ok = self.parser.health_check().await?;
         let embedding_ok = self.embedding.health_check().await?;
 
-        let overall = graph_ok && enhanced_ok && parser_ok && embedding_ok;
+        let overall = parser_ok && embedding_ok;
         Ok(HealthStatus {
             overall,
-            graph: graph_ok && enhanced_ok,
             parser: parser_ok,
             embedding: embedding_ok,
         })
@@ -389,7 +351,6 @@ impl ContextNestServices {
 #[derive(Debug, serde::Serialize)]
 pub struct HealthStatus {
     pub overall: bool,
-    pub graph: bool,
     pub parser: bool,
     pub embedding: bool,
 }

@@ -43,8 +43,7 @@ pub mod services;
 // Re-export service container + core services for convenience. Most users
 // should `use contextnest::prelude::*` instead.
 pub use services::{
-    ContextManagerService, ContextNestServices, EmbeddingService, EnhancedGraphService,
-    GraphService, HealthStatus, ParserService,
+    ContextManagerService, ContextNestServices, EmbeddingService, HealthStatus, ParserService,
 };
 
 pub use crate::config::Config;
