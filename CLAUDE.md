@@ -149,7 +149,10 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | Minimum post-batch pause and backoff base |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | In-flight embedder calls |
 | `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` | 32 | Top-K cap on edges created per new fragment in `create_connections_for_node`. Bounds avg_degree growth as the substrate fills. Lower → faster ingest, smaller graph; higher → richer connection-aware retrieval. |
-| `CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD` | 0.7 | Cosine-similarity floor for a peer to qualify as a connection candidate. Raise to 0.8 during backlog drain to halve fan-out. |
+| `CONTEXTNEST_CONNECTION_SIMILARITY_THRESHOLD` | 0.7 | Cosine-similarity floor for a peer to qualify as a connection candidate. Raise to 0.8 during backlog drain to halve fan-out. Also reused by the T1 RecMem gate as the peer-similarity floor. |
+| `CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT` | 0 | T1 (arXiv:2605.16045). When > 0, defers a fragment to the subconscious store if it has fewer than N session peers over the cosine floor. Sidecar stays retrievable; no basin, no graph work. Reconsideration re-enqueues when a peer arrives. |
+| `CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR` | 0.15 | T4 (arXiv:2601.14287). Drops fragments below this cosine from `reconstruct`'s chain assembly before top-K truncation. Set 0.0 to disable. |
+| `CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT` | 0.1 | T5 (arXiv:2606.12945). Weight on the frequency-of-use boost `1 + w * log2(count + 1)` applied to retrieve scoring. Set 0.0 to disable. |
 
 Full list in `docs/architecture-honest.md`.
 
