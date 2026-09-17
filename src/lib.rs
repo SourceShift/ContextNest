@@ -17,7 +17,7 @@
 //!   meta-cognition, agency (the substrate's primitives)
 //! - [`memory`] — canonical attractor-based memory sub-engines (adaptive decay,
 //!   connection network, gap filling, basin dynamics)
-//! - [`services`] — service container glue (embedding, graph, parser)
+//! - [`services`] — service container glue (embedding, parser)
 //! - [`protocols`] — Pareto-Lang protocol types
 //! - [`config`], [`error`] — config + error types
 //! See `resources/Context-Engineering/` for the canonical theory this
@@ -43,8 +43,7 @@ pub mod services;
 // Re-export service container + core services for convenience. Most users
 // should `use contextnest::prelude::*` instead.
 pub use services::{
-    ContextManagerService, ContextNestServices, EmbeddingService, EnhancedGraphService,
-    GraphService, HealthStatus, ParserService,
+    ContextManagerService, ContextNestServices, EmbeddingService, HealthStatus, ParserService,
 };
 
 pub use crate::config::Config;

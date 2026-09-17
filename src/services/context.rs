@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::EmbeddingService; // GraphService temporarily disabled
+use super::EmbeddingService;
 
 /// Request for building context
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,6 @@ pub enum SuggestionType {
 #[derive(Clone)]
 pub struct ContextManagerService {
     managers: HashMap<String, ContextManager>,
-    // graph_service: GraphService, // Temporarily disabled
     embedding_service: EmbeddingService,
     default_token_budget: usize,
 }
@@ -275,7 +274,7 @@ impl ContextManagerService {
             }
         }
 
-        // Add relevant patterns from graph
+        // Add relevant patterns
         if let Some(content) = &request.content {
             let similar_patterns = self.find_similar_patterns(content).await?;
             if !similar_patterns.is_empty() {
@@ -375,16 +374,10 @@ impl ContextManagerService {
         field.build_context()
     }
 
-    /// Find similar patterns in the graph
+    /// Find similar patterns.
     async fn find_similar_patterns(&self, content: &str) -> ContextNestResult<Vec<String>> {
         // Generate embedding for content
         let embedding = self.embedding_service.generate_embedding(content).await?;
-
-        // Search for similar widgets (temporarily disabled - graph service not available)
-        // let similar_widgets = self
-        //     .graph_service
-        //     .find_similar_widgets(&embedding, 5)
-        //     .await?;
 
         // Extract patterns (using placeholder for now)
         let patterns = vec![

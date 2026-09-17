@@ -13,8 +13,7 @@
 // =============================================================================
 
 pub use crate::services::{
-    ContextManagerService, ContextNestServices, EmbeddingService, EnhancedGraphService,
-    GraphService, HealthStatus, ParserService,
+    ContextManagerService, ContextNestServices, EmbeddingService, HealthStatus, ParserService,
 };
 
 // =============================================================================
