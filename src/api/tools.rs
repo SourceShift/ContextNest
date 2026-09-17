@@ -838,11 +838,20 @@ pub async fn retrieve(
             // so this is backward-compatible. Knobs:
             //   CONTEXTNEST_RETRIEVE_TRUST_<TIER>.
             let trust = fragment_meta.map(provenance_weight).unwrap_or(1.0);
+            // T5 (arXiv:2606.12945) — frequency-of-use boost. Fragments
+            // that have been retrieved often are more valuable than
+            // those that have never been used. Logarithmic scaling so
+            // the boost saturates: a 10x-used fragment isn't 10x
+            // better than a 1x-used one. Neutral 1.0 for fragments
+            // that were never retrieved (retrieval_count missing / 0).
+            // Weight knob: CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT
+            // (default 0.1). Set 0.0 to disable.
+            let frequency = fragment_meta.map(frequency_multiplier).unwrap_or(1.0);
             RetrieveHit {
                 id: fragment.id,
                 content,
                 importance: fragment.importance,
-                similarity: base_similarity * decay * kind_weight * density * trust,
+                similarity: base_similarity * decay * kind_weight * density * trust * frequency,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
             }
@@ -925,6 +934,11 @@ pub async fn retrieve(
     // returned hit so future retrieves apply the recency bonus via
     // `decay_multiplier` (which prefers last_accessed over ts when
     // present). One write-lock, all hits in a single batch.
+    //
+    // T5 (arXiv:2606.12945, Learning What to Remember) — also increment
+    // `retrieval_count`, the frequency signal in the multi-factor
+    // value model. Consumed by `frequency_multiplier` at retrieval
+    // scoring time; see docs/roadmap/epics/2026-arxiv-improvements.md.
     if !scored.is_empty() {
         let now_iso = chrono::Utc::now().to_rfc3339();
         let mut meta_w = services.fragment_metadata.write().await;
@@ -934,6 +948,12 @@ pub async fn retrieve(
                 "last_accessed".to_string(),
                 serde_json::Value::String(now_iso.clone()),
             );
+            let next = entry
+                .get("retrieval_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            entry.insert("retrieval_count".to_string(), serde_json::Value::from(next));
         }
     }
 
@@ -1535,6 +1555,46 @@ fn decay_multiplier(metadata: &HashMap<String, serde_json::Value>) -> f32 {
     let age_days = age_secs / 86_400.0;
     let lambda = std::f64::consts::LN_2 / half_life_days;
     (-lambda * age_days).exp() as f32
+}
+
+/// T5 frequency-of-use multiplier (arXiv:2606.12945, Learning What to
+/// Remember — "usage-frequency decay" factor). Reads `retrieval_count`
+/// from metadata (bumped by the retrieve handler on every hit) and
+/// returns a multiplier in `[1.0, 1.0 + w * log2(count + 1)]` where
+/// `w = CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT` (default 0.1).
+///
+/// Logarithmic so a fragment retrieved 100 times isn't 100x-boosted —
+/// it's `1 + 0.1 * log2(101) ≈ 1.67` at default weight. Fragments that
+/// have never been retrieved score neutral 1.0.
+///
+/// Backwards-compatible: legacy fragments without `retrieval_count`
+/// default to zero, which yields the neutral 1.0 multiplier.
+fn frequency_multiplier(metadata: &HashMap<String, serde_json::Value>) -> f32 {
+    let weight = *frequency_weight_cached();
+    if weight <= 0.0 {
+        return 1.0;
+    }
+    let count = metadata
+        .get("retrieval_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if count == 0 {
+        return 1.0;
+    }
+    1.0 + weight * ((count as f32 + 1.0).log2())
+}
+
+/// Cached frequency-weight knob. Env-only; read once at process start
+/// so we don't `getenv` per hit. Default 0.1.
+fn frequency_weight_cached() -> &'static f32 {
+    static CACHED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.1)
+    })
 }
 
 /// Cached density-weight knob read from environment exactly once per
