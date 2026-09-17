@@ -17,7 +17,7 @@
 //!   meta-cognition, agency (the substrate's primitives)
 //! - [`memory`] — canonical attractor-based memory sub-engines (adaptive decay,
 //!   connection network, gap filling, basin dynamics)
-//! - [`services`] — service container glue (embedding, graph, parser)
+//! - [`services`] — service container glue (embedding, parser)
 //! - [`protocols`] — Pareto-Lang protocol types
 //! - [`config`], [`error`] — config + error types
 //! See `resources/Context-Engineering/` for the canonical theory this

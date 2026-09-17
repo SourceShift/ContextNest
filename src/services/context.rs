@@ -274,7 +274,7 @@ impl ContextManagerService {
             }
         }
 
-        // Add relevant patterns from graph
+        // Add relevant patterns
         if let Some(content) = &request.content {
             let similar_patterns = self.find_similar_patterns(content).await?;
             if !similar_patterns.is_empty() {
@@ -374,7 +374,7 @@ impl ContextManagerService {
         field.build_context()
     }
 
-    /// Find similar patterns in the graph
+    /// Find similar patterns.
     async fn find_similar_patterns(&self, content: &str) -> ContextNestResult<Vec<String>> {
         // Generate embedding for content
         let embedding = self.embedding_service.generate_embedding(content).await?;

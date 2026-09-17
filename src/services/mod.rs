@@ -1,5 +1,5 @@
 //! Core services container.
-//! v0.1.0 surface is intentionally minimal: graph, parser, embedding, context
+//! v0.1.0 surface is intentionally minimal: parser, embedding, context
 //! manager. Plugin loading + hot reload + sandbox management were removed with
 //! the plugin SDK.
 
