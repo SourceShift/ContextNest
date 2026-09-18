@@ -126,6 +126,22 @@ CN_BIND       ?= 127.0.0.1:28080
 CN_SUBSTRATE  ?= http://$(CN_BIND)
 CN_WAL        ?= $(HOME)/.contextnest/wal.jsonl
 CN_BIN        ?= ./target/release/contextnest
+# Extra cargo features for the build and serve targets. Empty by default, so
+# the standard build is byte-for-byte what it was.
+#
+# This matters more than it looks. The neo4j graph projection is compiled out
+# unless `neo4j-graph` is named here, and a feature-off binary does not fail
+# loudly — it serves every graph route and answers the upsert with
+# `{"skipped": true}`. Disabled and unreachable are indistinguishable from the
+# client side, so a forgotten flag reads as a database problem:
+#
+#   make cn-redeploy CN_FEATURES=neo4j-graph
+#
+# Each target below builds into the same path for a given profile, so a plain
+# `make cn-serve` after a feature build silently replaces the binary with a
+# feature-off one.
+CN_FEATURES   ?=
+CN_FEATURE_FLAGS = $(if $(CN_FEATURES),--features $(CN_FEATURES),)
 SINCE         ?= 7d
 PROJECT       ?=
 
@@ -155,6 +171,10 @@ cn-help:
 	@echo "  CN_SUBSTRATE=$(CN_SUBSTRATE)"
 	@echo "  CN_WAL=$(CN_WAL)"
 	@echo "  CN_BIN=$(CN_BIN)"
+	@echo "  CN_FEATURES=$(CN_FEATURES)"
+	@echo "    build/serve targets pass CN_FEATURES through as --features."
+	@echo "    Set it to keep optional backends compiled in, e.g."
+	@echo "      make cn-redeploy CN_FEATURES=neo4j-graph"
 	@echo "  SINCE=$(SINCE)   PROJECT=$(PROJECT)"
 	@echo
 	@echo "Secrets: set DEEPINFRA_API_KEY (or OPENAI_API_KEY) in your shell."
@@ -169,10 +189,10 @@ cn-config:
 	fi
 
 cn-build:
-	cargo build --release
+	cargo build --release $(CN_FEATURE_FLAGS)
 
 cn-test:
-	cargo test --tests
+	cargo test --tests $(CN_FEATURE_FLAGS)
 
 cn-lint:
 	cargo clippy --tests -- -A clippy::all -D clippy::correctness
@@ -201,7 +221,7 @@ cn-serve: cn-build
 # fail to bind while the old process still holds the port. Foreground, so it
 # blocks the terminal like `cn-serve` does.
 cn-redeploy: ## Rebuild release + restart cn-serve (stops the running instance first).
-	cargo build --release
+	cargo build --release $(CN_FEATURE_FLAGS)
 	@echo "stopping running contextnest on $(CN_BIND) (if any)…"
 	-@pkill -f 'contextnest serve' 2>/dev/null; sleep 1
 	$(MAKE) cn-serve
@@ -221,12 +241,12 @@ cn-ingest: $(CN_BIN)
 CN_BIN_FAST   ?= ./target/fast/contextnest
 
 cn-build-fast: ## Build the fast-profile binary (cargo build --profile fast)
-	cargo build --profile fast
+	cargo build --profile fast $(CN_FEATURE_FLAGS)
 
 cn-serve-dev: ## Run the fast-profile binary, WAL on. Auto-rebuilds on each invocation.
 	@if [ ! -f config.toml ]; then $(MAKE) cn-config; fi
 	@mkdir -p $(dir $(CN_WAL))
-	cargo run --profile fast --bin contextnest -- serve --bind $(CN_BIND)
+	cargo run --profile fast --bin contextnest $(CN_FEATURE_FLAGS) -- serve --bind $(CN_BIND)
 
 cn-watch: ## Auto-rebuild + restart on .rs file changes (requires cargo-watch). Ctrl-C exits both.
 	@if ! command -v cargo-watch >/dev/null 2>&1; then \
