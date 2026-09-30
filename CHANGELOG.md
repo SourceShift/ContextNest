@@ -19,7 +19,7 @@ Minor bump: the canonical checkpoint's on-disk format changes (see
   store, graph node, `embeddings_by_id`, per-basin copies) as separate 4 KB
   heap allocations. Measured on the 334 k-fragment operator substrate before
   the change: 12.4 GB live heap, 92 M allocations, ~37 KB per fragment.
-  ([epic](docs/roadmap/epics/disk-first-substrate.md))
+  ([#190], [epic](docs/roadmap/epics/disk-first-substrate.md))
 - **Compact connection graph.** Edges are 64-byte records with `u32`
   endpoints and per-node incident lists, replacing string-keyed maps that
   stored each edge UUID five times and each endpoint id twice more
@@ -78,6 +78,7 @@ Minor bump: the canonical checkpoint's on-disk format changes (see
    with free space (~4 KB per fragment).
 
 [#185]: https://github.com/SourceShift/ContextNest/pull/185
+[#190]: https://github.com/SourceShift/ContextNest/pull/190
 [#186]: https://github.com/SourceShift/ContextNest/pull/186
 [#187]: https://github.com/SourceShift/ContextNest/pull/187
 [#188]: https://github.com/SourceShift/ContextNest/pull/188
