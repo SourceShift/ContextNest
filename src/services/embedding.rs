@@ -8,14 +8,33 @@ use crate::{
 use chrono::Utc;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+/// Text→vector response cache, bounded LRU. Unbounded, every distinct text
+/// ever embedded (fragments, retrieve queries, goal-phase refinement,
+/// proxied `/v1/embeddings` calls) stayed resident for the process
+/// lifetime. A `std` mutex, not tokio: `LruCache::get` mutates recency and
+/// the critical section never spans an `.await`.
+type ResponseCache = std::sync::Arc<std::sync::Mutex<lru::LruCache<String, Vec<f32>>>>;
+
+/// Default bound: 4096 × 1024-d f32 ≈ 16 MB.
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// `None` when `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES=0` disables caching.
+fn new_response_cache() -> Option<ResponseCache> {
+    let entries = std::env::var("CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CACHE_MAX_ENTRIES);
+    std::num::NonZeroUsize::new(entries)
+        .map(|bound| std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(bound))))
+}
 
 /// Embedding service for generating vector embeddings
 #[derive(Clone)]
 pub struct EmbeddingService {
     config: EmbeddingServicesConfig,
     client: Client,
-    cache: std::sync::Arc<tokio::sync::RwLock<HashMap<String, Vec<f32>>>>,
+    cache: Option<ResponseCache>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,13 +55,10 @@ struct OpenAIEmbeddingData {
 
 impl EmbeddingService {
     pub fn new(config: EmbeddingServicesConfig) -> ContextNestResult<Self> {
-        let client = Client::new();
-        let cache = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-
         Ok(Self {
             config,
-            client,
-            cache,
+            client: Client::new(),
+            cache: new_response_cache(),
         })
     }
 
@@ -52,7 +68,7 @@ impl EmbeddingService {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
-            cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            cache: new_response_cache(),
         }
     }
 
@@ -173,9 +189,8 @@ impl EmbeddingService {
         // actually send to the provider).
         let cache_key = self.create_cache_key(text);
 
-        {
-            let cache_read = self.cache.read().await;
-            if let Some(cached) = cache_read.get(&cache_key) {
+        if let Some(cache) = &self.cache {
+            if let Some(cached) = cache.lock().unwrap().get(&cache_key) {
                 return Ok(cached.clone());
             }
         }
@@ -193,10 +208,8 @@ impl EmbeddingService {
             }
         };
 
-        // Cache the result
-        {
-            let mut cache_write = self.cache.write().await;
-            cache_write.insert(cache_key, embedding.clone());
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().put(cache_key, embedding.clone());
         }
 
         Ok(embedding)
@@ -802,16 +815,17 @@ impl EmbeddingService {
 
     /// Clear embedding cache
     pub async fn clear_cache(&self) {
-        let mut cache_write = self.cache.write().await;
-        cache_write.clear();
+        if let Some(cache) = &self.cache {
+            cache.lock().unwrap().clear();
+        }
     }
 
     /// Get cache statistics
     pub async fn get_cache_stats(&self) -> CacheStats {
-        let cache_read = self.cache.read().await;
+        let size = self.cache.as_ref().map_or(0, |c| c.lock().unwrap().len());
         CacheStats {
-            size: cache_read.len(),
-            memory_usage: cache_read.len() * self.config.dimensions * std::mem::size_of::<f32>(),
+            size,
+            memory_usage: size * self.config.dimensions * std::mem::size_of::<f32>(),
         }
     }
 
@@ -1300,6 +1314,51 @@ mod max_input_length_clamping_tests {
             .generate_embedding(&multibyte_text)
             .await
             .expect("multibyte embed should not panic on byte-vs-char boundary");
+    }
+}
+
+#[cfg(test)]
+mod response_cache_bound_tests {
+    use super::*;
+    use crate::config::EmbeddingServicesConfig;
+
+    fn service_with_bound(entries: usize) -> EmbeddingService {
+        let mut service =
+            EmbeddingService::new(EmbeddingServicesConfig::default()).expect("service builds");
+        service.cache = std::num::NonZeroUsize::new(entries)
+            .map(|b| std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(b))));
+        service
+    }
+
+    #[tokio::test]
+    async fn cache_never_exceeds_its_bound() {
+        let service = service_with_bound(2);
+        for text in ["alpha", "beta", "gamma", "delta"] {
+            service.generate_embedding(text).await.expect("embed");
+        }
+        assert_eq!(service.get_cache_stats().await.size, 2);
+    }
+
+    #[tokio::test]
+    async fn eviction_drops_least_recently_used() {
+        let service = service_with_bound(2);
+        service.generate_embedding("alpha").await.unwrap();
+        service.generate_embedding("beta").await.unwrap();
+        // Touch alpha so beta becomes the eviction victim.
+        service.generate_embedding("alpha").await.unwrap();
+        service.generate_embedding("gamma").await.unwrap();
+        let cache = service.cache.as_ref().unwrap().lock().unwrap();
+        assert!(cache.contains(&service.create_cache_key("alpha")));
+        assert!(!cache.contains(&service.create_cache_key("beta")));
+    }
+
+    #[tokio::test]
+    async fn zero_bound_disables_caching_but_still_embeds() {
+        let service = service_with_bound(0);
+        let first = service.generate_embedding("alpha").await.unwrap();
+        let second = service.generate_embedding("alpha").await.unwrap();
+        assert_eq!(first, second, "local embedder is deterministic");
+        assert_eq!(service.get_cache_stats().await.size, 0);
     }
 }
 
