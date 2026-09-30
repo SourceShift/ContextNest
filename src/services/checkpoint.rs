@@ -5,8 +5,12 @@
 //! their vector emptied; fragment and basin vectors live in the binary
 //! `vectors` table (little-endian f32). Node payloads never carry a vector —
 //! a node shares its fragment's. Rows written by older builds (vectors inline
-//! as JSON arrays, ~11 KB per 1024-d vector) still load unchanged;
-//! [`compact`] rewrites a whole checkpoint into the binary form.
+//! as JSON arrays, ~11 KB per 1024-d vector) still load unchanged inside a
+//! v0.2 file; [`compact`] rewrites a whole checkpoint into the binary form.
+//!
+//! A *whole-file* pre-v0.2 checkpoint (no `vectors` table at all) is refused
+//! at [`CheckpointStore::open`] unless `CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT=1`
+//! — the reason is in [`is_legacy_checkpoint`].
 use crate::memory::attractors::attractor_basin::AttractorBasin;
 use crate::memory::attractors::connection_network::{ConnectionEdge, MemoryNode, MemoryNodeType};
 use crate::memory::attractors::memory_attractor_manager::CanonicalSnapshot;
@@ -23,6 +27,10 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 /// Rows per restore batch handed to the attractor manager.
 const RESTORE_BATCH: usize = 2048;
+
+/// Set to `1` to let [`CheckpointStore::open`] adopt a pre-v0.2 checkpoint in
+/// place. Off by default — see [`is_legacy_checkpoint`].
+const ALLOW_LEGACY_ENV: &str = "CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT";
 
 const SCHEMA: &str = "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;
     CREATE TABLE IF NOT EXISTS identity(space TEXT NOT NULL);
@@ -122,8 +130,64 @@ fn upsert_vector(
     Ok(())
 }
 
+/// True when `path` is an existing pre-v0.2 checkpoint: it carries the v0.1
+/// `objects` table but no binary `vectors` table, so every vector is still
+/// inline JSON inside a payload.
+///
+/// Such a file must not be adopted in place. [`CheckpointStore::open`] runs
+/// [`SCHEMA`] unconditionally, which would add an empty `vectors` table to
+/// the operator's only pre-upgrade copy — the migration guide's contract is
+/// that the source is opened read-only and never written. Booting it also
+/// materialises ~11 KB of JSON per 1024-d vector, the heap profile that
+/// exhausted a 36 GB host's compressed-memory segments (v0.2 release notes:
+/// 12.4 GB -> 2.6 GB live heap).
+///
+/// Errors are folded into `false`: an unreadable file is the caller's problem
+/// to report, not this predicate's.
+pub fn is_legacy_checkpoint(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() == 0 {
+        return false;
+    }
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let has = |name: &str| -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [name],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    };
+    has("objects") && !has("vectors")
+}
+
+fn allow_legacy_checkpoint() -> bool {
+    std::env::var(ALLOW_LEGACY_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 impl CheckpointStore {
     pub fn open(path: &Path, space: &str) -> Result<Self> {
+        if is_legacy_checkpoint(path) && !allow_legacy_checkpoint() {
+            return Err(format!(
+                "{} is a pre-v0.2 checkpoint: vectors are still stored as inline JSON. \
+                 Booting it would add a `vectors` table to your only pre-upgrade copy and \
+                 load ~11 KB of JSON per vector into memory. Compact it into a new file \
+                 first:\n    contextnest checkpoint compact --from {} --into {}.compacted.sqlite\n\
+                 See docs/upgrading/v0.2.0.md. Set {ALLOW_LEGACY_ENV}=1 to adopt it in place anyway.",
+                path.display(),
+                path.display(),
+                path.display(),
+            )
+            .into());
+        }
         let lock = super::tenants::lock_database(path)?;
         let mut connection = Connection::open(path)?;
         connection.execute_batch(SCHEMA)?;
@@ -884,6 +948,68 @@ mod tests {
         let _live = CheckpointStore::open(&path, "space").unwrap();
         let err = compact(&path, &dir.path().join("out.sqlite")).unwrap_err();
         assert!(err.to_string().contains("in use"), "{err}");
+    }
+
+    fn has_vectors_table(path: &Path) -> bool {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+    }
+
+    /// A whole-file pre-v0.2 checkpoint is refused by default: adopting it
+    /// would write a `vectors` table into the operator's only pre-upgrade
+    /// copy and load inline JSON vectors at ~11 KB each.
+    #[test]
+    fn legacy_checkpoint_is_refused_unless_explicitly_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v0_1.sqlite");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE identity(space TEXT NOT NULL);
+                 CREATE TABLE objects(kind TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(kind,id));
+                 INSERT INTO identity VALUES('space');
+                 INSERT INTO objects VALUES('fragment','a','{\"id\":\"a\",\"content\":[1.0,0.5]}');",
+            )
+            .unwrap();
+        }
+        assert!(is_legacy_checkpoint(&path));
+        assert!(!has_vectors_table(&path));
+
+        std::env::remove_var(ALLOW_LEGACY_ENV);
+        let message = match CheckpointStore::open(&path, "space") {
+            Ok(_) => panic!("a pre-v0.2 checkpoint must not be adopted by default"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("pre-v0.2"), "{message}");
+        assert!(
+            !has_vectors_table(&path),
+            "a refused boot must leave the source untouched"
+        );
+
+        std::env::set_var(ALLOW_LEGACY_ENV, "1");
+        let store = CheckpointStore::open(&path, "space").unwrap();
+        std::env::remove_var(ALLOW_LEGACY_ENV);
+        assert!(has_vectors_table(&path), "the override adopts it in place");
+        drop(store);
+    }
+
+    #[test]
+    fn fresh_and_v0_2_checkpoints_are_not_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.sqlite");
+        assert!(
+            !is_legacy_checkpoint(&fresh),
+            "a missing file is not legacy"
+        );
+        let store = CheckpointStore::open(&fresh, "space").unwrap();
+        store.save("a", snapshot(), &HashMap::new()).unwrap();
+        assert!(!is_legacy_checkpoint(&fresh), "a v0.2 file is not legacy");
     }
 
     #[test]

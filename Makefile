@@ -125,12 +125,14 @@ recover-list: ## mo-recover list — show recoverable files from last 24h
 CN_BIND       ?= 127.0.0.1:28080
 CN_SUBSTRATE  ?= http://$(CN_BIND)
 CN_WAL        ?= $(HOME)/.contextnest/wal.jsonl
+CN_CHECKPOINT ?= $(CN_WAL:.jsonl=.canonical.sqlite)
 CN_BIN        ?= ./target/release/contextnest
 SINCE         ?= 7d
 PROJECT       ?=
 
 .PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev cn-run-existing \
-        cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config
+        cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config \
+        cn-preflight
 
 cn-help:
 	@echo "ContextNest substrate targets"
@@ -140,6 +142,7 @@ cn-help:
 	@echo "  make cn-build-fast      — cargo build --profile fast (faster compile, ~ same runtime)"
 	@echo "  make cn-test            — cargo test --tests (full integration suite)"
 	@echo "  make cn-lint            — cargo clippy --tests (correctness gate)"
+	@echo "  make cn-preflight       — print resolved WAL/checkpoint + refuse a pre-v0.2 checkpoint"
 	@echo "  make cn-serve           — run the release binary, WAL on, config.toml loaded"
 	@echo "  make cn-redeploy        — rebuild release + restart cn-serve (deploys a code change)"
 	@echo "  make cn-serve-dev       — cargo run --profile fast (auto-rebuilds, target/fast/)"
@@ -154,6 +157,7 @@ cn-help:
 	@echo "  CN_BIND=$(CN_BIND)"
 	@echo "  CN_SUBSTRATE=$(CN_SUBSTRATE)"
 	@echo "  CN_WAL=$(CN_WAL)"
+	@echo "  CN_CHECKPOINT=$(CN_CHECKPOINT)"
 	@echo "  CN_BIN=$(CN_BIN)"
 	@echo "  SINCE=$(SINCE)   PROJECT=$(PROJECT)"
 	@echo
@@ -184,7 +188,37 @@ cn-lint:
 cn-run-existing:
 	CONTEXTNEST_WAL_PATH=$(CN_WAL) $(CN_BIN) serve --bind $(CN_BIND)
 
-cn-serve: cn-build
+# Print the resolved substrate paths and refuse a pre-v0.2 checkpoint BEFORE
+# the build. The binary refuses one too (`CheckpointStore::open`), but by then
+# you have waited for a release build to learn it. A pre-v0.2 checkpoint stores
+# vectors as inline JSON (~11 KB per 1024-d vector) and boots the old 12 GB
+# heap profile — the shape that exhausted the host's compressor on 2026-09-30.
+cn-preflight:
+	@echo "substrate:  $(CN_SUBSTRATE)"
+	@echo "WAL:        $(CN_WAL)"
+	@echo "checkpoint: $(CN_CHECKPOINT)"
+	@for f in $(CN_WAL) $(CN_CHECKPOINT); do \
+	  if [ -f "$$f" ]; then \
+	    printf '  %8s  %s\n' "$$(du -h "$$f" | cut -f1)" "$$f"; \
+	  else \
+	    printf '  %8s  %s\n' "(absent)" "$$f"; \
+	  fi; \
+	done
+	@if [ -f "$(CN_CHECKPOINT)" ] && command -v sqlite3 >/dev/null 2>&1; then \
+	  legacy="$$(sqlite3 "$(CN_CHECKPOINT)" "SELECT CASE WHEN EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='objects') AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors') THEN 1 ELSE 0 END" 2>/dev/null)"; \
+	  if [ "$$legacy" = "1" ]; then \
+	    echo; \
+	    echo "REFUSING: $(CN_CHECKPOINT) is a pre-v0.2 checkpoint (inline JSON vectors)."; \
+	    echo "  Compact it into a new file first — the source is opened read-only:"; \
+	    echo "    $(CN_BIN) checkpoint compact --from $(CN_CHECKPOINT) --into $(CN_CHECKPOINT).compacted.sqlite"; \
+	    echo "  Move the compacted file into place and keep the original as a .bak breadcrumb."; \
+	    echo "  Or set CN_WAL to a v0.2 data dir, e.g. CN_WAL=/path/to/v0.2/wal.jsonl."; \
+	    echo "  See docs/upgrading/v0.2.0.md. (Override: CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT=1.)"; \
+	    exit 1; \
+	  fi; \
+	fi
+
+cn-serve: cn-preflight cn-build
 	@if [ ! -f config.toml ]; then \
 	  echo "no config.toml — copying from example"; $(MAKE) cn-config; \
 	fi
@@ -223,7 +257,7 @@ CN_BIN_FAST   ?= ./target/fast/contextnest
 cn-build-fast: ## Build the fast-profile binary (cargo build --profile fast)
 	cargo build --profile fast
 
-cn-serve-dev: ## Run the fast-profile binary, WAL on. Auto-rebuilds on each invocation.
+cn-serve-dev: cn-preflight ## Run the fast-profile binary, WAL on. Auto-rebuilds on each invocation.
 	@if [ ! -f config.toml ]; then $(MAKE) cn-config; fi
 	@mkdir -p $(dir $(CN_WAL))
 	cargo run --profile fast --bin contextnest -- serve --bind $(CN_BIND)

@@ -13,8 +13,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recommended runtime settings, verification, rollback and troubleshooting,
   with timings measured on a 329 k-fragment substrate.
   ([docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md))
+- **Resident-memory ceiling** (`CONTEXTNEST_MAX_RSS_MB`, default half of
+  physical memory): the server warns at 80 % and exits with code 70 at 100 %
+  instead of growing until the host's compressor runs out of swap. Sampled
+  every 5 s by a plain thread that takes no manager lock and needs no async
+  runtime; `0` disables it. `make cn-serve` logs the armed ceiling at boot.
+- **`make cn-preflight`** (run by `cn-serve` and `cn-serve-dev`): prints the
+  resolved WAL/checkpoint paths with their sizes and refuses to start against
+  a pre-v0.2 checkpoint *before* the build, so the failure arrives in
+  milliseconds rather than after a release build.
 
 ### Fixed
+
+- **Refuse to boot a whole-file pre-v0.2 checkpoint.** `CheckpointStore::open`
+  ran its `CREATE TABLE IF NOT EXISTS` schema unconditionally, so pointing a
+  v0.2 binary at an old checkpoint wrote a `vectors` table into what is, at
+  that moment, the operator's only pre-upgrade copy — and loaded ~11 KB of
+  inline JSON per vector into memory, the heap profile that took a process to
+  20.15 GB RSS on a 36 GB host. The guard is table-level (`objects` present,
+  `vectors` absent), so v0.2 files holding legacy inline rows still load as
+  before; `CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT=1` adopts an old file in place.
+- **`/api/v1/metrics` memory readout** no longer returns a null stub: it
+  reports real process RSS via the same platform sampler as the ceiling.
 
 - **`contextnest checkpoint compact` throughput.** It inserted rows in the
   source's insertion order into a fresh `(kind, id)` B-tree with SQLite's

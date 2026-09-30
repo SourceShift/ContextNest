@@ -386,12 +386,11 @@ pub async fn metrics_middleware(
 }
 
 /// Get current process resident memory usage in bytes.
-/// Not implemented in v0.1.0 — system-metrics readout is a v0.2 deliverable.
-/// Returning `None` is the honest result; downstream metric formatters skip
-/// the field when `None`. Wire via the `sysinfo` or `procfs` crate when
-/// metrics-driven autoscaling lands.
+/// Backed by the same platform sampler as the boot-time memory guard
+/// (`services::resource_monitor`); `None` when the platform query fails, in
+/// which case downstream metric formatters skip the field.
 fn get_memory_usage() -> Option<usize> {
-    None
+    crate::services::resource_monitor::resident_bytes()
 }
 
 /// Get current process CPU usage as a fraction of one core.

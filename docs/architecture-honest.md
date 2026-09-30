@@ -120,6 +120,8 @@ All optional, env-overridable, sensible defaults:
 
 | Env var | Default | Phase | Purpose |
 |---|---|---|---|
+| `CONTEXTNEST_MAX_RSS_MB` | half of physical | boot | Resident-memory ceiling. Warns at 80 %, exits with code 70 at 100 % (`EXIT_RSS_CEILING`) rather than letting the host's compressor run out of swap. `0` disables. Sampled every 5 s by a plain thread — no manager lock, no async runtime |
+| `CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT` | unset | boot | `1` lets `CheckpointStore::open` adopt a whole-file pre-v0.2 checkpoint in place. Refused by default: `open` runs its schema unconditionally, so adopting would add a `vectors` table to the operator's only pre-upgrade copy and load ~11 KB of inline JSON per vector |
 | `CONTEXTNEST_DECAY_HALF_LIFE_DAYS` | 60 | 2 | Half-life for the age-based decay multiplier |
 | `CONTEXTNEST_CONSOLIDATION_INTERVAL_MS` | 500 | 1 | Post-batch minimum delay and rate-limit backoff base; empty queues reconcile every at least 5 seconds |
 | `CONTEXTNEST_CONSOLIDATION_CONCURRENCY` | 4 | 1 | In-flight embedder calls |
