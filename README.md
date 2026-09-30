@@ -262,6 +262,7 @@ return at least one hit from outside `src/memory/attractors/`.
 - [docs/architecture.md](docs/architecture.md) — substrate internals, mermaid + sequence diagrams per tool, concurrency contract
 - [docs/architecture-honest.md](docs/architecture-honest.md) — what actually happens at runtime, per-fragment lifecycle through the attractor pipeline, all env knobs, grep-verifiable claims
 - [docs/roadmap/epics/neural-field-real.md](docs/roadmap/epics/neural-field-real.md) — 7-phase epic that brought the substrate's runtime behavior into agreement with its tagline (now complete)
+- [docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md) — upgrading an existing v0.1.x substrate to v0.2 (backup, compaction, rollback)
 - [docs/usage.md](docs/usage.md) — copy-paste curl examples for every tool, integration recipes (Python, bash, Claude Code hooks), troubleshooting
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to add a tool, CI gates, canonical pipeline
 - [SECURITY.md](SECURITY.md) — vulnerability reporting
