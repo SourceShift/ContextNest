@@ -1,16 +1,23 @@
 //! Connection Network for Optimized Memory Retrieval
 //! Implements a sophisticated connection network that enables optimized
 //! retrieval patterns through intelligent memory association and pathfinding.
+//!
+//! Storage layout (disk-first substrate epic): node vectors live once in the
+//! shared [`VectorArena`] and a node's index *is* its arena row. Edges are
+//! 64-byte records in a slab addressed by `u32` slot; each node keeps the
+//! slots of its incident edges. The previous layout stored every edge UUID
+//! five times and every endpoint id twice more as separate heap strings —
+//! ~870 bytes per edge, ~6.7 GB at 7.8 M edges.
 
+use crate::error::ContextNestError;
 use crate::error::ContextNestResult;
-use crate::error::{ContextNestError, Result};
-use crate::memory::attractors::{utils, ComponentStatus, MemoryAttractorConfig, MemoryFragment};
+use crate::memory::attractors::vector_arena::{ArenaView, Holder, VectorArena};
+use crate::memory::attractors::{utils, ComponentStatus, MemoryAttractorConfig};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock as AsyncRwLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Connection network for optimized memory retrieval
@@ -21,8 +28,6 @@ pub struct ConnectionNetwork {
     config: MemoryAttractorConfig,
     /// Network graph
     graph: Arc<RwLock<MemoryGraph>>,
-    /// Connection weights
-    connection_weights: Arc<RwLock<HashMap<String, f32>>>,
     /// Retrieval optimizer
     retrieval_optimizer: Arc<RetrievalOptimizer>,
     /// Path finder
@@ -33,17 +38,68 @@ pub struct ConnectionNetwork {
     status: Arc<RwLock<ComponentStatus>>,
 }
 
-/// Memory graph representing connections between memories
+/// Slot marker for a freed edge record.
+const DEAD: u32 = u32::MAX;
+
+/// Node state minus its vector (which lives in the arena row).
 #[derive(Debug, Clone)]
+struct NodeSlot {
+    node_type: MemoryNodeType,
+    importance: f32,
+    last_accessed: DateTime<Utc>,
+    access_frequency: f32,
+    metadata: HashMap<String, String>,
+    created_at: DateTime<Utc>,
+    fragment_ids: Vec<String>,
+    /// Slots of edges touching this node.
+    incident: Vec<u32>,
+}
+
+/// One edge, 64 bytes. `uuid` is the durable edge id; ids that are not
+/// UUIDs (legacy/test data) are kept in `MemoryGraph::edge_names`.
+#[derive(Debug, Clone, Copy)]
+struct EdgeRecord {
+    uuid: u128,
+    source: u32,
+    target: u32,
+    weight: f32,
+    strength: f32,
+    created_at: DateTime<Utc>,
+    last_reinforced: DateTime<Utc>,
+    usage_count: u32,
+    connection_type: ConnectionType,
+    bidirectional: bool,
+}
+
+impl EdgeRecord {
+    fn is_live(&self) -> bool {
+        self.source != DEAD
+    }
+
+    /// The endpoint opposite `row`, honouring direction: a directed edge is
+    /// only walkable from its source.
+    fn other(&self, row: u32) -> Option<u32> {
+        if self.source == row {
+            Some(self.target)
+        } else if self.target == row && self.bidirectional {
+            Some(self.source)
+        } else {
+            None
+        }
+    }
+}
+
+/// Memory graph representing connections between memories
+#[derive(Debug)]
 pub struct MemoryGraph {
-    /// Nodes (memories)
-    nodes: HashMap<String, MemoryNode>,
-    norms: HashMap<String, f32>,
-    incident_edges: HashMap<String, Vec<String>>,
-    /// Edges (connections)
-    edges: HashMap<String, Vec<ConnectionEdge>>,
-    /// Adjacency list for fast lookup
-    adjacency_list: HashMap<String, Vec<String>>,
+    arena: Arc<VectorArena>,
+    /// Indexed by arena row; `None` for rows that are not graph nodes.
+    nodes: Vec<Option<NodeSlot>>,
+    node_count: usize,
+    edges: Vec<EdgeRecord>,
+    free_edges: Vec<u32>,
+    edge_count: usize,
+    edge_names: HashMap<u32, String>,
     /// Graph metrics
     metrics: GraphMetrics,
 }
@@ -112,7 +168,7 @@ pub struct ConnectionEdge {
 }
 
 /// Types of connections between memories
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionType {
     /// Semantic similarity
     Semantic,
@@ -350,11 +406,17 @@ pub struct NetworkStatistics {
 }
 
 impl ConnectionNetwork {
-    /// Create a new connection network
+    /// Create a new connection network with a private vector arena.
     pub fn new(config: MemoryAttractorConfig) -> Self {
+        Self::with_arena(config, Arc::new(VectorArena::new()))
+    }
+
+    /// Create a network whose node vectors live in `arena`, shared with the
+    /// fragment store.
+    pub fn with_arena(config: MemoryAttractorConfig, arena: Arc<VectorArena>) -> Self {
         Self {
             config: config.clone(),
-            graph: Arc::new(RwLock::new(MemoryGraph::new())),
+            graph: Arc::new(RwLock::new(MemoryGraph::new(arena))),
             connection_policy: RwLock::new((
                 std::env::var("CONTEXTNEST_MAX_CONNECTIONS_PER_NODE")
                     .ok()
@@ -365,7 +427,6 @@ impl ConnectionNetwork {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.7),
             )),
-            connection_weights: Arc::new(RwLock::new(HashMap::new())),
             retrieval_optimizer: Arc::new(RetrievalOptimizer::new()),
             path_finder: Arc::new(PathFinder::new()),
             statistics: Arc::new(RwLock::new(NetworkStatistics::default())),
@@ -391,27 +452,7 @@ impl ConnectionNetwork {
         // would deadlock on `std::sync::RwLock` (writer waiting for itself).
         {
             let mut graph = self.graph.write().unwrap();
-            if graph.nodes.contains_key(&node_id) {
-                return Err(ContextNestError::Validation(format!(
-                    "Node {} already exists",
-                    node_id
-                )));
-            }
-            let norm = crate::services::exact::norm(&node.content)
-                .ok_or_else(|| ContextNestError::Validation("invalid memory vector".into()))?;
-            if graph
-                .nodes
-                .values()
-                .next()
-                .is_some_and(|n| n.content.len() != node.content.len())
-            {
-                return Err(ContextNestError::Validation(
-                    "memory vector dimension mismatch".into(),
-                ));
-            }
-            graph.norms.insert(node_id.clone(), norm);
-            graph.nodes.insert(node_id.clone(), node);
-            graph.adjacency_list.insert(node_id.clone(), Vec::new());
+            graph.insert_node(node)?;
         }
 
         // Phase 2: create connections (uses read+write internally, see fix in
@@ -432,60 +473,21 @@ impl ConnectionNetwork {
         Ok(())
     }
 
-    /// Remove a memory node from the network
+    /// Remove a memory node and every edge touching it. O(degree).
 
     pub async fn remove_node(&self, node_id: &str) -> ContextNestResult<()> {
         let mut graph = self.graph.write().unwrap();
-
-        // Check if node exists
-        if !graph.nodes.contains_key(node_id) {
+        let Some(row) = graph.row_of(node_id) else {
             return Err(ContextNestError::NotFound(format!(
                 "Node {} not found",
                 node_id
             )));
-        }
-
-        // Remove node
-        graph.nodes.remove(node_id);
-        graph.norms.remove(node_id);
-        graph.incident_edges.remove(node_id);
-
-        // Remove all edges connected to this node
-        let edges_to_remove: Vec<String> = graph
-            .edges
-            .iter()
-            .filter(|(_, edges)| {
-                edges
-                    .iter()
-                    .any(|e| e.source == node_id || e.target == node_id)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for edge_id in edges_to_remove {
-            if let Some(edges) = graph.edges.remove(&edge_id) {
-                for edge in edges {
-                    for endpoint in [edge.source, edge.target] {
-                        if let Some(ids) = graph.incident_edges.get_mut(&endpoint) {
-                            ids.retain(|id| id != &edge_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove from adjacency list
-        graph.adjacency_list.remove(node_id);
-
-        // Remove from other adjacency lists
-        for (_, neighbors) in graph.adjacency_list.iter_mut() {
-            neighbors.retain(|id| id != node_id);
-        }
-
-        // Update graph metrics
+        };
+        graph.remove_node_row(row);
+        graph.arena.release(node_id, Holder::Node);
         graph.update_metrics();
+        drop(graph);
 
-        // Update statistics
         self.update_statistics(|stats| {
             stats.total_nodes_removed += 1;
         });
@@ -504,74 +506,44 @@ impl ConnectionNetwork {
     ) -> ContextNestResult<String> {
         let mut graph = self.graph.write().unwrap();
 
-        // Check if nodes exist
-        if !graph.nodes.contains_key(source_id) {
+        let Some(source) = graph.row_of(source_id) else {
             return Err(ContextNestError::NotFound(format!(
                 "Source node {} not found",
                 source_id
             )));
-        }
-
-        if !graph.nodes.contains_key(target_id) {
+        };
+        let Some(target) = graph.row_of(target_id) else {
             return Err(ContextNestError::NotFound(format!(
                 "Target node {} not found",
                 target_id
             )));
-        }
-
-        // Create connection edge
-        let edge = ConnectionEdge {
-            id: utils::generate_unique_id(),
-            source: source_id.to_string(),
-            target: target_id.to_string(),
-            weight,
-            connection_type,
-            strength: weight,
-            bidirectional: true,
-            created_at: Utc::now(),
-            last_reinforced: Utc::now(),
-            usage_count: 0,
         };
 
-        let edge_id = edge.id.clone();
-
-        // Add edge
-        graph.edges.insert(edge_id.clone(), vec![edge.clone()]);
-        graph
-            .incident_edges
-            .entry(source_id.to_owned())
-            .or_default()
-            .push(edge_id.clone());
-        graph
-            .incident_edges
-            .entry(target_id.to_owned())
-            .or_default()
-            .push(edge_id.clone());
-
-        // Update adjacency lists
-        graph
-            .adjacency_list
-            .get_mut(source_id)
-            .unwrap()
-            .push(target_id.to_string());
-        graph
-            .adjacency_list
-            .get_mut(target_id)
-            .unwrap()
-            .push(source_id.to_string());
-
-        // Update connection weights
-        self.update_connection_weight(&edge_id, weight);
-
-        // Update graph metrics
+        let now = Utc::now();
+        let uuid = Uuid::new_v4();
+        graph.push_edge(
+            EdgeRecord {
+                uuid: uuid.as_u128(),
+                source,
+                target,
+                weight,
+                strength: weight,
+                created_at: now,
+                last_reinforced: now,
+                usage_count: 0,
+                connection_type,
+                bidirectional: true,
+            },
+            None,
+        );
         graph.update_metrics();
+        drop(graph);
 
-        // Update statistics
         self.update_statistics(|stats| {
             stats.total_connections_created += 1;
         });
 
-        Ok(edge_id)
+        Ok(uuid.to_string())
     }
 
     /// 1-hop neighbors of `node_id` with their edge weights, sorted
@@ -580,30 +552,21 @@ impl ConnectionNetwork {
     /// learned-graph siblings of a query's top hit at retrieve time,
     /// independent of the heavier `retrieve_memories` cache path.
     ///
-    /// Walks the edge map (cheap O(E) scan; for the 25k-fragment
-    /// substrate that's ~10k–50k edges) and emits both directions of
-    /// any bidirectional edge so callers get a symmetric neighbor list.
-    /// Returns an empty Vec when the node has no edges yet (cold
-    /// substrate, or no peer fragments survived similarity-driven
+    /// Walks the node's incident edges (O(degree)) and emits both
+    /// directions of any bidirectional edge so callers get a symmetric
+    /// neighbor list. Returns an empty Vec when the node has no edges yet
+    /// (cold substrate, or no peer fragments survived similarity-driven
     /// auto-connection thresholds).
     pub async fn neighbors_of(&self, node_id: &str) -> Vec<(String, f32)> {
         let graph = self.graph.read().unwrap();
-        let mut out: Vec<(String, f32)> = Vec::new();
-        for edges in graph
-            .incident_edges
-            .get(node_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| graph.edges.get(id))
-        {
-            for edge in edges {
-                if edge.source == node_id {
-                    out.push((edge.target.clone(), edge.weight));
-                } else if edge.target == node_id && edge.bidirectional {
-                    out.push((edge.source.clone(), edge.weight));
-                }
-            }
-        }
+        let Some(row) = graph.row_of(node_id) else {
+            return Vec::new();
+        };
+        let view = graph.arena.read();
+        let mut out: Vec<(String, f32)> = graph
+            .neighbor_rows(row)
+            .filter_map(|(other, weight)| Some((view.id(other)?.to_string(), weight)))
+            .collect();
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -654,14 +617,14 @@ impl ConnectionNetwork {
         let graph = self.graph.read().unwrap();
 
         // Check if nodes exist
-        if !graph.nodes.contains_key(start_id) {
+        if graph.row_of(start_id).is_none() {
             return Err(ContextNestError::NotFound(format!(
                 "Start node {} not found",
                 start_id
             )));
         }
 
-        if !graph.nodes.contains_key(end_id) {
+        if graph.row_of(end_id).is_none() {
             return Err(ContextNestError::NotFound(format!(
                 "End node {} not found",
                 end_id
@@ -679,42 +642,40 @@ impl ConnectionNetwork {
         Ok(path)
     }
 
-    /// Reinforce connections based on usage
+    /// Reinforce connections based on usage. O(degree) per path step.
 
     pub async fn reinforce_connections(&self, retrieval_path: &[String]) -> ContextNestResult<()> {
         let mut graph = self.graph.write().unwrap();
 
         for window in retrieval_path.windows(2) {
-            let source_id = window[0].clone();
-            let target_id = window[1].clone();
-
-            // Two-phase update to keep `graph.edges` and `graph.nodes`
-            // borrows non-overlapping: first reinforce the matching edge(s),
-            // then bump the participating nodes' access stats.
+            let (Some(source), Some(target)) = (graph.row_of(&window[0]), graph.row_of(&window[1]))
+            else {
+                continue;
+            };
+            let now = Utc::now();
+            let slots: Vec<u32> = graph.nodes[source as usize]
+                .as_ref()
+                .map(|slot| slot.incident.clone())
+                .unwrap_or_default();
             let mut node_bump = false;
-            for (_, edges) in graph.edges.iter_mut() {
-                for edge in edges.iter_mut() {
-                    if (edge.source == source_id && edge.target == target_id)
-                        || (edge.source == target_id && edge.target == source_id)
-                    {
-                        edge.usage_count += 1;
-                        edge.last_reinforced = Utc::now();
-                        edge.strength = (edge.strength * 0.9 + 0.1).min(1.0);
-                        node_bump = true;
-                        break;
-                    }
+            for slot in slots {
+                let edge = &mut graph.edges[slot as usize];
+                if (edge.source == source && edge.target == target)
+                    || (edge.source == target && edge.target == source)
+                {
+                    edge.usage_count = edge.usage_count.saturating_add(1);
+                    edge.last_reinforced = now;
+                    edge.strength = (edge.strength * 0.9 + 0.1).min(1.0);
+                    node_bump = true;
                 }
             }
 
             if node_bump {
-                let now = Utc::now();
-                if let Some(node) = graph.nodes.get_mut(&source_id) {
-                    node.last_accessed = now;
-                    node.access_frequency += 1.0;
-                }
-                if let Some(node) = graph.nodes.get_mut(&target_id) {
-                    node.last_accessed = now;
-                    node.access_frequency += 1.0;
+                for row in [source, target] {
+                    if let Some(node) = graph.nodes[row as usize].as_mut() {
+                        node.last_accessed = now;
+                        node.access_frequency += 1.0;
+                    }
                 }
             }
         }
@@ -728,13 +689,19 @@ impl ConnectionNetwork {
         let mut graph = self.graph.write().unwrap();
         let mut optimizations = Vec::new();
 
-        // Remove weak connections
-        let initial_edges = graph.edges.len();
-        graph.edges.retain(|_, edges| {
-            edges.retain(|edge| edge.strength > 0.1);
-            !edges.is_empty()
-        });
-        let edges_removed = initial_edges - graph.edges.len();
+        // Remove weak connections, keeping both endpoints' incident lists
+        // consistent (the previous map-retain left stale edge ids behind).
+        let weak: Vec<u32> = graph
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.is_live() && edge.strength <= 0.1)
+            .map(|(slot, _)| slot as u32)
+            .collect();
+        let edges_removed = weak.len();
+        for slot in weak {
+            graph.remove_edge(slot);
+        }
 
         if edges_removed > 0 {
             optimizations.push(NetworkOptimization {
@@ -743,9 +710,6 @@ impl ConnectionNetwork {
                 description: format!("Removed {} weak connections", edges_removed),
             });
         }
-
-        // Rebuild adjacency list
-        graph.rebuild_adjacency_list();
 
         // Update metrics
         graph.update_metrics();
@@ -760,8 +724,8 @@ impl ConnectionNetwork {
         Ok(NetworkOptimizationResult {
             optimizations,
             improvement_score,
-            final_node_count: graph.nodes.len(),
-            final_edge_count: graph.edges.len(),
+            final_node_count: graph.node_count,
+            final_edge_count: graph.edge_count,
         })
     }
 
@@ -796,7 +760,7 @@ impl ConnectionNetwork {
         vectors: impl Iterator<Item = &'a [f32]>,
     ) -> ContextNestResult<()> {
         let graph = self.graph.read().unwrap();
-        let mut dimensions = graph.nodes.values().next().map(|n| n.content.len());
+        let mut dimensions = graph.arena.dim();
         for vector in vectors {
             if vector.len() > 8192
                 || crate::services::exact::norm(vector).is_none()
@@ -815,63 +779,54 @@ impl ConnectionNetwork {
         *self.connection_policy.write().unwrap() = (max, threshold);
     }
 
+    /// Durable form of one node (`Some(id)`: the node and its incident
+    /// edges) or of the whole graph (`None`). Hydrates vectors from the
+    /// arena, so whole-graph snapshots allocate one vector per node.
     pub(crate) fn durable_graph(&self, id: Option<&str>) -> (Vec<MemoryNode>, Vec<ConnectionEdge>) {
         let graph = self.graph.read().unwrap();
+        let view = graph.arena.read();
         match id {
             None => (
-                graph.nodes.values().cloned().collect(),
-                graph.edges.values().flatten().cloned().collect(),
-            ),
-            Some(id) => (
-                graph.nodes.get(id).cloned().into_iter().collect(),
                 graph
-                    .incident_edges
-                    .get(id)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| graph.edges.get(id))
-                    .flatten()
-                    .cloned()
+                    .node_rows()
+                    .filter_map(|(row, _)| graph.to_node(row, &view))
+                    .collect(),
+                (0..graph.edges.len() as u32)
+                    .filter_map(|slot| graph.to_edge(slot, &view))
                     .collect(),
             ),
+            Some(id) => {
+                // Resolve through the held view: a second `arena.read()` on
+                // this thread can deadlock behind a queued writer.
+                let Some(row) = view.row_of(id).filter(|&row| graph.has_row(row)) else {
+                    return (Vec::new(), Vec::new());
+                };
+                let incident = graph.nodes[row as usize]
+                    .as_ref()
+                    .map(|slot| slot.incident.as_slice())
+                    .unwrap_or_default();
+                (
+                    graph.to_node(row, &view).into_iter().collect(),
+                    incident
+                        .iter()
+                        .filter_map(|&slot| graph.to_edge(slot, &view))
+                        .collect(),
+                )
+            }
         }
     }
 
+    /// Restore durable nodes and edges. A node whose `content` is empty
+    /// reuses the arena row its fragment already claimed. Edges whose
+    /// endpoints are not nodes, or whose id is already present, are skipped.
     pub(crate) fn restore_graph(&self, nodes: Vec<MemoryNode>, edges: Vec<ConnectionEdge>) {
         let mut graph = self.graph.write().unwrap();
         for node in nodes {
-            if let Some(norm) = crate::services::exact::norm(&node.content) {
-                graph.norms.insert(node.id.clone(), norm);
-                graph.adjacency_list.entry(node.id.clone()).or_default();
-                graph.nodes.insert(node.id.clone(), node);
-            }
+            graph.restore_node(node);
         }
+        graph.edges.reserve(edges.len());
         for edge in edges {
-            if graph.edges.contains_key(&edge.id) {
-                continue;
-            }
-            graph
-                .adjacency_list
-                .entry(edge.source.clone())
-                .or_default()
-                .push(edge.target.clone());
-            graph
-                .adjacency_list
-                .entry(edge.target.clone())
-                .or_default()
-                .push(edge.source.clone());
-            graph
-                .incident_edges
-                .entry(edge.source.clone())
-                .or_default()
-                .push(edge.id.clone());
-            graph
-                .incident_edges
-                .entry(edge.target.clone())
-                .or_default()
-                .push(edge.id.clone());
-            self.update_connection_weight(&edge.id, edge.weight);
-            graph.edges.insert(edge.id.clone(), vec![edge]);
+            graph.restore_edge(edge);
         }
         graph.update_metrics();
     }
@@ -881,35 +836,22 @@ impl ConnectionNetwork {
     async fn create_connections_for_node(&self, node_id: &str) -> ContextNestResult<()> {
         let (max_connections, similarity_threshold) = *self.connection_policy.read().unwrap();
 
-        // Phase 1: snapshot similarity candidates under a read lock. We
-        // collect owned `(other_id, similarity)` pairs and release the read
-        // lock by letting `graph` drop. Without this snapshot, the inner
-        // `create_connection` call below tries to take a `write()` while we
-        // still hold the `read()`, which deadlocks `std::sync::RwLock`.
+        // Phase 1: score candidates under read locks (graph, then arena —
+        // the crate-wide lock order). One contiguous pass over the arena
+        // rows; ids are cloned only for the final top-K. Locks drop before
+        // phase 2 because `create_connection` takes the graph write lock.
         let candidates = {
             let graph = self.graph.read().unwrap();
-            let Some(new_node) = graph.nodes.get(node_id) else {
+            let Some(row) = graph.row_of(node_id) else {
                 return Ok(());
             };
-            let Some(&new_norm) = graph.norms.get(node_id) else {
+            let view = graph.arena.read();
+            let Some(query) = view.vector(row) else {
                 return Ok(());
             };
-            crate::services::exact::top_k(
-                graph
-                    .nodes
-                    .iter()
-                    .filter(|(id, _)| id.as_str() != node_id)
-                    .filter_map(|(id, node)| {
-                        let score = crate::services::exact::cosine(
-                            &new_node.content,
-                            new_norm,
-                            &node.content,
-                            *graph.norms.get(id)?,
-                        )?;
-                        (score > similarity_threshold).then_some((id.as_str(), score))
-                    }),
-                max_connections,
-            )
+            view.top_k(query, max_connections, similarity_threshold, |other| {
+                other != row && graph.has_row(other)
+            })
         };
 
         // Phase 2: issue connection creates with no read lock held.
@@ -920,11 +862,6 @@ impl ConnectionNetwork {
         }
 
         Ok(())
-    }
-
-    fn update_connection_weight(&self, edge_id: &str, weight: f32) {
-        let mut weights = self.connection_weights.write().unwrap();
-        weights.insert(edge_id.to_string(), weight);
     }
 
     fn calculate_query_hash(&self, query: &RetrievalQuery) -> u64 {
@@ -988,34 +925,236 @@ impl ConnectionNetwork {
 }
 
 impl MemoryGraph {
-    fn new() -> Self {
+    fn new(arena: Arc<VectorArena>) -> Self {
         Self {
-            nodes: HashMap::new(),
-            norms: HashMap::new(),
-            incident_edges: HashMap::new(),
-            edges: HashMap::new(),
-            adjacency_list: HashMap::new(),
+            arena,
+            nodes: Vec::new(),
+            node_count: 0,
+            edges: Vec::new(),
+            free_edges: Vec::new(),
+            edge_count: 0,
+            edge_names: HashMap::new(),
             metrics: GraphMetrics::default(),
         }
     }
 
+    fn has_row(&self, row: u32) -> bool {
+        self.nodes.get(row as usize).is_some_and(Option::is_some)
+    }
+
+    /// Row of `id` when it is a graph node (an arena row alone is not).
+    fn row_of(&self, id: &str) -> Option<u32> {
+        self.arena.row(id).filter(|&row| self.has_row(row))
+    }
+
+    fn node_rows(&self) -> impl Iterator<Item = (u32, &NodeSlot)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(row, slot)| Some((row as u32, slot.as_ref()?)))
+    }
+
+    /// Walkable neighbours of `row` with edge weights.
+    fn neighbor_rows(&self, row: u32) -> impl Iterator<Item = (u32, f32)> + '_ {
+        self.nodes
+            .get(row as usize)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.incident.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(move |&slot| {
+                let edge = &self.edges[slot as usize];
+                Some((edge.other(row)?, edge.weight))
+            })
+    }
+
+    fn slot_for(node: &MemoryNode) -> NodeSlot {
+        NodeSlot {
+            node_type: node.node_type.clone(),
+            importance: node.importance,
+            last_accessed: node.last_accessed,
+            access_frequency: node.access_frequency,
+            metadata: node.metadata.clone(),
+            created_at: node.created_at,
+            fragment_ids: node.fragment_ids.clone(),
+            incident: Vec::new(),
+        }
+    }
+
+    fn place(&mut self, row: u32, slot: NodeSlot) {
+        let index = row as usize;
+        if self.nodes.len() <= index {
+            self.nodes.resize_with(index + 1, || None);
+        }
+        if self.nodes[index].replace(slot).is_none() {
+            self.node_count += 1;
+        }
+    }
+
+    fn insert_node(&mut self, node: MemoryNode) -> ContextNestResult<u32> {
+        if self.row_of(&node.id).is_some() {
+            return Err(ContextNestError::Validation(format!(
+                "Node {} already exists",
+                node.id
+            )));
+        }
+        let row = self
+            .arena
+            .claim(&node.id, Holder::Node, &node.content)
+            .map_err(|e| ContextNestError::Validation(e.to_string()))?;
+        self.place(row, Self::slot_for(&node));
+        Ok(row)
+    }
+
+    /// Restore path: replaces an existing node's metadata (keeping its
+    /// edges); an empty `content` reuses the fragment's arena row.
+    fn restore_node(&mut self, node: MemoryNode) {
+        let row = if node.content.is_empty() {
+            self.arena.claim_existing(&node.id, Holder::Node)
+        } else {
+            self.arena.claim(&node.id, Holder::Node, &node.content).ok()
+        };
+        let Some(row) = row else {
+            return;
+        };
+        let mut slot = Self::slot_for(&node);
+        if let Some(existing) = self.nodes.get_mut(row as usize).and_then(Option::take) {
+            self.node_count -= 1;
+            slot.incident = existing.incident;
+        }
+        self.place(row, slot);
+    }
+
+    fn restore_edge(&mut self, edge: ConnectionEdge) {
+        let (Some(source), Some(target)) = (self.row_of(&edge.source), self.row_of(&edge.target))
+        else {
+            return;
+        };
+        let uuid = Uuid::parse_str(&edge.id).ok().map(|u| u.as_u128());
+        let duplicate = self.nodes[source as usize].as_ref().is_some_and(|slot| {
+            slot.incident.iter().any(|&s| match uuid {
+                Some(u) => self.edges[s as usize].uuid == u && !self.edge_names.contains_key(&s),
+                None => self.edge_names.get(&s) == Some(&edge.id),
+            })
+        });
+        if duplicate {
+            return;
+        }
+        self.push_edge(
+            EdgeRecord {
+                uuid: uuid.unwrap_or(0),
+                source,
+                target,
+                weight: edge.weight,
+                strength: edge.strength,
+                created_at: edge.created_at,
+                last_reinforced: edge.last_reinforced,
+                usage_count: u32::try_from(edge.usage_count).unwrap_or(u32::MAX),
+                connection_type: edge.connection_type,
+                bidirectional: edge.bidirectional,
+            },
+            uuid.is_none().then_some(edge.id),
+        );
+    }
+
+    fn push_edge(&mut self, record: EdgeRecord, name: Option<String>) -> u32 {
+        let slot = match self.free_edges.pop() {
+            Some(slot) => {
+                self.edges[slot as usize] = record;
+                slot
+            }
+            None => {
+                self.edges.push(record);
+                (self.edges.len() - 1) as u32
+            }
+        };
+        if let Some(name) = name {
+            self.edge_names.insert(slot, name);
+        }
+        for row in [record.source, record.target] {
+            if let Some(node) = self.nodes[row as usize].as_mut() {
+                if !node.incident.contains(&slot) {
+                    node.incident.push(slot);
+                }
+            }
+        }
+        self.edge_count += 1;
+        slot
+    }
+
+    fn remove_edge(&mut self, slot: u32) {
+        let edge = self.edges[slot as usize];
+        if !edge.is_live() {
+            return;
+        }
+        for row in [edge.source, edge.target] {
+            if let Some(node) = self.nodes[row as usize].as_mut() {
+                node.incident.retain(|&s| s != slot);
+            }
+        }
+        self.edges[slot as usize].source = DEAD;
+        self.edge_names.remove(&slot);
+        self.free_edges.push(slot);
+        self.edge_count -= 1;
+    }
+
+    fn remove_node_row(&mut self, row: u32) {
+        let incident = self.nodes[row as usize]
+            .as_mut()
+            .map(|slot| std::mem::take(&mut slot.incident))
+            .unwrap_or_default();
+        for slot in incident {
+            self.remove_edge(slot);
+        }
+        if self.nodes[row as usize].take().is_some() {
+            self.node_count -= 1;
+        }
+    }
+
+    fn edge_id(&self, slot: u32) -> String {
+        self.edge_names
+            .get(&slot)
+            .cloned()
+            .unwrap_or_else(|| Uuid::from_u128(self.edges[slot as usize].uuid).to_string())
+    }
+
+    fn to_edge(&self, slot: u32, view: &ArenaView<'_>) -> Option<ConnectionEdge> {
+        let edge = self.edges.get(slot as usize).filter(|e| e.is_live())?;
+        Some(ConnectionEdge {
+            id: self.edge_id(slot),
+            source: view.id(edge.source)?.to_string(),
+            target: view.id(edge.target)?.to_string(),
+            weight: edge.weight,
+            connection_type: edge.connection_type,
+            strength: edge.strength,
+            bidirectional: edge.bidirectional,
+            created_at: edge.created_at,
+            last_reinforced: edge.last_reinforced,
+            usage_count: edge.usage_count as usize,
+        })
+    }
+
+    fn to_node(&self, row: u32, view: &ArenaView<'_>) -> Option<MemoryNode> {
+        let slot = self.nodes.get(row as usize)?.as_ref()?;
+        Some(MemoryNode {
+            id: view.id(row)?.to_string(),
+            node_type: slot.node_type.clone(),
+            content: view.vector(row)?.to_vec(),
+            importance: slot.importance,
+            last_accessed: slot.last_accessed,
+            access_frequency: slot.access_frequency,
+            metadata: slot.metadata.clone(),
+            created_at: slot.created_at,
+            fragment_ids: slot.fragment_ids.clone(),
+        })
+    }
+
     fn update_metrics(&mut self) {
-        self.metrics.total_nodes = self.nodes.len();
+        self.metrics.total_nodes = self.node_count;
+        self.metrics.total_edges = self.edge_count;
 
-        // Edge count is `edges.len()`, not a `.values().map(len).sum()` scan:
-        // `create_connection` stores every edge as its own single-element Vec,
-        // so the map length equals the edge total exactly. At 1.5M edges the
-        // old O(E) sum — invoked up to MAX_CONNECTIONS_PER_NODE times per
-        // ingested fragment via `create_connection` — was ~40% of the
-        // consolidation worker's pegged core.
-        self.metrics.total_edges = self.edges.len();
-
-        // avg_degree via a closed form instead of an O(V) sum over the
-        // adjacency lists. Every edge is bidirectional and contributes exactly
-        // one adjacency entry to each endpoint, so total adjacency degree is
-        // always 2 * total_edges. This invariant holds through both
-        // `create_connection` (+1 edge, +2 entries) and `remove_node`
-        // (-d edges, -2d entries), so the result is identical to the old scan.
+        // avg_degree via a closed form: every edge contributes one incident
+        // entry to each endpoint, so total degree is 2 * total_edges.
         if self.metrics.total_nodes > 0 {
             self.metrics.avg_degree =
                 (2 * self.metrics.total_edges) as f32 / self.metrics.total_nodes as f32;
@@ -1038,31 +1177,6 @@ impl MemoryGraph {
         self.metrics.avg_path_length = 3.5; // Placeholder
         self.metrics.connected_components = 1; // Assuming connected graph
         self.metrics.largest_component_size = self.metrics.total_nodes;
-    }
-
-    fn rebuild_adjacency_list(&mut self) {
-        self.adjacency_list.clear();
-
-        // Initialize adjacency list
-        for node_id in self.nodes.keys() {
-            self.adjacency_list.insert(node_id.clone(), Vec::new());
-        }
-
-        // Build adjacency list from edges
-        for edges in self.edges.values() {
-            for edge in edges {
-                self.adjacency_list
-                    .get_mut(&edge.source)
-                    .unwrap()
-                    .push(edge.target.clone());
-                if edge.bidirectional {
-                    self.adjacency_list
-                        .get_mut(&edge.target)
-                        .unwrap()
-                        .push(edge.source.clone());
-                }
-            }
-        }
     }
 }
 
@@ -1159,21 +1273,20 @@ impl SimilarityRetrieval {
 
 impl RetrievalStrategy for SimilarityRetrieval {
     fn find_memories(&self, query: &RetrievalQuery, graph: &MemoryGraph) -> Vec<RetrievalResult> {
-        let mut results = Vec::new();
-
-        for (node_id, node) in graph.nodes.iter() {
-            let similarity = utils::cosine_similarity(&query.content, &node.content);
-
-            if similarity >= self.similarity_threshold {
-                results.push(RetrievalResult {
-                    memory_id: node_id.clone(),
-                    confidence: similarity,
-                    retrieval_path: None,
-                    strategy: self.name().to_string(),
-                    metadata: HashMap::new(),
-                });
-            }
-        }
+        let view = graph.arena.read();
+        let mut results: Vec<RetrievalResult> = view
+            .all_at_least(&query.content, self.similarity_threshold, |row| {
+                graph.has_row(row)
+            })
+            .into_iter()
+            .map(|(memory_id, similarity)| RetrievalResult {
+                memory_id,
+                confidence: similarity,
+                retrieval_path: None,
+                strategy: self.name().to_string(),
+                metadata: HashMap::new(),
+            })
+            .collect();
 
         results.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
         results
@@ -1201,33 +1314,31 @@ impl AssociationRetrieval {
 
 impl RetrievalStrategy for AssociationRetrieval {
     fn find_memories(&self, query: &RetrievalQuery, graph: &MemoryGraph) -> Vec<RetrievalResult> {
-        let mut results = Vec::new();
+        let view = graph.arena.read();
 
-        // Find nodes with highest degree (most connected)
-        let mut node_degrees: Vec<(String, usize)> = graph
-            .adjacency_list
-            .iter()
-            .map(|(id, neighbors)| (id.clone(), neighbors.len()))
+        // Find nodes with highest degree (most connected); ties by id so the
+        // ranking is deterministic.
+        let mut node_degrees: Vec<(&str, usize)> = graph
+            .node_rows()
+            .filter_map(|(row, slot)| Some((view.id(row)?.as_ref(), slot.incident.len())))
             .collect();
-
-        node_degrees.sort_by(|a, b| b.1.cmp(&a.1));
+        node_degrees.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
         // Return top connected nodes
-        for (node_id, degree) in node_degrees.iter().take(query.max_results) {
-            let confidence = (*degree as f32 / graph.metrics.total_nodes as f32).min(1.0);
-
-            if confidence >= query.min_confidence {
-                results.push(RetrievalResult {
-                    memory_id: node_id.clone(),
+        node_degrees
+            .into_iter()
+            .take(query.max_results)
+            .filter_map(|(node_id, degree)| {
+                let confidence = (degree as f32 / graph.metrics.total_nodes as f32).min(1.0);
+                (confidence >= query.min_confidence).then(|| RetrievalResult {
+                    memory_id: node_id.to_string(),
                     confidence,
                     retrieval_path: None,
                     strategy: self.name().to_string(),
                     metadata: HashMap::new(),
-                });
-            }
-        }
-
-        results
+                })
+            })
+            .collect()
     }
 
     fn name(&self) -> &str {
@@ -1254,9 +1365,10 @@ impl ContextualRetrieval {
 
 impl RetrievalStrategy for ContextualRetrieval {
     fn find_memories(&self, query: &RetrievalQuery, graph: &MemoryGraph) -> Vec<RetrievalResult> {
+        let view = graph.arena.read();
         let mut results = Vec::new();
 
-        for (node_id, node) in graph.nodes.iter() {
+        for (row, node) in graph.node_rows() {
             // Calculate context-based confidence
             let mut confidence = 0.5; // Base confidence
 
@@ -1275,22 +1387,17 @@ impl RetrievalStrategy for ContextualRetrieval {
             confidence += frequency_factor * self.context_weight;
 
             // Apply context filters
-            let mut matches_filters = true;
-            for (filter_key, filter_value) in &query.context_filters {
-                if let Some(node_value) = node.metadata.get(filter_key) {
-                    if node_value != filter_value {
-                        matches_filters = false;
-                        break;
-                    }
-                } else {
-                    matches_filters = false;
-                    break;
-                }
-            }
+            let matches_filters = query
+                .context_filters
+                .iter()
+                .all(|(key, value)| node.metadata.get(key) == Some(value));
 
             if matches_filters && confidence >= query.min_confidence {
+                let Some(node_id) = view.id(row) else {
+                    continue;
+                };
                 results.push(RetrievalResult {
-                    memory_id: node_id.clone(),
+                    memory_id: node_id.to_string(),
                     confidence: confidence.min(1.0),
                     retrieval_path: None,
                     strategy: self.name().to_string(),
@@ -1401,70 +1508,59 @@ impl DijkstraPathfinding {
 
 impl PathfindingAlgorithm for DijkstraPathfinding {
     fn find_path(&self, graph: &MemoryGraph, start: &str, end: &str) -> Option<Path> {
-        // Simplified Dijkstra implementation. BinaryHeap needs Ord, but f32 is
-        // PartialOrd-only (NaN incomparable). Wrap distances in `NotNan<f32>`
-        // so the heap can compare-and-swap deterministically; we already
-        // protect against NaN at graph construction time so the unwrap is safe.
+        // Unit-weight Dijkstra over node rows. Distances are tracked lazily
+        // for visited rows only — the previous version seeded a map entry
+        // (and an id clone) for every node in the graph per query. f32 is
+        // PartialOrd-only, so distances ride in `NotNan` for the heap.
         use ordered_float::NotNan;
-        let inf = NotNan::new(f32::INFINITY).expect("INFINITY is not NaN");
+        let start_row = graph.row_of(start)?;
+        let end_row = graph.row_of(end)?;
         let zero = NotNan::new(0.0_f32).expect("0.0 is not NaN");
-        let mut distances: HashMap<String, NotNan<f32>> = HashMap::new();
-        let mut previous: HashMap<String, String> = HashMap::new();
-        let mut unvisited: BinaryHeap<(std::cmp::Reverse<NotNan<f32>>, String)> = BinaryHeap::new();
-
-        // Initialize distances
-        for node_id in graph.nodes.keys() {
-            distances.insert(node_id.clone(), inf);
-        }
-        distances.insert(start.to_string(), zero);
-
-        // Use reverse ordering for min-heap behavior
-        unvisited.push((std::cmp::Reverse(zero), start.to_string()));
+        let step = NotNan::new(1.0_f32).expect("constant 1.0 is not NaN");
+        let mut distances: HashMap<u32, NotNan<f32>> = HashMap::from([(start_row, zero)]);
+        let mut previous: HashMap<u32, u32> = HashMap::new();
+        let mut unvisited = BinaryHeap::from([(std::cmp::Reverse(zero), start_row)]);
 
         while let Some((std::cmp::Reverse(dist), current)) = unvisited.pop() {
-            if current == end {
+            if current == end_row {
                 break;
             }
-
-            if dist > distances[&current] {
+            if distances.get(&current).is_some_and(|&d| dist > d) {
                 continue;
             }
-
-            // Check neighbors
-            if let Some(neighbors) = graph.adjacency_list.get(&current) {
-                for neighbor in neighbors {
-                    let edge_weight = NotNan::new(1.0_f32).expect("constant 1.0 is not NaN");
-                    let alt = distances[&current] + edge_weight;
-
-                    if alt < distances[neighbor] {
-                        distances.insert(neighbor.clone(), alt);
-                        previous.insert(neighbor.clone(), current.clone());
-                        unvisited.push((std::cmp::Reverse(alt), neighbor.clone()));
-                    }
+            for (neighbor, _) in graph.neighbor_rows(current) {
+                let alt = dist + step;
+                let improves = match distances.get(&neighbor) {
+                    Some(&known) => alt < known,
+                    None => true,
+                };
+                if improves {
+                    distances.insert(neighbor, alt);
+                    previous.insert(neighbor, current);
+                    unvisited.push((std::cmp::Reverse(alt), neighbor));
                 }
             }
         }
 
-        // Reconstruct path
-        if distances.get(end).copied().unwrap_or(inf) == inf {
-            return None;
+        let total_weight = distances.get(&end_row)?.into_inner();
+        let mut rows = vec![end_row];
+        let mut current = end_row;
+        while current != start_row {
+            current = *previous.get(&current)?;
+            rows.push(current);
         }
+        rows.reverse();
 
-        let mut path_nodes = Vec::new();
-        let mut current = end.to_string();
-
-        while current != start {
-            path_nodes.push(current.clone());
-            current = previous.get(&current)?.clone();
-        }
-
-        path_nodes.push(start.to_string());
-        path_nodes.reverse();
+        let view = graph.arena.read();
+        let path_nodes: Vec<String> = rows
+            .into_iter()
+            .map(|row| view.id(row).map(|id| id.to_string()))
+            .collect::<Option<_>>()?;
 
         Some(Path {
-            nodes: path_nodes.clone(),
-            total_weight: distances[end].into_inner(),
             length: path_nodes.len(),
+            nodes: path_nodes,
+            total_weight,
             confidence: 0.8,
             algorithm: self.name().to_string(),
         })
@@ -1546,6 +1642,38 @@ pub enum OptimizationType {
 mod tests {
     use super::*;
     use crate::memory::attractors::MemoryAttractorConfig;
+    use std::time::Instant;
+
+    fn node(id: &str, content: Vec<f32>) -> MemoryNode {
+        MemoryNode {
+            id: id.to_string(),
+            node_type: MemoryNodeType::Primary,
+            content,
+            importance: 0.8,
+            last_accessed: Utc::now(),
+            access_frequency: 1.0,
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+            fragment_ids: vec![],
+        }
+    }
+
+    fn edge(graph: &mut MemoryGraph, source: &str, target: &str, weight: f32) -> u32 {
+        let now = Utc::now();
+        let record = EdgeRecord {
+            uuid: Uuid::new_v4().as_u128(),
+            source: graph.row_of(source).unwrap(),
+            target: graph.row_of(target).unwrap(),
+            weight,
+            strength: weight,
+            created_at: now,
+            last_reinforced: now,
+            usage_count: 0,
+            connection_type: ConnectionType::Semantic,
+            bidirectional: true,
+        };
+        graph.push_edge(record, None)
+    }
 
     #[tokio::test]
     async fn test_connection_network() {
@@ -1553,20 +1681,10 @@ mod tests {
         let network = ConnectionNetwork::new(config);
         network.initialize().await.unwrap();
 
-        // Add a node
-        let node = MemoryNode {
-            id: "test_node".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 64],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        network.add_node(node).await.unwrap();
+        network
+            .add_node(node("test_node", vec![0.1; 64]))
+            .await
+            .unwrap();
 
         // Get statistics
         let stats = network.get_statistics();
@@ -1579,33 +1697,14 @@ mod tests {
         let network = ConnectionNetwork::new(config);
         network.initialize().await.unwrap();
 
-        // Add two nodes
-        let node1 = MemoryNode {
-            id: "node1".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 32],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        let node2 = MemoryNode {
-            id: "node2".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.2; 32],
-            importance: 0.7,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        network.add_node(node1).await.unwrap();
-        network.add_node(node2).await.unwrap();
+        network
+            .add_node(node("node1", vec![0.1; 32]))
+            .await
+            .unwrap();
+        network
+            .add_node(node("node2", vec![0.2; 32]))
+            .await
+            .unwrap();
 
         // Create connection
         let edge_id = network
@@ -1613,21 +1712,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!edge_id.is_empty());
+        assert!(Uuid::parse_str(&edge_id).is_ok());
 
         // `add_node(node2)` auto-creates a Semantic connection because
         // `create_connections_for_node` finds node1 highly similar
         // (vec![0.1; 32] vs vec![0.2; 32] has cosine similarity > 0.7), so
         // when we then *manually* create_connection the count is 2, not 1.
-        // The pre-Phase-A version of this test asserted 1 because the
-        // auto-connection path was masked by the read+write deadlock in
-        // `add_node`; with that fixed the auto-path runs to completion.
         let stats = network.get_statistics();
-        assert!(
-            stats.total_connections_created >= 1,
-            "expected at least one connection, got {}",
-            stats.total_connections_created
-        );
+        assert_eq!(stats.total_connections_created, 2);
+        assert_eq!(network.get_graph_metrics().total_edges, 2);
     }
 
     #[tokio::test]
@@ -1636,20 +1729,10 @@ mod tests {
         let network = ConnectionNetwork::new(config);
         network.initialize().await.unwrap();
 
-        // Add a node
-        let node = MemoryNode {
-            id: "test_node".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 64],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        network.add_node(node).await.unwrap();
+        network
+            .add_node(node("test_node", vec![0.1; 64]))
+            .await
+            .unwrap();
 
         // Create retrieval query
         let query = RetrievalQuery {
@@ -1672,33 +1755,14 @@ mod tests {
         let network = ConnectionNetwork::new(config);
         network.initialize().await.unwrap();
 
-        // Add nodes and create a path
-        let node1 = MemoryNode {
-            id: "node1".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 32],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        let node2 = MemoryNode {
-            id: "node2".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.2; 32],
-            importance: 0.7,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-
-        network.add_node(node1).await.unwrap();
-        network.add_node(node2).await.unwrap();
+        network
+            .add_node(node("node1", vec![0.1; 32]))
+            .await
+            .unwrap();
+        network
+            .add_node(node("node2", vec![0.2; 32]))
+            .await
+            .unwrap();
 
         network
             .create_connection("node1", "node2", ConnectionType::Semantic, 0.8)
@@ -1727,24 +1791,17 @@ mod tests {
             allowed_strategies: vec![],
         };
 
-        let mut graph = MemoryGraph::new();
-        graph.nodes.insert(
-            "node1".to_string(),
-            MemoryNode {
-                id: "node1".to_string(),
-                node_type: MemoryNodeType::Primary,
-                content: vec![0.1; 32],
-                importance: 0.8,
-                last_accessed: Utc::now(),
-                access_frequency: 1.0,
-                metadata: HashMap::new(),
-                created_at: Utc::now(),
-                fragment_ids: vec![],
-            },
-        );
+        let arena = Arc::new(VectorArena::new());
+        let mut graph = MemoryGraph::new(arena.clone());
+        graph.insert_node(node("node1", vec![0.1; 32])).unwrap();
+        // An arena row that is not a graph node must not be retrieved.
+        arena
+            .claim("fragment-only", Holder::Fragment, &[0.1; 32])
+            .unwrap();
 
         let results = strategy.find_memories(&query, &graph);
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_id, "node1");
         assert!(results[0].confidence > 0.9);
     }
 
@@ -1752,41 +1809,194 @@ mod tests {
     fn test_dijkstra_pathfinding() {
         let algorithm = DijkstraPathfinding;
 
-        let mut graph = MemoryGraph::new();
+        let mut graph = MemoryGraph::new(Arc::new(VectorArena::new()));
 
         // Create a simple graph: node1 -> node2 -> node3
         for i in 1..=3 {
-            let node_id = format!("node{}", i);
-            graph.nodes.insert(
-                node_id.clone(),
-                MemoryNode {
-                    id: node_id,
-                    node_type: MemoryNodeType::Primary,
-                    content: vec![0.1; 32],
-                    importance: 0.8,
-                    last_accessed: Utc::now(),
-                    access_frequency: 1.0,
-                    metadata: HashMap::new(),
-                    created_at: Utc::now(),
-                    fragment_ids: vec![],
-                },
-            );
+            graph
+                .insert_node(node(&format!("node{}", i), vec![0.1; 32]))
+                .unwrap();
         }
-
-        // Add adjacency
-        graph
-            .adjacency_list
-            .insert("node1".to_string(), vec!["node2".to_string()]);
-        graph
-            .adjacency_list
-            .insert("node2".to_string(), vec!["node3".to_string()]);
-        graph.adjacency_list.insert("node3".to_string(), vec![]);
+        edge(&mut graph, "node1", "node2", 0.9);
+        edge(&mut graph, "node2", "node3", 0.9);
 
         let path = algorithm.find_path(&graph, "node1", "node3");
         assert!(path.is_some());
 
         let path = path.unwrap();
         assert_eq!(path.nodes, vec!["node1", "node2", "node3"]);
+        assert_eq!(path.total_weight, 2.0);
+        assert!(algorithm.find_path(&graph, "node1", "missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_node_drops_incident_edges_and_releases_the_row() {
+        let arena = Arc::new(VectorArena::new());
+        let network =
+            ConnectionNetwork::with_arena(MemoryAttractorConfig::default(), arena.clone());
+        network.set_connection_policy(0, 0.7); // no auto-connections
+        for (id, x) in [("a", 1.0), ("b", 2.0), ("c", 3.0)] {
+            network.add_node(node(id, vec![x, 1.0])).await.unwrap();
+        }
+        network
+            .create_connection("a", "b", ConnectionType::Semantic, 0.9)
+            .await
+            .unwrap();
+        network
+            .create_connection("b", "c", ConnectionType::Semantic, 0.8)
+            .await
+            .unwrap();
+        network
+            .create_connection("a", "c", ConnectionType::Semantic, 0.7)
+            .await
+            .unwrap();
+
+        network.remove_node("b").await.unwrap();
+
+        assert_eq!(network.get_graph_metrics().total_edges, 1);
+        assert_eq!(
+            network.neighbors_of("a").await,
+            vec![("c".to_string(), 0.7)]
+        );
+        assert_eq!(
+            network.neighbors_of("c").await,
+            vec![("a".to_string(), 0.7)]
+        );
+        assert!(!arena.contains("b"));
+        assert!(network.remove_node("b").await.is_err());
+
+        // Freed edge slots and the arena row are reused.
+        network.add_node(node("d", vec![4.0, 1.0])).await.unwrap();
+        network
+            .create_connection("d", "a", ConnectionType::Semantic, 0.6)
+            .await
+            .unwrap();
+        let graph = network.graph.read().unwrap();
+        assert_eq!(graph.edges.len(), 3, "a dead slot was reused");
+        assert_eq!(graph.edge_count, 2);
+    }
+
+    #[tokio::test]
+    async fn node_shares_the_fragment_row() {
+        let arena = Arc::new(VectorArena::new());
+        let row = arena.claim("f", Holder::Fragment, &[1.0, 0.0]).unwrap();
+        let network =
+            ConnectionNetwork::with_arena(MemoryAttractorConfig::default(), arena.clone());
+        network.add_node(node("f", vec![1.0, 0.0])).await.unwrap();
+        assert_eq!(arena.row("f"), Some(row));
+        assert_eq!(arena.len(), 1);
+        network.remove_node("f").await.unwrap();
+        assert!(arena.contains("f"), "fragment still holds the row");
+    }
+
+    #[tokio::test]
+    async fn durable_graph_round_trips_through_restore() {
+        let network = ConnectionNetwork::new(MemoryAttractorConfig::default());
+        network.set_connection_policy(0, 0.7);
+        network.add_node(node("a", vec![1.0, 0.0])).await.unwrap();
+        network.add_node(node("b", vec![0.0, 1.0])).await.unwrap();
+        let id = network
+            .create_connection("a", "b", ConnectionType::Causal, 0.42)
+            .await
+            .unwrap();
+        network
+            .reinforce_connections(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+
+        let (nodes, edges) = network.durable_graph(None);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].id, id);
+        assert_eq!(edges[0].usage_count, 1);
+        assert_eq!(edges[0].connection_type, ConnectionType::Causal);
+
+        let restored = ConnectionNetwork::new(MemoryAttractorConfig::default());
+        let mut legacy = edges[0].clone();
+        legacy.id = "legacy-edge".to_string();
+        restored.restore_graph(nodes, vec![edges[0].clone(), edges[0].clone(), legacy]);
+        let (_, again) = restored.durable_graph(Some("a"));
+        let mut ids: Vec<_> = again.iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![id.clone(), "legacy-edge".to_string()],
+            "duplicate skipped"
+        );
+        assert_eq!(restored.get_graph_metrics().total_edges, 2);
+        assert_eq!(
+            restored.neighbors_of("b").await,
+            vec![("a".to_string(), 0.42), ("a".to_string(), 0.42)]
+        );
+    }
+
+    /// `durable_graph(Some(..))` runs on every checkpoint persist while the
+    /// consolidation worker writes to the arena. It must not re-enter the
+    /// arena lock under its own read view (deadlocks behind a queued writer).
+    #[tokio::test]
+    async fn durable_graph_does_not_deadlock_with_concurrent_arena_writers() {
+        let arena = Arc::new(VectorArena::new());
+        let network = Arc::new(ConnectionNetwork::with_arena(
+            MemoryAttractorConfig::default(),
+            arena.clone(),
+        ));
+        network.set_connection_policy(0, 0.7);
+        network.add_node(node("a", vec![1.0, 0.0])).await.unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (arena, stop) = (arena.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let id = format!("w{}", i % 64);
+                    arena
+                        .claim(&id, Holder::Fragment, &[1.0, i as f32])
+                        .unwrap();
+                    i += 1;
+                }
+            })
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let network = network.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    assert_eq!(network.durable_graph(Some("a")).0.len(), 1);
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        let finished = done_rx.recv_timeout(Duration::from_secs(20));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            finished.is_ok(),
+            "durable_graph deadlocked against arena writers"
+        );
+        reader.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimize_network_keeps_incident_lists_consistent() {
+        let network = ConnectionNetwork::new(MemoryAttractorConfig::default());
+        network.set_connection_policy(0, 0.7);
+        network.add_node(node("a", vec![1.0, 0.0])).await.unwrap();
+        network.add_node(node("b", vec![0.0, 1.0])).await.unwrap();
+        network
+            .create_connection("a", "b", ConnectionType::Semantic, 0.05)
+            .await
+            .unwrap();
+        network
+            .create_connection("a", "b", ConnectionType::Semantic, 0.9)
+            .await
+            .unwrap();
+        let result = network.optimize_network().await.unwrap();
+        assert_eq!(result.final_edge_count, 1);
+        assert_eq!(
+            network.neighbors_of("a").await,
+            vec![("b".to_string(), 0.9)]
+        );
     }
 
     /// Verify that `CONTEXTNEST_MAX_CONNECTIONS_PER_NODE` bounds the fan-out
@@ -1828,18 +2038,10 @@ mod tests {
         // Seed 10 peers whose content is essentially identical to the
         // inbound node — every one sits well above the 0.7 similarity floor.
         for i in 0..10 {
-            let peer = MemoryNode {
-                id: format!("peer{}", i),
-                node_type: MemoryNodeType::Primary,
-                content: vec![0.1; 32],
-                importance: 0.5,
-                last_accessed: Utc::now(),
-                access_frequency: 1.0,
-                metadata: HashMap::new(),
-                created_at: Utc::now(),
-                fragment_ids: vec![],
-            };
-            network.add_node(peer).await.unwrap();
+            network
+                .add_node(node(&format!("peer{}", i), vec![0.1; 32]))
+                .await
+                .unwrap();
         }
 
         // Baseline: capture connection count after the seeding completes
@@ -1847,18 +2049,10 @@ mod tests {
         let stats_before = network.get_statistics();
 
         // Inbound node — same content vector, so all 10 peers qualify.
-        let inbound = MemoryNode {
-            id: "inbound".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 32],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-        network.add_node(inbound).await.unwrap();
+        network
+            .add_node(node("inbound", vec![0.1; 32]))
+            .await
+            .unwrap();
 
         let stats_after = network.get_statistics();
         let new_connections =
@@ -1886,30 +2080,14 @@ mod tests {
         assert_eq!(network.path_finder_metrics().total_searches, 0);
 
         // Set up two nodes connected by an edge so find_path has a valid path.
-        let node1 = MemoryNode {
-            id: "pf_node1".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.1; 32],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-        let node2 = MemoryNode {
-            id: "pf_node2".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.9; 32],
-            importance: 0.7,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-        network.add_node(node1).await.unwrap();
-        network.add_node(node2).await.unwrap();
+        network
+            .add_node(node("pf_node1", vec![0.1; 32]))
+            .await
+            .unwrap();
+        network
+            .add_node(node("pf_node2", vec![0.9; 32]))
+            .await
+            .unwrap();
         network
             .create_connection("pf_node1", "pf_node2", ConnectionType::Semantic, 0.8)
             .await
@@ -1939,18 +2117,10 @@ mod tests {
         assert_eq!(network.retrieval_optimizer_metrics().total_retrievals, 0);
 
         // Add a node so there is at least one candidate to retrieve.
-        let node = MemoryNode {
-            id: "ro_node1".to_string(),
-            node_type: MemoryNodeType::Primary,
-            content: vec![0.5; 32],
-            importance: 0.8,
-            last_accessed: Utc::now(),
-            access_frequency: 1.0,
-            metadata: HashMap::new(),
-            created_at: Utc::now(),
-            fragment_ids: vec![],
-        };
-        network.add_node(node).await.unwrap();
+        network
+            .add_node(node("ro_node1", vec![0.5; 32]))
+            .await
+            .unwrap();
 
         let query = RetrievalQuery {
             id: "ro_query".to_string(),
@@ -1969,5 +2139,42 @@ mod tests {
             1,
             "expected total_retrievals == 1 after one retrieve_memories call"
         );
+    }
+
+    /// Scale benchmark for the contiguous exact scan (the operation that
+    /// drove consolidation CPU). Run with:
+    /// `cargo test --release --lib connection_scan_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn connection_scan_benchmark() {
+        let rows: usize = std::env::var("CN_BENCH_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(334_000);
+        let dim = 1024;
+        let arena = VectorArena::new();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let mut vector = vec![0.0f32; dim];
+        for i in 0..rows {
+            vector.iter_mut().for_each(|v| *v = next());
+            arena
+                .claim(&format!("frag-{i:08}"), Holder::Node, &vector)
+                .unwrap();
+        }
+        let view = arena.read();
+        let query = view.vector(7).unwrap().to_vec();
+        let started = Instant::now();
+        let iterations = 10;
+        for _ in 0..iterations {
+            std::hint::black_box(view.top_k(&query, 32, 0.7, |r| r != 7));
+        }
+        let per_scan = started.elapsed() / iterations;
+        println!("exact top-32 over {rows} x {dim}: {per_scan:?} per scan");
     }
 }

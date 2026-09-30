@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-09-30
+
+Minor bump: the canonical checkpoint's on-disk format changes (see
+**Upgrade notes**). Older binaries cannot read rows written by this one.
+
+### Changed
+
+- **Disk-first substrate: each embedding is stored once.** A new
+  `VectorArena` holds every fragment vector in one contiguous buffer, shared
+  by the fragment store and the connection graph (a graph node's index is
+  its arena row). Previously each vector was held ~3.5 times (fragment
+  store, graph node, `embeddings_by_id`, per-basin copies) as separate 4 KB
+  heap allocations. Measured on the 334 k-fragment operator substrate before
+  the change: 12.4 GB live heap, 92 M allocations, ~37 KB per fragment.
+  ([#190], [epic](docs/roadmap/epics/disk-first-substrate.md))
+- **Compact connection graph.** Edges are 64-byte records with `u32`
+  endpoints and per-node incident lists, replacing string-keyed maps that
+  stored each edge UUID five times and each endpoint id twice more
+  (~870 bytes per edge, ~6.7 GB at 7.8 M edges). The write-only
+  `connection_weights` map is gone. `remove_node`, `reinforce_connections`
+  and path search are O(degree) instead of scanning every edge or node;
+  `optimize_network` now keeps incident lists consistent.
+- **Contiguous exact similarity scan.** Connection formation and the
+  similarity retrieval strategy scan the arena linearly with a 16-lane SIMD
+  dot product. Results stay exact; scores differ from the old sequential
+  sum only by float rounding.
+- **`embeddings_by_id` holds pending fragments only.** Bootstrap no longer
+  copies every restored vector into it; consolidation drops the entry once
+  the canonical vector exists and scores consolidated RecMem peers in place.
+- **Streaming checkpoint restore.** Boot streams basins, fragments, nodes
+  and edges into the manager in bounded batches instead of materialising
+  the whole canonical state (plus a vector copy) first. Node rows are parsed
+  without allocating their legacy inline vectors.
+- **Binary checkpoint vectors.** Fragment and basin vectors are stored as
+  little-endian f32 blobs in a new `vectors` table (4 KB instead of ~11 KB of
+  JSON per 1024-d vector); node rows no longer duplicate their fragment's
+  vector. Rows written by older builds still load.
+- **Bounded embedding response cache.** The text→vector cache was
+  insert-only for the process lifetime; it is now an LRU
+  (`CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES`, default 4096).
+
+### Added
+
+- `contextnest checkpoint compact --from <db> --into <new-db>`: rewrites a
+  stopped checkpoint into the binary format by streaming into a new file.
+  The source is opened read-only; refuses to run while `serve` holds the
+  database lock or when `--into` exists.
+- `CONTEXTNEST_VECTOR_ARENA_DIR`: file-backed vector arena for the operator
+  substrate. Under memory pressure its pages are written back to the file
+  and dropped instead of being compressed/swapped. The file is derived
+  state, unlinked as soon as it is mapped.
+- `GET /api/v1/graph/neighbors` and `GET /api/v1/graph/path` over the
+  canonical connection network. ([#186])
+- Neo4j agent-memory property graph behind the opt-in `neo4j-graph`
+  feature, with configuration docs. ([#187], [#188])
+
+### Removed
+
+- The dead `services/graph.rs` / `graph_enhanced.rs` Neo4j services;
+  `neo4rs` is now optional. ([#185])
+
+### Upgrade notes
+
+1. Stop `contextnest serve` and back up `~/.contextnest/wal.canonical.sqlite`
+   to a volume with free space. Rolling back to ≤ 0.1.4 after this build has
+   written checkpoint rows requires that backup.
+2. Optional: `contextnest checkpoint compact --from <db> --into <new-db>`,
+   verify the report, then swap the files. Without compaction the file
+   converges as fragments are re-persisted.
+3. Optional: set `CONTEXTNEST_VECTOR_ARENA_DIR` to a directory on a volume
+   with free space (~4 KB per fragment).
+
+[#185]: https://github.com/SourceShift/ContextNest/pull/185
+[#190]: https://github.com/SourceShift/ContextNest/pull/190
+[#186]: https://github.com/SourceShift/ContextNest/pull/186
+[#187]: https://github.com/SourceShift/ContextNest/pull/187
+[#188]: https://github.com/SourceShift/ContextNest/pull/188
+
 ## [0.1.4] — 2026-09-17
 
 ### Added

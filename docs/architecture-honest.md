@@ -65,9 +65,15 @@ After consolidation, the fragment exists in **four** places:
 | `fragment_texts` | source text | ingest |
 | `fragment_metadata` | structured meta + `_cn_consolidated` flag | ingest + consolidation |
 | `session_index` | session affinity | ingest |
-| `reconstruction_protocol.fragment_store` | canonical `MemoryFragment` (embedding + importance) | consolidation |
+| `reconstruction_protocol.fragment_store` | canonical fragment metadata (importance, timestamps) | consolidation |
+| `attractor_manager.vector_arena` row | the embedding, stored **once**, shared by the fragment and its graph node | consolidation |
 | `basin_manager.basins[basin_id].associated_fragments` | basin membership | consolidation |
-| `connection_network.graph.nodes[id]` | graph node + auto-formed edges | consolidation |
+| `connection_network.graph` node at the same arena row | graph node + auto-formed edges (64-byte records, `u32` endpoints) | consolidation |
+
+`embeddings_by_id` only holds vectors of fragments still pending
+consolidation (embed once across retries); the entry is dropped on success.
+See [disk-first substrate](roadmap/epics/disk-first-substrate.md) for the
+heap accounting behind this layout.
 
 ## Lifecycle of one retrieve query
 
@@ -128,6 +134,8 @@ All optional, env-overridable, sensible defaults:
 | `CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT` | 0.1 | 5 | Floor on edge weight |
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT` | true | 6 | Auto-attach reconstruction on chain queries |
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH` | 5 | 6 | top-N fragments stitched in the chain |
+| `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | disk-first | LRU bound on the text→vector response cache (~16 MB at 1024-d); `0` disables it |
+| `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | disk-first | Directory for the operator's file-backed vector arena. Derived state: created fresh and unlinked at boot, rebuilt from the checkpoint. Pages are written back to the file under memory pressure instead of compressed/swapped |
 
 ## Observability
 
@@ -200,8 +208,13 @@ when tenant mode is configured. See the [tenant/session repair design](roadmap/e
 
 The operator store now has a canonical SQLite checkpoint beside its JSONL WAL.
 Vectors, affected basins/edges and completion are committed together. Restart
-restores completed state without re-embedding; persisted failures retain their
-retry budget. Transcript tails use durable complete-line offsets and bounded
+restores completed state without re-embedding, streaming rows into the
+manager in bounded batches (no whole-state snapshot at boot); persisted
+failures retain their retry budget. Vectors are stored as little-endian f32
+blobs in a `vectors` table; payloads written by older builds (vectors inline
+as JSON) still load, and `contextnest checkpoint compact` rewrites a stopped
+checkpoint into the binary form. Older binaries cannot read binary-format
+rows, so back the checkpoint up before upgrading. Transcript tails use durable complete-line offsets and bounded
 reads. Identical ingestion preserves canonical metadata and does not requeue work.
 
 Health reads scalar basin statistics instead of cloning vectors, caches age

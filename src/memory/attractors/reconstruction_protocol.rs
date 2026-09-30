@@ -4,6 +4,8 @@
 
 use crate::error::ContextNestResult;
 use crate::error::{ContextNestError, Result};
+use crate::memory::attractors::fragment_store::FragmentStore;
+use crate::memory::attractors::vector_arena::VectorArena;
 use crate::memory::attractors::{
     utils, ComponentStatus, GapFillSource, GapFillingMethod, GapInfo, MemoryAttractorConfig,
     MemoryFragment, ReconstructedMemory,
@@ -21,8 +23,8 @@ use uuid::Uuid;
 pub struct MemoryReconstructionProtocol {
     /// Configuration
     config: MemoryAttractorConfig,
-    /// Fragment store
-    fragment_store: Arc<AsyncRwLock<HashMap<String, MemoryFragment>>>,
+    /// Fragment store (metadata; vectors live in the shared arena)
+    fragment_store: Arc<AsyncRwLock<FragmentStore>>,
     /// Reconstruction cache
     reconstruction_cache: Arc<RwLock<HashMap<String, CachedReconstruction>>>,
     /// Pattern matching engine
@@ -238,11 +240,17 @@ pub struct AdaptationRecord {
 }
 
 impl MemoryReconstructionProtocol {
-    /// Create a new memory reconstruction protocol
+    /// Create a new memory reconstruction protocol with a private arena.
     pub fn new(config: MemoryAttractorConfig) -> Self {
+        Self::with_arena(config, Arc::new(VectorArena::new()))
+    }
+
+    /// Create a protocol whose fragment vectors live in `arena`, shared
+    /// with the connection graph.
+    pub fn with_arena(config: MemoryAttractorConfig, arena: Arc<VectorArena>) -> Self {
         Self {
             config: config.clone(),
-            fragment_store: Arc::new(AsyncRwLock::new(HashMap::new())),
+            fragment_store: Arc::new(AsyncRwLock::new(FragmentStore::new(arena))),
             reconstruction_cache: Arc::new(RwLock::new(HashMap::new())),
             pattern_matcher: Arc::new(PatternMatchingEngine::new()),
             statistics: Arc::new(RwLock::new(ReconstructionStatistics::default())),
@@ -260,11 +268,7 @@ impl MemoryReconstructionProtocol {
     /// Add a memory fragment to the store
 
     pub async fn add_fragment(&self, fragment: MemoryFragment) -> ContextNestResult<()> {
-        let fragment_id = fragment.id.clone();
-        self.fragment_store
-            .write()
-            .await
-            .insert(fragment_id, fragment);
+        self.fragment_store.write().await.insert(fragment);
         Ok(())
     }
 
@@ -414,26 +418,14 @@ impl MemoryReconstructionProtocol {
     /// Remove old fragments
 
     pub async fn cleanup_old_fragments(&self, max_age: Duration) -> ContextNestResult<usize> {
-        let mut fragments = self.fragment_store.write().await;
         let now = Utc::now();
-        let mut to_remove = Vec::new();
-
-        for (id, fragment) in fragments.iter() {
+        let removed_count = self.fragment_store.write().await.retain(|fragment| {
             let age = now
                 .signed_duration_since(fragment.created_at)
                 .to_std()
                 .unwrap_or_default();
-            if age > max_age {
-                to_remove.push(id.clone());
-            }
-        }
-
-        let removed_count = to_remove.len();
-
-        for id in to_remove {
-            fragments.remove(&id);
-        }
-
+            age <= max_age
+        });
         Ok(removed_count)
     }
 
@@ -442,7 +434,7 @@ impl MemoryReconstructionProtocol {
     /// without going through the protocol's own pipeline (which is
     /// reconstruction-oriented, not key-value-oriented). Cloning an Arc is
     /// O(1) — only the reference count is bumped, not the map contents.
-    pub fn fragment_store(&self) -> Arc<AsyncRwLock<HashMap<String, MemoryFragment>>> {
+    pub fn fragment_store(&self) -> Arc<AsyncRwLock<FragmentStore>> {
         self.fragment_store.clone()
     }
 
@@ -472,7 +464,7 @@ impl MemoryReconstructionProtocol {
 
         for id in fragment_ids {
             if let Some(fragment) = fragment_store.get(id) {
-                fragments.push(fragment.clone());
+                fragments.push(fragment);
             }
         }
 

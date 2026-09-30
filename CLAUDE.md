@@ -153,8 +153,20 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT` | 0 | T1 (arXiv:2605.16045). When > 0, defers a fragment to the subconscious store if it has fewer than N session peers over the cosine floor. Sidecar stays retrievable; no basin, no graph work. Reconsideration re-enqueues when a peer arrives. |
 | `CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR` | 0.15 | T4 (arXiv:2601.14287). Drops fragments below this cosine from `reconstruct`'s chain assembly before top-K truncation. Set 0.0 to disable. |
 | `CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT` | 0.1 | T5 (arXiv:2606.12945). Weight on the frequency-of-use boost `1 + w * log2(count + 1)` applied to retrieve scoring. Set 0.0 to disable. |
+| `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | LRU bound on the embedding response cache (~16 MB at 1024-d). `0` disables it. |
+| `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | Put the operator's vector arena in a file-backed mapping under this dir (derived state, unlinked at boot). Use a volume with free space. |
 
 Full list in `docs/architecture-honest.md`.
+
+## Memory layout (disk-first substrate)
+
+Each fragment vector lives **once**, in `VectorArena`
+(`src/memory/attractors/vector_arena.rs`), shared by the fragment store and
+the connection graph (a graph node's index *is* its arena row). Edges are
+64-byte records with `u32` endpoints. Measure heap with `vmmap --summary <pid>`
+(MALLOC ZONE "BYTES ALLOCATED") — macOS RSS is compressor-masked and useless
+here. Lock order: graph lock before arena lock, never the reverse. See
+`docs/roadmap/epics/disk-first-substrate.md`.
 
 ## Gotchas
 

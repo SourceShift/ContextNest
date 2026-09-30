@@ -9,7 +9,9 @@
 
 use clap::Parser;
 use contextnest::api::create_app;
-use contextnest::cli::{Cli, Commands, IngestSource, McpCommands, PromptContextCommands};
+use contextnest::cli::{
+    CheckpointCommands, Cli, Commands, IngestSource, McpCommands, PromptContextCommands,
+};
 use contextnest::config::Config;
 use contextnest::inbox::{render_json, render_markdown, render_text, InboxItem};
 use contextnest::ingest::claude_code::{
@@ -59,7 +61,37 @@ async fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             json,
             url,
         } => features(since, layer, project, json, url).await,
+        Commands::Checkpoint {
+            action: CheckpointCommands::Compact { from, into },
+        } => checkpoint_compact(from, into).await,
     }
+}
+
+/// `contextnest checkpoint compact`: stream a canonical checkpoint into the
+/// binary-vector format at a new path. Runs on a blocking thread; the
+/// source is read-only and must not be in use.
+async fn checkpoint_compact(
+    from: PathBuf,
+    into: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("compacting {} -> {}", from.display(), into.display());
+    let started = std::time::Instant::now();
+    let report = tokio::task::spawn_blocking(move || {
+        contextnest::services::checkpoint::compact(&from, &into).map_err(|e| e.to_string())
+    })
+    .await??;
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "fragments={} basins={} nodes={} edges={}\nsource={:.0} MiB output={:.0} MiB ({:.1}s)",
+        report.fragments,
+        report.basins,
+        report.nodes,
+        report.edges,
+        mib(report.source_bytes),
+        mib(report.output_bytes),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Dispatch the `features` subcommand. Calls `GET /api/v1/features` with

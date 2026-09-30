@@ -146,6 +146,35 @@ pub enum Commands {
         #[arg(long)]
         url: Option<String>,
     },
+
+    /// Offline maintenance of the canonical checkpoint
+    /// (`<wal>.canonical.sqlite`). Stop `contextnest serve` first.
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointCommands,
+    },
+}
+
+/// Canonical checkpoint maintenance.
+#[derive(Subcommand)]
+pub enum CheckpointCommands {
+    /// Rewrite a checkpoint into the binary-vector format by streaming it
+    /// into a NEW file. Vectors stored as JSON text (~11 KB per 1024-d
+    /// vector) become 4 KB blobs; node rows stop duplicating their
+    /// fragment's vector. The source is opened read-only and never
+    /// modified; `--into` must not exist. Swap files after verifying:
+    ///
+    ///   contextnest checkpoint compact \
+    ///     --from ~/.contextnest/wal.canonical.sqlite \
+    ///     --into /Volumes/big/wal.canonical.compact.sqlite
+    Compact {
+        /// Existing checkpoint (must not be in use by a running server).
+        #[arg(long)]
+        from: PathBuf,
+        /// Output path for the compacted checkpoint (must not exist).
+        #[arg(long)]
+        into: PathBuf,
+    },
 }
 
 /// MCP server modes. v0.x ships only the stdio transport (the standard
