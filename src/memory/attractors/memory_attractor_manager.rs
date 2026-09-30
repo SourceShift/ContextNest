@@ -4,6 +4,7 @@
 
 use crate::error::ContextNestResult;
 use crate::error::{ContextNestError, Result};
+use crate::memory::attractors::vector_arena::VectorArena;
 use crate::memory::attractors::{
     utils, AdaptiveDecaySystem, AttractorBasinManager, ComponentStatus, ConnectionNetwork,
     GapFillingEngine, MemoryAttractorConfig, MemoryAttractorMetrics, MemoryFragment,
@@ -33,6 +34,8 @@ pub struct MemoryAttractorManager {
     decay_system: Arc<AdaptiveDecaySystem>,
     /// Connection network
     connection_network: Arc<ConnectionNetwork>,
+    /// Canonical vectors shared by the fragment store and the graph
+    vector_arena: Arc<VectorArena>,
     /// System metrics
     metrics: Arc<RwLock<SystemMetrics>>,
     /// Component status
@@ -240,15 +243,22 @@ pub struct CanonicalSnapshot {
 }
 
 impl MemoryAttractorManager {
-    /// Create a new memory attractor manager
+    /// Create a new memory attractor manager. The fragment store and the
+    /// connection graph share one vector arena: each fragment vector is
+    /// stored once and its graph node reuses the same row.
     pub fn new(config: MemoryAttractorConfig) -> Self {
+        let arena = Arc::new(VectorArena::new());
         Self {
             config: config.clone(),
             basin_manager: Arc::new(AttractorBasinManager::new(config.clone())),
-            reconstruction_protocol: Arc::new(MemoryReconstructionProtocol::new(config.clone())),
+            reconstruction_protocol: Arc::new(MemoryReconstructionProtocol::with_arena(
+                config.clone(),
+                arena.clone(),
+            )),
             gap_filling_engine: Arc::new(GapFillingEngine::new(config.clone())),
             decay_system: Arc::new(AdaptiveDecaySystem::new(config.clone())),
-            connection_network: Arc::new(ConnectionNetwork::new(config)),
+            connection_network: Arc::new(ConnectionNetwork::with_arena(config, arena.clone())),
+            vector_arena: arena,
             metrics: Arc::new(RwLock::new(SystemMetrics::default())),
             status: Arc::new(RwLock::new(ComponentStatus::Initializing)),
             background_tasks: Arc::new(RwLock::new(Vec::new())),
@@ -404,7 +414,7 @@ impl MemoryAttractorManager {
                 // insert is idempotent for the key; we overwrite with the
                 // latest version if the same ID is submitted twice, which is
                 // the correct behaviour for re-ingestion of updated fragments.
-                store.insert(fragment.id.clone(), fragment.clone());
+                store.insert(fragment.clone());
             }
         }
 
@@ -782,7 +792,27 @@ impl MemoryAttractorManager {
     pub async fn get_fragment(&self, id: &str) -> ContextNestResult<Option<MemoryFragment>> {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let store = store_arc.read().await;
-        Ok(store.get(id).cloned())
+        Ok(store.get(id))
+    }
+
+    /// Cosine between `query` and a canonical fragment's vector, computed
+    /// in place — no fragment or vector clone. `None` for unknown ids.
+    pub async fn fragment_similarity(&self, id: &str, query: &[f32]) -> Option<f32> {
+        let store_arc = self.reconstruction_protocol.fragment_store();
+        let store = store_arc.read().await;
+        store.cosine_to(id, query)
+    }
+
+    /// Copy of a canonical fragment's vector. `None` for unknown ids.
+    pub async fn fragment_vector(&self, id: &str) -> Option<Vec<f32>> {
+        let store_arc = self.reconstruction_protocol.fragment_store();
+        let store = store_arc.read().await;
+        store.get(id).map(|f| f.content)
+    }
+
+    /// Shared canonical vector store (fragment store + graph).
+    pub fn vector_arena(&self) -> Arc<VectorArena> {
+        self.vector_arena.clone()
     }
 
     /// In-place update of the fragment's `importance` field and refreshes
@@ -802,13 +832,10 @@ impl MemoryAttractorManager {
     ) -> ContextNestResult<bool> {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let mut store = store_arc.write().await;
-        if let Some(fragment) = store.get_mut(id) {
+        Ok(store.update(id, |fragment| {
             fragment.importance = new_importance;
             fragment.last_accessed = Utc::now();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        }))
     }
 
     /// Hard delete: remove the fragment from the canonical store entirely.
@@ -824,7 +851,7 @@ impl MemoryAttractorManager {
     pub async fn discard_fragment(&self, id: &str) -> ContextNestResult<bool> {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let mut store = store_arc.write().await;
-        let removed = store.remove(id).is_some();
+        let removed = store.remove(id);
         drop(store);
         self.basin_manager.discard_member(id).await;
         let _ = self.connection_network.remove_node(id).await;
@@ -840,7 +867,7 @@ impl MemoryAttractorManager {
     pub async fn list_fragment_ids(&self) -> Vec<String> {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let store = store_arc.read().await;
-        store.keys().cloned().collect()
+        store.ids()
     }
 
     /// Configure this session's graph before publishing its manager.
@@ -861,8 +888,8 @@ impl MemoryAttractorManager {
         let store = self.reconstruction_protocol.fragment_store();
         let store = store.read().await;
         let fragments: Vec<MemoryFragment> = match fragment_id {
-            Some(id) => store.get(id).cloned().into_iter().collect(),
-            None => store.values().cloned().collect(),
+            Some(id) => store.get(id).into_iter().collect(),
+            None => store.all(),
         };
         drop(store);
         let basins = self.basin_manager.durable_basins(basin_ids).await;
@@ -881,15 +908,35 @@ impl MemoryAttractorManager {
     }
 
     pub async fn restore_snapshot(&self, snapshot: CanonicalSnapshot) {
+        self.restore_fragments(snapshot.fragments).await;
+        self.restore_basins(snapshot.basins).await;
+        self.restore_graph(snapshot.nodes, snapshot.edges);
+    }
+
+    // Incremental restore, used by the streaming checkpoint bootstrap.
+    // Fragments must be restored before the nodes that share their rows.
+
+    pub async fn restore_fragments(&self, fragments: Vec<MemoryFragment>) {
         let store = self.reconstruction_protocol.fragment_store();
         let mut store = store.write().await;
-        for fragment in snapshot.fragments {
-            store.insert(fragment.id.clone(), fragment);
+        for fragment in fragments {
+            store.insert(fragment);
         }
-        drop(store);
-        self.basin_manager.restore_basins(snapshot.basins).await;
-        self.connection_network
-            .restore_graph(snapshot.nodes, snapshot.edges);
+    }
+
+    pub async fn restore_basins(
+        &self,
+        basins: Vec<crate::memory::attractors::attractor_basin::AttractorBasin>,
+    ) {
+        self.basin_manager.restore_basins(basins).await;
+    }
+
+    pub fn restore_graph(
+        &self,
+        nodes: Vec<crate::memory::attractors::connection_network::MemoryNode>,
+        edges: Vec<crate::memory::attractors::connection_network::ConnectionEdge>,
+    ) {
+        self.connection_network.restore_graph(nodes, edges);
     }
 
     // Helper methods

@@ -17,9 +17,12 @@ pub mod adaptive_decay;
 /// Core memory attractor system components
 pub mod attractor_basin;
 pub mod connection_network;
+pub mod fragment_store;
 pub mod gap_filling_engine;
 pub mod memory_attractor_manager;
 pub mod reconstruction_protocol;
+pub mod vector_arena;
+mod vector_arena_file;
 
 // Re-export main components
 pub use adaptive_decay::*;
