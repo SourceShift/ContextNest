@@ -1,6 +1,7 @@
 # Epic — Disk-first substrate (heap diet)
 
-**Status:** In progress on `feat/disk-first-substrate`.
+**Status:** Stages 1–6 implemented on `feat/disk-first-substrate` (v0.2.0).
+Live heap measurement on the operator substrate pending the operator's restart.
 
 **Last updated:** 2026-09-30.
 
@@ -96,9 +97,17 @@ Each stage is one commit on the epic branch, gated on `cargo test --lib`,
 
 ### Deliberately deferred
 
-- **HNSW / approximate index.** Contiguous exact scan keeps connection
-  formation bit-identical to today. Gate: add an ANN index only if the
-  exact-scan benchmark exceeds ~50 ms per scan at the live substrate size.
+- **HNSW / approximate index.** The contiguous scan is still exact (no
+  approximate recall); scores differ from the old sequential fold only by
+  float rounding (~1e-7) because the dot product uses 16 SIMD lanes.
+  Measured `connection_scan_benchmark` (release, one thread, 334 k × 1024):
+  **139 ms per scan** with the first 8-lane kernel, taken while the host was
+  swapping (30.4 / 31.7 GB swap used), so the number is pessimistic. The
+  shipped 16-lane kernel measured ~2× faster than the 8-lane one in the same
+  conditions, and the scan's floor is streaming 1.37 GB from memory.
+  That sits at or just above the 50 ms gate, so an ANN index is the next
+  step if a quiet-host re-run confirms > 50 ms. Per-fragment embedding
+  latency (~250 ms) still dominates consolidation.
 - **Basin centres in an arena.** Centres move (basin dynamics, merges), so
   they need their own mutable arena; 0.77 GB, follow-up.
 - **f16 quantisation.** The arena feeds the canonical checkpoint, so it must
