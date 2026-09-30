@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-09-30
+
+### Added
+
+- **Upgrade guide** for v0.1.x → v0.2: backup, compaction, data relocation,
+  recommended runtime settings, verification, rollback and troubleshooting,
+  with timings measured on a 329 k-fragment substrate.
+  ([docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md))
+
+### Fixed
+
+- **`contextnest checkpoint compact` throughput.** It inserted rows in the
+  source's insertion order into a fresh `(kind, id)` B-tree with SQLite's
+  2 MB default page cache, so once the index outgrew the cache every insert
+  became a random page rewrite (I/O-bound at ~50 MB/min on a 14.4 GB
+  checkpoint). It now reads in key order so inserts append, uses a 256 MB
+  page cache and `synchronous=OFF` on the output (a fresh file: a crash
+  means re-running), and logs progress every 250 k rows.
+
+### Measured
+
+Live operator substrate after upgrading (329,547 fragments, 188,657 basins,
+7,784,794 edges): live heap **2.6 GB** in 10.5 M allocations, down from
+12.4 GB in 92 M; checkpoint 14.4 GB → 6.3 GB; boot restores in ~2 min
+without re-embedding.
+
 ## [0.2.0] — 2026-09-30
 
 Minor bump: the canonical checkpoint's on-disk format changes (see
@@ -67,6 +93,8 @@ Minor bump: the canonical checkpoint's on-disk format changes (see
   `neo4rs` is now optional. ([#185])
 
 ### Upgrade notes
+
+Full walkthrough: [docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md).
 
 1. Stop `contextnest serve` and back up `~/.contextnest/wal.canonical.sqlite`
    to a volume with free space. Rolling back to ≤ 0.1.4 after this build has

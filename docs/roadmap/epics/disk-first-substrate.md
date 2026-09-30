@@ -1,7 +1,9 @@
 # Epic — Disk-first substrate (heap diet)
 
-**Status:** Stages 1–6 implemented on `feat/disk-first-substrate` (v0.2.0).
-Live heap measurement on the operator substrate pending the operator's restart.
+**Status:** Shipped in v0.2.0 (#190); compaction throughput fix in v0.2.1.
+Live result on the operator substrate (2026-09-30, 329,547 fragments,
+7,784,794 edges): **2.6 GB** live heap in 10.5 M allocations, down from
+12.4 GB in 92 M; checkpoint 14.4 GB → 6.3 GB; boot restore ~2 min.
 
 **Last updated:** 2026-09-30.
 

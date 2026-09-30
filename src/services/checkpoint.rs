@@ -570,6 +570,14 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
     let space: String = source.query_row("SELECT space FROM identity LIMIT 1", [], |r| r.get(0))?;
     let target = CheckpointStore::open(into, &space)?;
     let mut out = target.connection.lock().unwrap();
+    // The output is a fresh file: a crash means re-running into a new path,
+    // so durability per commit buys nothing. A large page cache keeps the
+    // growing (kind,id) index resident; together with key-ordered reads
+    // below, inserts become appends instead of random B-tree rewrites
+    // (a 15 GB checkpoint went I/O-bound at ~50 MB/min without this).
+    out.execute_batch(
+        "PRAGMA synchronous=OFF;PRAGMA cache_size=-262144;PRAGMA temp_store=MEMORY;",
+    )?;
     let mut report = CompactReport::default();
 
     for table in ["completed", "tombstones", "retries", "tails"] {
@@ -604,7 +612,8 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
     if has_vectors {
         let tx = out.transaction()?;
         {
-            let mut read = source.prepare("SELECT kind, id, data FROM vectors")?;
+            let mut read =
+                source.prepare("SELECT kind, id, data FROM vectors ORDER BY kind, id")?;
             let mut rows = read.query([])?;
             let mut write = tx.prepare("INSERT OR IGNORE INTO vectors VALUES(?1,?2,?3)")?;
             while let Some(row) = rows.next()? {
@@ -618,11 +627,19 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
         tx.commit()?;
     }
 
-    let mut read = source.prepare("SELECT kind, id, payload FROM objects")?;
+    // Key order (the source's primary-key index) makes every output insert
+    // an append to both the objects and vectors B-trees.
+    let total: u64 = source.query_row("SELECT count(*) FROM objects", [], |r| r.get(0))?;
+    let mut read = source.prepare("SELECT kind, id, payload FROM objects ORDER BY kind, id")?;
     let mut rows = read.query([])?;
     let mut tx = out.transaction()?;
     let mut in_tx = 0usize;
+    let mut done = 0u64;
     while let Some(row) = rows.next()? {
+        done += 1;
+        if done % 250_000 == 0 {
+            tracing::info!(done, total, "checkpoint compact progress");
+        }
         let kind: String = row.get(0)?;
         let id: String = row.get(1)?;
         let payload: String = row.get(2)?;

@@ -17,6 +17,12 @@ Curated entry points for understanding and using ContextNest.
   generic HTTP for Voyage / Cohere / Jina / Mistral / TEI). Custom
   provider trait for anything else.
 
+## Upgrading
+
+- [**upgrading/v0.2.0.md**](upgrading/v0.2.0.md) — moving an existing
+  v0.1.x substrate to v0.2 (disk-first layout): backup, checkpoint
+  compaction, runtime settings for constrained machines, rollback.
+
 ## Where this is going
 
 - [**Tenant and session memory repair design**](roadmap/epics/tenant-session-memory.md)
