@@ -416,29 +416,33 @@ async fn consolidate_one(
         .map(|f| f as f32)
         .unwrap_or(0.5);
 
-    // Reuse the cache so we don't re-embed the same text twice across
-    // a worker tick — populates on first read, cheap thereafter.
+    // `embeddings_by_id` holds vectors only for fragments still pending
+    // consolidation, so a retry does not re-embed. A fragment whose vector
+    // already lives in the canonical arena reuses it.
     let embedding = {
         let cache = services.embeddings_by_id.read().await;
         cache.get(id).cloned()
     };
     let embedding = match embedding {
         Some(e) => e,
-        None => {
-            let emb = services
-                .embedding
-                .generate_embedding(&text)
-                .await
-                .map_err(|e| format!("embed: {e}"))?;
-            // Best-effort cache write — failure here just means the
-            // next consolidation pass re-embeds.
-            services
-                .embeddings_by_id
-                .write()
-                .await
-                .insert(id.to_string(), emb.clone());
-            emb
-        }
+        None => match services.attractor_manager.fragment_vector(id).await {
+            Some(canonical) => canonical,
+            None => {
+                let emb = services
+                    .embedding
+                    .generate_embedding(&text)
+                    .await
+                    .map_err(|e| format!("embed: {e}"))?;
+                // Best-effort cache write — failure here just means the
+                // next consolidation pass re-embeds.
+                services
+                    .embeddings_by_id
+                    .write()
+                    .await
+                    .insert(id.to_string(), emb.clone());
+                emb
+            }
+        },
     };
 
     // RecMem recurrence gate (arXiv:2605.16045). Disabled by default
@@ -472,24 +476,40 @@ async fn consolidate_one(
                 .filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 1.0)
                 .unwrap_or(0.7);
             let peers = services.session_index.list_active(&session_id).await;
-            let cache = services.embeddings_by_id.read().await;
-            let mut matched = 0usize;
-            for peer_id in peers.iter() {
-                if peer_id == id {
-                    continue;
-                }
-                if let Some(peer_emb) = cache.get(peer_id) {
-                    let sim =
-                        crate::memory::attractors::utils::cosine_similarity(&embedding, peer_emb);
-                    if sim >= threshold {
-                        matched += 1;
-                        if matched >= recurrence_min_count {
-                            break;
+            // Pending peers carry their vector in `embeddings_by_id`;
+            // consolidated peers are scored in place in the arena.
+            let (mut matched, pending_peers) = {
+                let cache = services.embeddings_by_id.read().await;
+                let mut matched = 0usize;
+                let mut pending = std::collections::HashSet::new();
+                for peer_id in peers.iter().filter(|p| p.as_str() != id) {
+                    if let Some(peer_emb) = cache.get(peer_id) {
+                        pending.insert(peer_id.as_str());
+                        let sim = crate::memory::attractors::utils::cosine_similarity(
+                            &embedding, peer_emb,
+                        );
+                        if sim >= threshold {
+                            matched += 1;
                         }
                     }
                 }
+                (matched, pending)
+            };
+            for peer_id in peers.iter() {
+                if matched >= recurrence_min_count {
+                    break;
+                }
+                if peer_id == id || pending_peers.contains(peer_id.as_str()) {
+                    continue;
+                }
+                let sim = services
+                    .attractor_manager
+                    .fragment_similarity(peer_id, &embedding)
+                    .await;
+                if sim.is_some_and(|s| s >= threshold) {
+                    matched += 1;
+                }
             }
-            drop(cache);
             if matched < recurrence_min_count {
                 // Mark the fragment so a future reconsideration pass
                 // can find it, then return Deferred without running
@@ -607,6 +627,10 @@ async fn consolidate_one(
             .expect("metrics lock poisoned")
             .reconsidered_and_passed += 1;
     }
+
+    // The canonical arena owns the vector now; the pending copy would be
+    // a second resident 4 KB per fragment for the life of the process.
+    services.embeddings_by_id.write().await.remove(id);
 
     services.invalidate_health();
 

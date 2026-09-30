@@ -135,12 +135,13 @@ pub struct ContextNestServices {
     /// rebuilds the strongest signal within a few queries because the
     /// inbox/sessions polling drives retrieve calls naturally.
     pub connection_log: Arc<tokio::sync::RwLock<HashMap<(String, String), u32>>>,
-    /// Per-fragment-id embedding cache. Populated lazily by the
-    /// `/api/v1/fragments?with_embedding=true` handler. Lets a refresh
-    /// of the /field view skip the EmbeddingService entirely on its
-    /// second-and-later calls, turning a 1–5s rebuild into ~50ms map
-    /// reads. Soft-capped at 20k entries (drops oldest-ish on
-    /// overflow). Lost on restart.
+    /// Vectors of fragments **not yet consolidated**, by id: the
+    /// consolidation worker's embed-once buffer across retries, also
+    /// filled by `/api/v1/fragments?with_embedding=true` for pending
+    /// fragments. Consolidation removes the entry on success because the
+    /// canonical vector then lives in the attractor manager's arena
+    /// (read it via `attractor_manager.fragment_vector`). Never filled at
+    /// bootstrap. Soft-capped at 20k entries. Lost on restart.
     pub embeddings_by_id: Arc<tokio::sync::RwLock<HashMap<String, Vec<f32>>>>,
     /// Per-session **intent-text** embedding cache (Option C from the
     /// retrieve-architecture upgrade). Key = session_id; value =
