@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved WAL/checkpoint paths with their sizes and refuses to start against
   a pre-v0.2 checkpoint *before* the build, so the failure arrives in
   milliseconds rather than after a release build.
+- **`make cn-prod`** — start the operator substrate against `CN_PROD_DATA`:
+  preflight, build, *kill every running contextnest first* (`pkill -x
+  contextnest`, SIGTERM then SIGKILL), start detached with the disk-first env
+  (`CONTEXTNEST_VECTOR_ARENA_DIR`, capped workers, `nice -n 10`), wait for
+  `/api/v1/substrate/health`, and print the fragment/basin/edge counts. The
+  log and pid land next to the data. Companions: `cn-prod-stop`,
+  `cn-prod-status` (pid, RSS, checkpoint size, and the cwd the config came
+  from), `cn-prod-logs`. It refuses a missing `CN_PROD_CONFIG` rather than
+  letting a generated config silently re-embed the substrate.
 
 ### Fixed
 

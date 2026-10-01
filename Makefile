@@ -127,12 +127,25 @@ CN_SUBSTRATE  ?= http://$(CN_BIND)
 CN_WAL        ?= $(HOME)/.contextnest/wal.jsonl
 CN_CHECKPOINT ?= $(CN_WAL:.jsonl=.canonical.sqlite)
 CN_BIN        ?= ./target/release/contextnest
+
+# ── Production substrate ────────────────────────────────────────────────
+# The operator's live data lives outside the repo. `cn-prod` is `cn-redeploy`
+# for that data: preflight, build the current checkout, kill every running
+# substrate, start against CN_PROD_DATA, wait for health. The log and pid land
+# next to the data so a later session can find what is running and why.
+CN_PROD_DATA     ?= /Volumes/docker-ssd/Migration/Development/contextnest-data
+CN_PROD_BIND     ?= 127.0.0.1:28080
+CN_PROD_WAL      ?= $(CN_PROD_DATA)/wal.jsonl
+CN_PROD_ARENA    ?= $(CN_PROD_DATA)/arena
+CN_PROD_CHECKPOINT ?= $(CN_PROD_DATA)/wal.canonical.sqlite
+CN_PROD_PORT     ?= $(lastword $(subst :, ,$(CN_PROD_BIND)))
+CN_PROD_CONFIG   ?= ./config.toml
 SINCE         ?= 7d
 PROJECT       ?=
 
 .PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev cn-run-existing \
         cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config \
-        cn-preflight
+        cn-preflight cn-prod cn-prod-stop cn-prod-status cn-prod-logs cn-prod-build cn-prod-preflight
 
 cn-help:
 	@echo "ContextNest substrate targets"
@@ -142,6 +155,10 @@ cn-help:
 	@echo "  make cn-build-fast      — cargo build --profile fast (faster compile, ~ same runtime)"
 	@echo "  make cn-test            — cargo test --tests (full integration suite)"
 	@echo "  make cn-lint            — cargo clippy --tests (correctness gate)"
+	@echo "  make cn-prod            — KILL every running substrate, build, start on CN_PROD_DATA, wait for health"
+	@echo "  make cn-prod-stop       — stop every running contextnest (any checkout, any binary)"
+	@echo "  make cn-prod-status     — what is serving prod: pid, rss, checkpoint size, health"
+	@echo "  make cn-prod-logs       — tail the newest prod serve log"
 	@echo "  make cn-preflight       — print resolved WAL/checkpoint + refuse a pre-v0.2 checkpoint"
 	@echo "  make cn-serve           — run the release binary, WAL on, config.toml loaded"
 	@echo "  make cn-redeploy        — rebuild release + restart cn-serve (deploys a code change)"
@@ -158,6 +175,9 @@ cn-help:
 	@echo "  CN_SUBSTRATE=$(CN_SUBSTRATE)"
 	@echo "  CN_WAL=$(CN_WAL)"
 	@echo "  CN_CHECKPOINT=$(CN_CHECKPOINT)"
+	@echo "  CN_PROD_DATA=$(CN_PROD_DATA)"
+	@echo "  CN_PROD_BIND=$(CN_PROD_BIND)"
+	@echo "  CN_PROD_CONFIG=$(CN_PROD_CONFIG)   (must be a real config; see cn-prod)"
 	@echo "  CN_BIN=$(CN_BIN)"
 	@echo "  SINCE=$(SINCE)   PROJECT=$(PROJECT)"
 	@echo
@@ -239,6 +259,111 @@ cn-redeploy: ## Rebuild release + restart cn-serve (stops the running instance f
 	@echo "stopping running contextnest on $(CN_BIND) (if any)…"
 	-@pkill -f 'contextnest serve' 2>/dev/null; sleep 1
 	$(MAKE) cn-serve
+
+# Stop EVERY contextnest process, regardless of which checkout or binary
+# started it. Blanket on purpose: the failure this exists to prevent is a
+# *stale* instance from another checkout holding the port — on 2026-10-01 one
+# started from the pre-disk-first checkout held 12.3 GB of heap (91 M
+# allocations) against the legacy checkpoint and put the host's compressor into
+# the band that panicked it on 09-30. SIGTERM, wait 10 s, then SIGKILL.
+cn-prod-stop:
+	@echo "stopping every contextnest process (serve or ingest)…"
+	-@pkill -x contextnest 2>/dev/null; \
+	  for _ in 1 2 3 4 5 6 7 8 9 10; do \
+	    pgrep -x contextnest >/dev/null 2>&1 || break; sleep 1; \
+	  done; \
+	  if pgrep -x contextnest >/dev/null 2>&1; then \
+	    echo "still alive after 10s — SIGKILL"; pkill -9 -x contextnest 2>/dev/null; sleep 1; \
+	  fi
+	@if pgrep -x contextnest >/dev/null 2>&1; then \
+	  echo "ERROR: contextnest refuses to die:"; ps -o pid,etime,command= -p $$(pgrep -x contextnest | tr '\n' ',' | sed 's/,$$//'); \
+	  exit 1; \
+	fi
+	@if lsof -nP -iTCP:$(CN_PROD_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "ERROR: port $(CN_PROD_PORT) is still held by something else:"; \
+	  lsof -nP -iTCP:$(CN_PROD_PORT) -sTCP:LISTEN; exit 1; \
+	fi
+	@echo "✓ nothing listening on $(CN_PROD_PORT)"
+
+# Preflight the PROD paths, not the ~/.contextnest defaults.
+cn-prod-preflight:
+	@$(MAKE) --no-print-directory cn-preflight \
+	  CN_WAL=$(CN_PROD_WAL) CN_CHECKPOINT=$(CN_PROD_CHECKPOINT)
+
+cn-prod-build:
+	@if [ -n "$(CN_PROD_SKIP_BUILD)" ]; then \
+	  echo "CN_PROD_SKIP_BUILD set — running $(CN_BIN) as-is"; \
+	else \
+	  $(MAKE) cn-build; \
+	fi
+
+# Build first, kill second, start third — that ordering keeps the downtime to
+# the boot (WAL replay + checkpoint restore, ~100 s on 330 k fragments) rather
+# than the release build.
+cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substrate, build, start against CN_PROD_DATA, wait for health.
+	@if [ ! -d "$(CN_PROD_DATA)" ]; then \
+	  echo "ERROR: missing $(CN_PROD_DATA) — is docker-ssd mounted?"; exit 1; \
+	fi
+	@if [ ! -f "$(CN_PROD_WAL)" ]; then echo "ERROR: missing $(CN_PROD_WAL)"; exit 1; fi
+	@if [ ! -x "$(CN_BIN)" ]; then echo "ERROR: missing $(CN_BIN) — run make cn-build"; exit 1; fi
+	@if [ ! -f "$(CN_PROD_CONFIG)" ]; then \
+	  echo "ERROR: no config at $(CN_PROD_CONFIG)."; \
+	  echo "  The embedding provider in that file must match the one that wrote the"; \
+	  echo "  checkpoint, or the substrate re-embeds all ~330 k fragments at boot."; \
+	  echo "  Do NOT let make cn-config generate one for prod. Point at an existing"; \
+	  echo "  config instead, e.g. CN_PROD_CONFIG=/path/to/your/config.toml."; \
+	  exit 1; \
+	fi
+	@if [ -z "$$DEEPINFRA_API_KEY" ] && [ -z "$$OPENAI_API_KEY" ]; then \
+	  echo "warning: neither DEEPINFRA_API_KEY nor OPENAI_API_KEY is set;"; \
+	  echo "         embedding calls will fail (ingest, consolidation)."; \
+	fi
+	@mkdir -p $(CN_PROD_ARENA)
+	@LOG=$(CN_PROD_DATA)/serve-$$(date +%Y%m%d-%H%M%S).log; \
+	  echo "starting $(CN_BIN) on $(CN_PROD_BIND)"; \
+	  echo "  data: $(CN_PROD_DATA)"; \
+	  echo "  log:  $$LOG"; \
+	  CONTEXTNEST_CONFIG=$(CN_PROD_CONFIG) \
+	  CONTEXTNEST_WAL_PATH=$(CN_PROD_WAL) \
+	  CONTEXTNEST_VECTOR_ARENA_DIR=$(CN_PROD_ARENA) \
+	  CONTEXTNEST_CONSOLIDATION_CONCURRENCY=2 \
+	  CONTEXTNEST_CPU_WORKERS=2 \
+	  TOKIO_WORKER_THREADS=4 \
+	  nohup nice -n 10 $(CN_BIN) serve --bind $(CN_PROD_BIND) > "$$LOG" 2>&1 & \
+	  echo $$! > $(CN_PROD_DATA)/serve.pid; \
+	  echo "  pid:  $$(cat $(CN_PROD_DATA)/serve.pid)"
+	@echo "waiting for /api/v1/substrate/health…"
+	@for i in $$(seq 1 90); do \
+	  if curl -sf -m 3 http://$(CN_PROD_BIND)/api/v1/substrate/health >/dev/null 2>&1; then \
+	    echo "✓ healthy after ~$$((i * 2))s"; exit 0; \
+	  fi; \
+	  sleep 2; \
+	done; \
+	echo "ERROR: not healthy after 180s — tail the log above"; exit 1
+	@curl -s -m 5 http://$(CN_PROD_BIND)/api/v1/substrate/health \
+	  | jq '{fragments: .fragments.total, basins: .basins.count, edges: .connections.edges}'
+	@echo "the process is detached; 'make cn-prod-stop' stops it, 'make cn-prod-logs' follows it"
+
+cn-prod-status: ## Show what is serving prod: pid, footprint, health.
+	@if pgrep -x contextnest >/dev/null 2>&1; then \
+	  for pid in $$(pgrep -x contextnest); do \
+	    printf 'pid %s  up %s  rss %s MB\n' "$$pid" \
+	      "$$(ps -o etime= -p $$pid | tr -d ' ')" \
+	      "$$(( $$(ps -o rss= -p $$pid | tr -d ' ') / 1024 ))"; \
+	    printf '  cwd:  %s   (this is where ./config.toml came from)\n' \
+	      "$$(lsof -a -p $$pid -d cwd -Fn 2>/dev/null | grep '^n' | cut -c2-)"; \
+	  done; \
+	else \
+	  echo "no contextnest running"; \
+	fi
+	@if [ -f "$(CN_PROD_DATA)/serve.pid" ]; then echo "serve.pid: $$(cat $(CN_PROD_DATA)/serve.pid)"; fi
+	@echo "checkpoint: $$(du -h $(CN_PROD_CHECKPOINT) 2>/dev/null | cut -f1)"
+	@curl -s -m 5 http://$(CN_PROD_BIND)/api/v1/substrate/health \
+	  | jq '{fragments: .fragments.total, basins: .basins.count, edges: .connections.edges}' \
+	  || echo "(health endpoint not answering)"
+
+cn-prod-logs: ## Follow the newest prod serve log.
+	@tail -f "$$(ls -t $(CN_PROD_DATA)/serve-*.log | head -1)"
 
 cn-ingest: $(CN_BIN)
 	$(CN_BIN) ingest claude-code \
