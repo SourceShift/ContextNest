@@ -5,14 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] — 2026-09-30
+## [Unreleased]
 
 ### Added
 
-- **Upgrade guide** for v0.1.x → v0.2: backup, compaction, data relocation,
-  recommended runtime settings, verification, rollback and troubleshooting,
-  with timings measured on a 329 k-fragment substrate.
-  ([docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md))
 - **Resident-memory ceiling** (`CONTEXTNEST_MAX_RSS_MB`, default half of
   physical memory): the server warns at 80 % and exits with code 70 at 100 %
   instead of growing until the host's compressor runs out of swap. Sampled
@@ -44,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before; `CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT=1` adopts an old file in place.
 - **`/api/v1/metrics` memory readout** no longer returns a null stub: it
   reports real process RSS via the same platform sampler as the ceiling.
+
+## [0.2.1] — 2026-09-30
+
+### Added
+
+- **Upgrade guide** for v0.1.x → v0.2: backup, compaction, data relocation,
+  recommended runtime settings, verification, rollback and troubleshooting,
+  with timings measured on a 329 k-fragment substrate.
+  ([docs/upgrading/v0.2.0.md](docs/upgrading/v0.2.0.md))
+
+### Fixed
 
 - **`contextnest checkpoint compact` throughput.** It inserted rows in the
   source's insertion order into a fresh `(kind, id)` B-tree with SQLite's
