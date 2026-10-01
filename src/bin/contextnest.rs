@@ -962,6 +962,17 @@ fn default_codex_sessions_dir() -> PathBuf {
 async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting ContextNest server");
 
+    // Start the resident-memory ceiling BEFORE any boot work: checkpoint
+    // restore is where a legacy heap profile lands. `None` means the guard is
+    // off (CONTEXTNEST_MAX_RSS_MB=0 or physical memory unknown).
+    match contextnest::services::resource_monitor::spawn_guard() {
+        Some(ceiling) => tracing::info!(
+            ceiling_mib = ceiling / (1024 * 1024),
+            "Memory guard armed (set CONTEXTNEST_MAX_RSS_MB=0 to disable)"
+        ),
+        None => tracing::info!("Memory guard disabled"),
+    }
+
     let config = load_configuration().await?;
     tracing::info!("Configuration loaded successfully");
 

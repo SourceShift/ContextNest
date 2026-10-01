@@ -53,6 +53,7 @@ pub mod llm_cache_redactor;
 #[cfg(feature = "neo4j-graph")]
 pub mod neo4j_graph;
 pub mod parser;
+pub mod resource_monitor;
 pub mod session_index;
 pub mod tenants;
 pub mod transcript_tail;
