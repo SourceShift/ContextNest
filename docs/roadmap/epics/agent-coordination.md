@@ -347,6 +347,61 @@ glob conflicts.
 
 ---
 
+## Phase 6 — Concord principals + mailbox (P0)
+
+**What.** Phase 1–5 coordinate *who holds which path right now*. They
+say nothing about *who is out there at all*. The mini-ork
+`concord-protocol.md` P0 layer sits on the same `/api/v1/coord/*`
+namespace but solves a different problem: a stable registry of every
+live agent, run, loop, session, or human currently operating on the
+shared codebase, plus a per-principal mailbox so a re-appearing agent
+can drain messages queued while it was offline, plus durable
+worker→principal bindings.
+
+Session ids churn on every Claude Code restart. Without a stable
+handle a lease issued in the prior session is anonymous to the next
+session, and there's no way to message "the loop that was editing
+P1, your last attempt deadlocked; try again with priority 9." The
+principal registry gives those handles durable names.
+
+### Endpoint table
+
+| Method | Path | Purpose |
+|---|---|---|
+| PUT    | `/api/v1/coord/principals/:id` | Upsert principal; returns `{principal, unacked_messages}` |
+| GET    | `/api/v1/coord/principals/:id` | Read one principal with computed status |
+| DELETE | `/api/v1/coord/principals/:id` | Mark `ended` (mailbox + bindings retained) |
+| GET    | `/api/v1/coord/principals[?status=active\|all]` | List ordered by `last_seen DESC` |
+| PUT    | `/api/v1/coord/bindings/:worker_id` | Bind a worker to a principal (replace on re-bind) |
+| GET    | `/api/v1/coord/bindings/:worker_id` | Read a binding |
+| POST   | `/api/v1/coord/principals/:id/messages` | Append to mailbox (≤8 KiB body) |
+| GET    | `/api/v1/coord/principals/:id/messages[?unacked=true]` | List mailbox oldest-first |
+| POST   | `/api/v1/coord/principals/:id/messages/:msg_id/ack` | Idempotent ack |
+
+Wire contract is the mini-ork `concord-protocol.md` document; every
+row above is one section there. Status (`live` / `idle` / `stale` /
+`ended`) is computed at read time from `last_seen`, the stored host,
+and the stored `pids` (the agent's `nix::sys::signal::kill(_, None)`
+probe decides if a pid is still alive on this host).
+
+### Configuration knobs
+
+| Env | Default | Effect |
+|---|---|---|
+| `CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS` | `90` | Threshold for live → idle/stale. Read on every status computation so suites flip it at will. |
+| `CONTEXTNEST_COORD_DB` | unset (next to `wal.jsonl`) | Path of the SQLite file holding principals, bindings and messages. Missing → in-memory (warns at boot). |
+
+### What stays out of scope
+
+The lease plane (`/api/v1/coord/lease*`) stays ephemeral and
+in-memory. Concord principals tell you *who exists*; leases tell you
+*who holds which path right now*. They're independent — a principal
+can exist without holding any lease (most of the time), and a lease
+need not be tied to a registered principal (Phase 1 callers don't
+have to opt in to Phase 6).
+
+---
+
 ## Out of scope
 
 - Cross-machine coordination (multiple hosts). Today's model assumes one

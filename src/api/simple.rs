@@ -8,6 +8,7 @@ use tracing::info;
 use crate::api::agent_outcome;
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::coord;
+use crate::api::coord_principals;
 use crate::api::field;
 use crate::api::graph;
 use crate::api::inbox;
@@ -54,6 +55,7 @@ pub async fn create_simple_app_with_tenants(
     // router's State<S> signature.
     let cc_hooks_router = cc_hooks::create_cc_hooks_router();
     let coord_router = coord::create_coord_router();
+    let coord_principals_router = coord_principals::create_coord_principals_router();
     // PR-6: agent outcome feedback endpoint
     let agent_outcome_router = agent_outcome::create_agent_outcome_router();
     let sessions_router = sessions::create_sessions_router();
@@ -86,6 +88,7 @@ pub async fn create_simple_app_with_tenants(
         .merge(tools_router)
         .merge(cc_hooks_router)
         .merge(coord_router)
+        .merge(coord_principals_router)
         .merge(agent_outcome_router)
         .merge(sessions_router)
         .merge(inbox_router)

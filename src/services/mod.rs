@@ -40,6 +40,7 @@ pub mod compute;
 pub mod consolidation;
 pub mod content_density;
 pub mod context;
+pub mod coord_store;
 pub mod embedding;
 pub mod embedding_providers;
 pub mod exact;
@@ -219,6 +220,13 @@ pub struct ContextNestServices {
     /// is evicted FIFO at [`crate::api::coord::AUDIT_RING_CAP`] so memory
     /// stays bounded. Served by `GET /api/v1/coord/audit[?since=...]`.
     pub coord_audit: Arc<tokio::sync::RwLock<VecDeque<crate::api::coord::AuditRecord>>>,
+    /// Concord P0 durable layer — principals, worker bindings, and per-
+    /// principal mailboxes. In-memory by default (`CoordStore::open_in_memory`)
+    /// so unit tests stay hermetic; the binary entrypoint swaps this for a
+    /// file-backed store at the path derived from `CONTEXTNEST_COORD_DB` or
+    /// the WAL path's sibling directory. Unlike the ephemeral lease plane
+    /// (see `coord_leases`), this survives restarts.
+    pub coord_store: Arc<crate::services::coord_store::CoordStore>,
 }
 
 impl ContextNestServices {
@@ -350,6 +358,7 @@ impl ContextNestServices {
             coord_audit: Arc::new(tokio::sync::RwLock::new(VecDeque::with_capacity(
                 crate::api::coord::AUDIT_RING_CAP,
             ))),
+            coord_store: Arc::new(crate::services::coord_store::CoordStore::open_in_memory()?),
         })
     }
 

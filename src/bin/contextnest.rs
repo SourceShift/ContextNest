@@ -982,6 +982,32 @@ async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::
     let services = ContextNestServices::new(config).await?;
     tracing::info!("Core services initialized successfully");
 
+    // Concord P0 durable layer: swap the in-memory default for a
+    // file-backed store BEFORE any `services.clone()`. Resolution
+    // order:
+    //   1. `CONTEXTNEST_COORD_DB` — explicit path wins.
+    //   2. The WAL path's sibling directory, derived via
+    //      `wal_path_from_env().map(|w| w.with_file_name("coord.db"))`.
+    //      This keeps the durable store next to the WAL under
+    //      `~/.contextnest/`, shared across worktrees.
+    // A resolved path that fails to open ABORTS boot — silent
+    // degradation to in-memory would lose principals across restarts.
+    let coord_path: Option<std::path::PathBuf> = match std::env::var_os("CONTEXTNEST_COORD_DB") {
+        Some(p) if !p.is_empty() => Some(std::path::PathBuf::from(p)),
+        _ => wal_path_from_env().map(|w| w.with_file_name("coord.db")),
+    };
+    let mut services = services;
+    if let Some(path) = coord_path {
+        let store = contextnest::services::coord_store::CoordStore::open(&path)
+            .map_err(std::io::Error::other)?;
+        services.coord_store = std::sync::Arc::new(store);
+        tracing::info!(path = %path.display(), "Concord principals store: file-backed");
+    } else {
+        tracing::warn!(
+            "Concord principals store: in-memory (set CONTEXTNEST_COORD_DB or CONTEXTNEST_WAL_PATH to persist)"
+        );
+    }
+
     // WAL bootstrap: replay any persisted records BEFORE opening the writer.
     // The writer is intentionally `None` during replay so that
     // `store_with_id` (called from the replay loop) does not re-log records
