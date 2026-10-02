@@ -424,7 +424,12 @@ pub fn create_coord_turn_router() -> Router<ContextNestServices> {
 
 /// Parse the raw body bytes + headers into a `TurnInputWithHeaders`.
 /// NEVER errors — a malformed body just becomes `TurnInput::default()`.
-fn parse_input(headers: &HeaderMap, body: &[u8]) -> TurnInputWithHeaders {
+///
+/// `pub` so the P1 `coord_footprints` module can reuse the same
+/// header/body parsing without duplicating the X-Concord-* extractor
+/// logic. Callers (handlers) must NEVER use this to do anything other
+/// than feed `resolve_principal` / lineage resolution.
+pub fn parse_input(headers: &HeaderMap, body: &[u8]) -> TurnInputWithHeaders {
     let inner: TurnInput = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {

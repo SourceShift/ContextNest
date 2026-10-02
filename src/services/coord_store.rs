@@ -19,9 +19,10 @@
 //! only release the lock *before* returning because nothing inside this
 //! module ever awaits.
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -34,6 +35,16 @@ const DEFAULT_PRINCIPAL_TTL_SECS: i64 = 90;
 /// protocol contract; oversized messages get a 400 instead of being
 /// silently truncated.
 const MAX_MESSAGE_BODY_BYTES: usize = 8192;
+
+/// Default retention window (days) for `footprints` rows. Read once
+/// at `open()` time from `CONTEXTNEST_COORD_FOOTPRINT_DAYS` so
+/// parallel test threads don't race on the process env.
+const DEFAULT_FOOTPRINT_RETENTION_DAYS: i64 = 7;
+
+/// Per-direction hop cap used by [`CoordStore::lineage`]. "Direction"
+/// here means the labels.parent chain, walked either upward (towards
+/// an ancestor) or downward (towards a descendant).
+pub const LINEAGE_MAX_HOPS: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoordStoreError {
@@ -160,6 +171,33 @@ pub struct Message {
     pub acked_by: Option<String>,
 }
 
+/// One read or write footprint recorded by the PostToolUse Concord
+/// hook. `mtime_ns` and `size` come from `std::fs::metadata` and may be
+/// `None` when the file vanished between the tool call and our stat
+/// (common for ephemeral /tmp paths).
+#[derive(Debug, Clone, Serialize)]
+pub struct Footprint {
+    pub seq: i64,
+    pub principal_id: String,
+    pub worker_id: String,
+    pub op: String,
+    pub path: String,
+    pub mtime_ns: Option<i64>,
+    pub size: Option<i64>,
+    pub ts: DateTime<Utc>,
+}
+
+/// Summarised view of "another principal wrote this path after seq N",
+/// used by the PreToolUse precheck to render the WAIT advisory.
+#[derive(Debug, Clone, Serialize)]
+pub struct OtherWriter {
+    pub principal_id: String,
+    pub seq: i64,
+    pub ts: DateTime<Utc>,
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+}
+
 /// Computed status. Persisted as lowercase text per the wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalStatus {
@@ -265,6 +303,26 @@ fn principal_ttl_secs() -> i64 {
         .unwrap_or(DEFAULT_PRINCIPAL_TTL_SECS)
 }
 
+/// Footprint retention in days. A value <= 0 or unparseable falls back
+/// to the default. Read once at `open()` so test threads don't race
+/// on the process env while they exercise the substrate.
+fn footprint_retention_days() -> i64 {
+    std::env::var("CONTEXTNEST_COORD_FOOTPRINT_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FOOTPRINT_RETENTION_DAYS)
+}
+
+/// Prune every footprint row older than `days` days from `now`. The
+/// `ts` column is fixed-width RFC3339 microseconds, so `ts < cutoff`
+/// compares lexicographically the same way it compares
+/// chronologically — no ISO parser required.
+fn prune_old_footprints(conn: &Connection, days: i64) -> rusqlite::Result<usize> {
+    let cutoff = fmt_ts(Utc::now() - ChronoDuration::days(days));
+    conn.execute("DELETE FROM footprints WHERE ts < ?1", params![cutoff])
+}
+
 /// Compute status from a stored principal at `now`.
 pub fn status_at(p: &Principal, now: DateTime<Utc>) -> PrincipalStatus {
     if p.ended_at.is_some() {
@@ -350,6 +408,18 @@ const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_messages_principal ON messages(principal_id, id);
     CREATE INDEX IF NOT EXISTS idx_bindings_principal ON bindings(principal_id);
+    CREATE TABLE IF NOT EXISTS footprints (
+        seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+        principal_id TEXT NOT NULL,
+        worker_id    TEXT NOT NULL,
+        op           TEXT NOT NULL CHECK(op IN ('read','write')),
+        path         TEXT NOT NULL,
+        mtime_ns     INTEGER,
+        size         INTEGER,
+        ts           TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_footprints_path ON footprints(path, seq);
+    CREATE INDEX IF NOT EXISTS idx_footprints_principal_path ON footprints(principal_id, path, seq);
 ";
 
 pub struct CoordStore {
@@ -381,6 +451,8 @@ impl CoordStore {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        let days = footprint_retention_days();
+        prune_old_footprints(&conn, days)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -390,6 +462,8 @@ impl CoordStore {
     pub fn open_in_memory() -> CoordStoreResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        let days = footprint_retention_days();
+        prune_old_footprints(&conn, days)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -961,6 +1035,209 @@ impl CoordStore {
         )?;
         row.into_message()
     }
+
+    // ────────────── footprints (Concord P1) ──────────────
+
+    /// Record one read/write footprint for `(principal_id, worker_id)`
+    /// against `path`. Returns the new autoincrement `seq`. The
+    /// `op` arg must be `"read"` or `"write"`; anything else is a
+    /// programmer error and is reported as `InvalidBody` so the
+    /// PostToolUse hook fails loudly rather than silently mis-classifying.
+    pub fn record_footprint(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        op: &str,
+        path: &str,
+        mtime_ns: Option<i64>,
+        size: Option<i64>,
+    ) -> CoordStoreResult<i64> {
+        if op != "read" && op != "write" {
+            return Err(CoordStoreError::InvalidBody(format!(
+                "footprint op must be 'read' or 'write', got {op:?}"
+            )));
+        }
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO footprints
+                (principal_id, worker_id, op, path, mtime_ns, size, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![principal_id, worker_id, op, path, mtime_ns, size, now_str],
+        )?;
+        let seq: i64 = conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
+        Ok(seq)
+    }
+
+    /// Look up a single footprint by its autoincrement seq. Returns
+    /// `None` when the row was pruned out of the retention window.
+    pub fn get_footprint(&self, seq: i64) -> CoordStoreResult<Option<Footprint>> {
+        let conn = self.lock();
+        let row: Option<FootprintRow> = conn
+            .query_row(
+                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, ts
+                 FROM footprints WHERE seq = ?1",
+                params![seq],
+                FootprintRow::from_row,
+            )
+            .optional()?;
+        row.map(FootprintRow::into_footprint).transpose()
+    }
+
+    /// Newest `seq` ever recorded against `(principal_id, path)`,
+    /// either op. Used by the precheck to find "what's the last
+    /// footprint this principal left on this file?".
+    pub fn last_footprint_seq(
+        &self,
+        principal_id: &str,
+        path: &str,
+    ) -> CoordStoreResult<Option<i64>> {
+        let conn = self.lock();
+        // MAX() over an empty set is NULL; we read it as `Option<i64>`
+        // so the no-rows case maps to `None`.
+        let max: Option<i64> = conn.query_row(
+            "SELECT MAX(seq) FROM footprints
+                 WHERE principal_id = ?1 AND path = ?2",
+            params![principal_id, path],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
+        Ok(max)
+    }
+
+    /// The set of principals in `principal_id`'s lineage, capped at
+    /// `max_hops` per direction. Self is always included. The
+    /// traversal is BFS-like with a visited set so cycles (a→b→a)
+    /// don't loop forever.
+    ///
+    /// Lineage = ancestors (walk `labels.parent` upward) ∪
+    /// descendants (principals whose `labels.parent` equals a lineage
+    /// member, walk downward). Siblings and cousins are NOT lineage.
+    /// That matches the brief's "labels.parent chains in either
+    /// direction" reading — revalidate if the design doc changes.
+    pub fn lineage(
+        &self,
+        principal_id: &str,
+        max_hops: usize,
+    ) -> CoordStoreResult<HashSet<String>> {
+        let conn = self.lock();
+        // Two parallel queues for the BFS. The visited set grows as
+        // we pull a principal off either queue so a cycle that
+        // touches the same node from both sides still terminates.
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut up: VecDeque<(String, usize)> = VecDeque::new();
+        let mut down: VecDeque<(String, usize)> = VecDeque::new();
+        visited.insert(principal_id.to_string());
+        up.push_back((principal_id.to_string(), 0));
+        down.push_back((principal_id.to_string(), 0));
+
+        while let Some((pid, depth)) = up.pop_front() {
+            if depth > 0 {
+                // depth=0 is self — already in `visited`.
+                visited.insert(pid.clone());
+            }
+            if depth >= max_hops {
+                continue;
+            }
+            // Walk up via labels.parent (a JSON string).
+            let parent: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(labels, '$.parent') FROM principals
+                     WHERE principal_id = ?1 AND json_valid(labels) = 1",
+                    params![&pid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(p) = parent {
+                if !p.is_empty() && visited.insert(p.clone()) {
+                    up.push_back((p, depth + 1));
+                }
+            }
+        }
+        while let Some((pid, depth)) = down.pop_front() {
+            if depth > 0 {
+                visited.insert(pid.clone());
+            }
+            if depth >= max_hops {
+                continue;
+            }
+            // Walk down: every principal whose labels.parent == pid.
+            let mut stmt = conn.prepare(
+                "SELECT principal_id FROM principals
+                 WHERE json_valid(labels) = 1
+                   AND json_extract(labels, '$.parent') = ?1",
+            )?;
+            let children: Vec<String> = stmt
+                .query_map(params![&pid], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for c in children {
+                if visited.insert(c.clone()) {
+                    down.push_back((c, depth + 1));
+                }
+            }
+        }
+        Ok(visited)
+    }
+
+    /// Distinct write footprints on `path` with `seq > after_seq`,
+    /// excluding every principal in `exclude`, deduped to one row per
+    /// principal (the newest seq/ts for that principal). Carries the
+    /// writer's `harness` and `cwd` via LEFT JOIN so the precheck
+    /// advisory can render the `<harness>, <cwd basename>` tuple.
+    /// Ordered newest seq first, capped at `limit`.
+    pub fn writes_after(
+        &self,
+        path: &str,
+        after_seq: i64,
+        exclude: &HashSet<String>,
+        limit: usize,
+    ) -> CoordStoreResult<Vec<OtherWriter>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Build a JSON array of excluded ids and pass it through
+        // `json_each` so the IN list doesn't have to be a dynamic
+        // number of `?` placeholders. Empty set → json_each over
+        // '[]' returns no rows, which is the right behavior.
+        let exclude_json = serde_json::to_string(&exclude.iter().cloned().collect::<Vec<_>>())?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.principal_id, MAX(f.seq), MAX(f.ts), p.harness, p.cwd
+             FROM footprints f
+             LEFT JOIN principals p ON p.principal_id = f.principal_id
+             WHERE f.op = 'write' AND f.path = ?1 AND f.seq > ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(?3) AS ex
+                   WHERE ex.value = f.principal_id
+               )
+             GROUP BY f.principal_id
+             ORDER BY MAX(f.seq) DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![path, after_seq, exclude_json, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(rows.len());
+        for (pid, seq, ts, harness, cwd) in rows {
+            out.push(OtherWriter {
+                principal_id: pid,
+                seq,
+                ts: parse_ts(&ts)?,
+                harness,
+                cwd,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn status_str(s: &str) -> PrincipalStatus {
@@ -1090,6 +1367,45 @@ impl MessageRow {
             delivered_to: self.delivered_to,
             acked_at: self.acked_at.as_deref().map(parse_ts).transpose()?,
             acked_by: self.acked_by,
+        })
+    }
+}
+
+struct FootprintRow {
+    seq: i64,
+    principal_id: String,
+    worker_id: String,
+    op: String,
+    path: String,
+    mtime_ns: Option<i64>,
+    size: Option<i64>,
+    ts: String,
+}
+
+impl FootprintRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            seq: r.get(0)?,
+            principal_id: r.get(1)?,
+            worker_id: r.get(2)?,
+            op: r.get(3)?,
+            path: r.get(4)?,
+            mtime_ns: r.get(5)?,
+            size: r.get(6)?,
+            ts: r.get(7)?,
+        })
+    }
+
+    fn into_footprint(self) -> CoordStoreResult<Footprint> {
+        Ok(Footprint {
+            seq: self.seq,
+            principal_id: self.principal_id,
+            worker_id: self.worker_id,
+            op: self.op,
+            path: self.path,
+            mtime_ns: self.mtime_ns,
+            size: self.size,
+            ts: parse_ts(&self.ts)?,
         })
     }
 }
@@ -1346,5 +1662,162 @@ mod tests {
         s.upsert_principal("loop:x", PrincipalUpsert::default())
             .unwrap();
         assert!(s.get_principal("loop:x").unwrap().is_some());
+    }
+
+    // ────────────── footprint tests (Concord P1) ──────────────
+
+    fn upsert_with_labels(s: &CoordStore, id: &str, parent: Option<&str>) {
+        let mut upsert = PrincipalUpsert::default();
+        upsert.harness = Some("claude-code".into());
+        if let Some(p) = parent {
+            upsert.labels = Some(json!({ "parent": p }));
+        } else {
+            upsert.labels = Some(json!({}));
+        }
+        s.upsert_principal(id, upsert).unwrap();
+    }
+
+    #[test]
+    fn record_footprint_returns_seq_and_rejects_bad_op() {
+        let s = store();
+        let seq = s
+            .record_footprint("loop:a", "w1", "read", "/x.rs", None, None)
+            .unwrap();
+        assert!(seq > 0);
+        let got = s.get_footprint(seq).unwrap().expect("present");
+        assert_eq!(got.principal_id, "loop:a");
+        assert_eq!(got.worker_id, "w1");
+        assert_eq!(got.op, "read");
+        assert_eq!(got.path, "/x.rs");
+        assert!(got.mtime_ns.is_none());
+        assert!(got.size.is_none());
+        // Bad op → InvalidBody (no row written).
+        let err = s
+            .record_footprint("loop:a", "w1", "delete", "/x.rs", None, None)
+            .unwrap_err();
+        assert!(matches!(err, CoordStoreError::InvalidBody(_)));
+    }
+
+    #[test]
+    fn last_footprint_seq_returns_max_across_ops() {
+        let s = store();
+        let r1 = s
+            .record_footprint("loop:a", "w1", "read", "/x.rs", None, None)
+            .unwrap();
+        let w1 = s
+            .record_footprint("loop:a", "w1", "write", "/x.rs", Some(1), Some(2))
+            .unwrap();
+        let r2 = s
+            .record_footprint("loop:a", "w1", "read", "/x.rs", None, None)
+            .unwrap();
+        assert_eq!(s.last_footprint_seq("loop:a", "/x.rs").unwrap(), Some(r2));
+        assert!(r2 > w1 && w1 > r1);
+        // Other path → None.
+        assert!(s.last_footprint_seq("loop:a", "/y.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn lineage_walks_up_and_down_with_three_hop_cap() {
+        let s = store();
+        // Chain: a ← b ← c ← d (a is root, d is leaf-3).
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", Some("loop:a"));
+        upsert_with_labels(&s, "loop:c", Some("loop:b"));
+        upsert_with_labels(&s, "loop:d", Some("loop:c"));
+        // Self + 3 hops up = {a, b, c, d}.
+        let lin = s.lineage("loop:d", LINEAGE_MAX_HOPS).unwrap();
+        assert!(lin.contains("loop:d"));
+        assert!(lin.contains("loop:c"));
+        assert!(lin.contains("loop:b"));
+        assert!(lin.contains("loop:a"));
+        // 4th ancestor is past the cap.
+        upsert_with_labels(&s, "loop:e", Some("loop:d"));
+        let lin = s.lineage("loop:e", LINEAGE_MAX_HOPS).unwrap();
+        assert!(lin.contains("loop:e"));
+        assert!(lin.contains("loop:d"));
+        assert!(lin.contains("loop:c"));
+        assert!(lin.contains("loop:b"));
+        assert!(!lin.contains("loop:a"), "4th ancestor must be excluded");
+    }
+
+    #[test]
+    fn lineage_walks_downward_too() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", Some("loop:a"));
+        upsert_with_labels(&s, "loop:c", Some("loop:b"));
+        let lin = s.lineage("loop:a", LINEAGE_MAX_HOPS).unwrap();
+        assert!(lin.contains("loop:a"));
+        assert!(lin.contains("loop:b"));
+        assert!(lin.contains("loop:c"));
+    }
+
+    #[test]
+    fn lineage_handles_cycle_without_infinite_loop() {
+        let s = store();
+        // a → b → a (cycle). Visited set must break the loop.
+        upsert_with_labels(&s, "loop:a", Some("loop:b"));
+        upsert_with_labels(&s, "loop:b", Some("loop:a"));
+        let lin = s.lineage("loop:a", LINEAGE_MAX_HOPS).unwrap();
+        assert!(lin.contains("loop:a"));
+        assert!(lin.contains("loop:b"));
+        // Visits terminate — if the BFS looped, this test would never
+        // return. A runtime cap on BFS step count would also be
+        // defensible; for now correctness is what we assert.
+    }
+
+    #[test]
+    fn writes_after_excludes_lineage_and_dedupes() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", None);
+        upsert_with_labels(&s, "loop:c", None);
+        // After the user "loop:a" read the file, "loop:b" and "loop:c"
+        // each wrote twice. The query must:
+        //   - exclude the caller's lineage (here, {a, b}? — only "a"
+        //     is the caller's lineage; "b" is NOT, so it appears),
+        //   - dedupe to one row per principal (the newest seq/ts),
+        //   - order newest first.
+        let after = 0;
+        let _r1 = s
+            .record_footprint("loop:a", "w0", "read", "/f.rs", None, None)
+            .unwrap();
+        let _w1 = s
+            .record_footprint("loop:b", "w1", "write", "/f.rs", Some(1), Some(10))
+            .unwrap();
+        let _w2 = s
+            .record_footprint("loop:b", "w1", "write", "/f.rs", Some(2), Some(20))
+            .unwrap();
+        let _w3 = s
+            .record_footprint("loop:c", "w2", "write", "/f.rs", Some(3), Some(30))
+            .unwrap();
+        let _w4 = s
+            .record_footprint("loop:c", "w2", "write", "/f.rs", Some(4), Some(40))
+            .unwrap();
+        // Exclude only self (loop:a).
+        let mut excl = std::collections::HashSet::new();
+        excl.insert("loop:a".to_string());
+        let out = s.writes_after("/f.rs", after, &excl, 3).unwrap();
+        assert_eq!(out.len(), 2, "two distinct writers, deduped");
+        // Newest seq first.
+        assert_eq!(out[0].principal_id, "loop:c");
+        assert_eq!(out[0].seq, _w4);
+        assert_eq!(out[1].principal_id, "loop:b");
+        assert_eq!(out[1].seq, _w2);
+        // Harness + cwd ride along via LEFT JOIN.
+        assert_eq!(out[0].harness.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn writes_after_empty_exclude_returns_all_writers() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", None);
+        s.record_footprint("loop:b", "w1", "write", "/f.rs", None, None)
+            .unwrap();
+        let excl = std::collections::HashSet::new();
+        let out = s.writes_after("/f.rs", 0, &excl, 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].principal_id, "loop:b");
     }
 }
