@@ -135,7 +135,7 @@ sha2 = "0.11"
 rsa = "0.9"
 p256 = "0.13"
 elliptic-curve = "0.13"
-nix = { version = "0.31", features = ["signal", "process", "user", "resource"] }
+nix = { version = "0.31", features = ["signal", "process", "user", "resource", "hostname"] }
 
 # Compression for response middleware
 flate2 = "1.0"

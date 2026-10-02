@@ -13,6 +13,7 @@ pub use crate::services::HealthStatus;
 pub mod agent_outcome;
 pub mod cc_hooks;
 pub mod coord;
+pub mod coord_principals;
 pub mod field;
 pub mod graph;
 pub mod inbox;
