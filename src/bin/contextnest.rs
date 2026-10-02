@@ -551,6 +551,18 @@ fn install_to_target(
                 label,
                 substrate.trim_end_matches('/'),
             );
+        } else if let Some(label) = ev.strip_suffix(" (concord precheck)") {
+            println!(
+                "        + {:<22} -> {}/api/v1/coord/precheck",
+                label,
+                substrate.trim_end_matches('/'),
+            );
+        } else if let Some(label) = ev.strip_suffix(" (concord footprints)") {
+            println!(
+                "        + {:<22} -> {}/api/v1/coord/footprints",
+                label,
+                substrate.trim_end_matches('/'),
+            );
         } else {
             println!(
                 "        + {:<22} -> {}/api/v1/cc/hook/{}",
@@ -571,11 +583,15 @@ fn install_to_target(
 /// at a new substrate gets a fresh entry next to the old one.
 ///
 /// `concord = true` also appends a synchronous `/api/v1/coord/turn`
-/// entry to SessionStart and UserPromptSubmit, one per event, detected
-/// by the bare substring `/api/v1/coord/turn` (a re-run against a new
-/// substrate URL therefore still skips — the brief is explicit on
-/// this asymmetry). The synchronous entry is what Claude Code reads
-/// on each turn; the async entries continue to do real-time ingest.
+/// entry to SessionStart and UserPromptSubmit (one per event), a
+/// synchronous `/api/v1/coord/precheck` entry under PreToolUse
+/// (Edit-class tools only), and an async
+/// `/api/v1/coord/footprints` entry under PostToolUse (Read +
+/// Edit-class). Each is detected by the bare substring of its URL —
+/// a re-run against a new substrate URL therefore still skips. The
+/// turn hook delivers the principal's mailbox per prompt; the
+/// precheck emits a per-Edit advisory; the footprints hook records
+/// every read/write so a later precheck can compare.
 fn merge_cc_hook_entries_with(
     existing: &Value,
     substrate: &str,
@@ -710,9 +726,87 @@ fn merge_cc_hook_entries_with(
             // cc_hook_path_segment's table).
             added.push(format!("{event_name} (concord turn)"));
         }
+
+        // Synchronous PreToolUse /api/v1/coord/precheck entry on
+        // Edit-class tools only. Same idempotency rule: skip if any
+        // existing command contains "/api/v1/coord/precheck".
+        let precheck_url = format!("{}/api/v1/coord/precheck", substrate);
+        let precheck_cmd = render_concord_precheck_command(&precheck_url);
+        let precheck_entry = json!({
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": precheck_cmd,
+                }
+            ]
+        });
+        if !entry_already_present(hooks_obj, "PreToolUse", "/api/v1/coord/precheck") {
+            let arr = hooks_obj
+                .entry("PreToolUse".to_string())
+                .or_insert_with(|| json!([]));
+            if !arr.is_array() {
+                *arr = json!([]);
+            }
+            arr.as_array_mut()
+                .expect("just ensured array")
+                .push(precheck_entry);
+            added.push("PreToolUse (concord precheck)".to_string());
+        }
+
+        // Async PostToolUse /api/v1/coord/footprints entry on
+        // Read + Edit-class tools. Same idempotency rule.
+        let footprints_url = format!("{}/api/v1/coord/footprints", substrate);
+        let footprints_cmd = render_concord_footprints_command(&footprints_url);
+        let footprints_entry = json!({
+            "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": footprints_cmd,
+                }
+            ]
+        });
+        if !entry_already_present(hooks_obj, "PostToolUse", "/api/v1/coord/footprints") {
+            let arr = hooks_obj
+                .entry("PostToolUse".to_string())
+                .or_insert_with(|| json!([]));
+            if !arr.is_array() {
+                *arr = json!([]);
+            }
+            arr.as_array_mut()
+                .expect("just ensured array")
+                .push(footprints_entry);
+            added.push("PostToolUse (concord footprints)".to_string());
+        }
     }
 
     (root, added)
+}
+
+/// True iff any command under `event_name` in `hooks_obj` contains
+/// `needle` (the URL substring). Used by the precheck/footprints
+/// appenders to detect an existing entry before pushing a duplicate.
+fn entry_already_present(
+    hooks_obj: &serde_json::Map<String, Value>,
+    event_name: &str,
+    needle: &str,
+) -> bool {
+    let Some(arr) = hooks_obj.get(event_name).and_then(Value::as_array) else {
+        return false;
+    };
+    for entry in arr {
+        if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
+            for hook in hooks {
+                if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                    if command.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Thin wrapper that reads `CONTEXTNEST_CONCORD_HOOKS` from the
@@ -1252,6 +1346,23 @@ fn render_hook_command(url: &str) -> String {
 /// - X-Concord-* headers carry the principal/pid/pane/tty so the
 ///   server can bind the session without re-deriving them.
 fn render_concord_turn_command(url: &str) -> String {
+    render_concord_synchronous_command(url)
+}
+
+/// Render the bash command body for the synchronous PreToolUse
+/// `/api/v1/coord/precheck` hook. Same body shape as the turn hook
+/// (URL-generic, short timeout, `|| true`, X-Concord-* headers,
+/// never backgrounded) — the only thing that changes between the
+/// two callers is the URL.
+fn render_concord_precheck_command(url: &str) -> String {
+    render_concord_synchronous_command(url)
+}
+
+/// Shared body for the two synchronous Concord hooks (turn +
+/// precheck). Pulled out so the two callers can't drift; see the
+/// `render_concord_turn_command` doc comment for the constraints
+/// (`-m 2`, `|| true`, X-Concord-* headers, no `mktemp`).
+fn render_concord_synchronous_command(url: &str) -> String {
     let default_headers = if url.starts_with("http://localhost:28080/")
         || url.starts_with("http://127.0.0.1:28080/")
     {
@@ -1262,6 +1373,27 @@ fn render_concord_turn_command(url: &str) -> String {
     let url = url.replace('\'', "'\\''");
     format!(
         r#"H="${{CONTEXTNEST_OPERATOR_HEADERS:-{default_headers}}}"; set --; if [ -r "$H" ]; then set -- --header "@$H"; fi; curl "$@" -sf -m 2 -X POST '{url}' -H 'content-type: application/json' -H "X-Concord-Principal: ${{CONCORD_PRINCIPAL:-}}" -H "X-Concord-Pane: ${{TMUX_PANE:-}}" -H "X-Concord-Tty: $(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')" -H "X-Concord-Pid: $PPID" --data-binary @- 2>/dev/null || true"#,
+    )
+}
+
+/// Render the bash command body for the async PostToolUse
+/// `/api/v1/coord/footprints` hook. Like the four ingest hooks
+/// (render_hook_command) this is a fire-and-forget backgrounded
+/// curl — Claude never waits for the substrate to acknowledge a
+/// read/write footprint. The X-Concord-* headers let the server
+/// bind `session_id` to a principal without re-deriving the
+/// lineage id.
+fn render_concord_footprints_command(url: &str) -> String {
+    let default_headers = if url.starts_with("http://localhost:28080/")
+        || url.starts_with("http://127.0.0.1:28080/")
+    {
+        "$HOME/.contextnest/tenant-auth/operator.headers"
+    } else {
+        ""
+    };
+    let url = url.replace('\'', "'\\''");
+    format!(
+        r#"F=$(mktemp /tmp/cnhk-XXXXXX); cat > "$F"; (H="${{CONTEXTNEST_OPERATOR_HEADERS:-{default_headers}}}"; set --; if [ -r "$H" ]; then set -- --header "@$H"; fi; curl "$@" -s -m 10 --retry 3 --retry-connrefused --retry-delay 1 -X POST '{url}' -H 'content-type: application/json' -H "X-Concord-Principal: ${{CONCORD_PRINCIPAL:-}}" -H "X-Concord-Pane: ${{TMUX_PANE:-}}" -H "X-Concord-Tty: $(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')" -H "X-Concord-Pid: $PPID" --data-binary @"$F" >/dev/null 2>&1; rm -f "$F") &"#,
     )
 }
 
@@ -1662,6 +1794,232 @@ mod render_hook_command_tests {
             !off_default.contains("$HOME/.contextnest"),
             "off-default substrate must NOT inject tenant headers path; got: {off_default}",
         );
+    }
+
+    // ─────────────────── merge_cc_hook_p1_tests ───────────────────
+    //
+    // P1 DoD 8: install-hooks adds the synchronous PreToolUse
+    // /api/v1/coord/precheck entry and the async PostToolUse
+    // /api/v1/coord/footprints entry exactly once, never duplicates
+    // an operator-custom entry with the same URL, leaves the P0b
+    // async + turn entries byte-identical, and respects the
+    // concord=false opt-out (no PreToolUse / PostToolUse keys are
+    // created at all in that mode).
+    //
+    // Every test path below contains `merge_cc_hook` so the
+    // verifier `cargo test --bin contextnest merge_cc_hook` finds
+    // them all.
+
+    #[test]
+    fn merge_cc_hook_fresh_settings_adds_precheck_and_footprints_entries() {
+        let original = serde_json::json!({});
+        let substrate = "http://localhost:28080";
+        let (updated, added) = super::merge_cc_hook_entries_with(&original, substrate, true);
+
+        // PreToolUse: exactly one entry, with the Edit-class matcher.
+        let pre = updated["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("pre array");
+        assert_eq!(
+            pre.len(),
+            1,
+            "exactly one PreToolUse entry on fresh settings"
+        );
+        assert_eq!(
+            pre[0]["matcher"].as_str(),
+            Some("Edit|Write|MultiEdit|NotebookEdit"),
+            "matcher is the Edit-class set",
+        );
+        let pre_cmd = pre[0]["hooks"][0]["command"].as_str().expect("cmd");
+        assert!(pre_cmd.contains("/api/v1/coord/precheck"));
+        assert!(pre_cmd.contains("-m 2"), "short timeout; got: {pre_cmd}");
+        assert!(
+            pre_cmd.contains("|| true"),
+            "must swallow curl errors; got: {pre_cmd}"
+        );
+        assert!(pre_cmd.contains("X-Concord-Principal"));
+        assert!(
+            !pre_cmd.trim_end().ends_with('&'),
+            "PreToolUse must not be backgrounded; got: {pre_cmd}",
+        );
+
+        // PostToolUse: exactly one entry, with the Read+Edit-class
+        // matcher. Async → backgrounded, mktemp dance, m 10.
+        let post = updated["hooks"]["PostToolUse"]
+            .as_array()
+            .expect("post array");
+        assert_eq!(
+            post.len(),
+            1,
+            "exactly one PostToolUse entry on fresh settings"
+        );
+        assert_eq!(
+            post[0]["matcher"].as_str(),
+            Some("Read|Edit|Write|MultiEdit|NotebookEdit"),
+            "matcher is Read + Edit-class set",
+        );
+        let post_cmd = post[0]["hooks"][0]["command"].as_str().expect("cmd");
+        assert!(post_cmd.contains("/api/v1/coord/footprints"));
+        assert!(
+            post_cmd.contains("mktemp /tmp/cnhk-"),
+            "mktemp dance; got: {post_cmd}"
+        );
+        assert!(post_cmd.contains("X-Concord-Principal"));
+        assert!(
+            post_cmd.trim_end().ends_with('&'),
+            "PostToolUse must be backgrounded; got: {post_cmd}",
+        );
+
+        // Added labels cover the two new events.
+        assert!(
+            added.iter().any(|s| s == "PreToolUse (concord precheck)"),
+            "precheck label present"
+        );
+        assert!(
+            added
+                .iter()
+                .any(|s| s == "PostToolUse (concord footprints)"),
+            "footprints label present"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1_rerun_is_idempotent() {
+        let substrate = "http://localhost:28080";
+        let (first, _) = super::merge_cc_hook_entries_with(&serde_json::json!({}), substrate, true);
+        let (second, added) = super::merge_cc_hook_entries_with(&first, substrate, true);
+        assert_eq!(second, first, "second merge is a no-op");
+        assert!(
+            !added
+                .iter()
+                .any(|s| s.contains("precheck") || s.contains("footprints")),
+            "no precheck/footprints labels on a re-run; got: {added:?}"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1_concord_false_omits_precheck_and_footprints() {
+        let (updated, added) = super::merge_cc_hook_entries_with(
+            &serde_json::json!({}),
+            "http://localhost:28080",
+            false,
+        );
+        // No PreToolUse / PostToolUse keys at all.
+        assert!(
+            updated["hooks"].get("PreToolUse").is_none(),
+            "PreToolUse must not be created when concord=false"
+        );
+        assert!(
+            updated["hooks"].get("PostToolUse").is_none(),
+            "PostToolUse must not be created when concord=false"
+        );
+        assert!(
+            !added
+                .iter()
+                .any(|s| s.contains("precheck") || s.contains("footprints")),
+            "no precheck/footprints labels when concord=false"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1_preserves_existing_custom_precheck_entry() {
+        // Operator has a custom command that already contains
+        // /api/v1/coord/precheck. The installer must NOT add a
+        // second one.
+        let custom = "curl -X POST http://example/api/v1/coord/precheck -H 'x: y'";
+        let original = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks":[{"type":"command","command": custom}]}
+                ]
+            }
+        });
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
+        let arr = updated["hooks"]["PreToolUse"].as_array().expect("array");
+        // Only the operator's precheck entry; no second one.
+        assert_eq!(
+            arr.len(),
+            1,
+            "operator's precheck must be preserved, not duplicated"
+        );
+        assert_eq!(arr[0]["hooks"][0]["command"].as_str(), Some(custom));
+        assert!(
+            !added.iter().any(|s| s.contains("precheck")),
+            "no precheck label when one already exists; got: {added:?}"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1_appends_after_existing_custom_posttooluse_entry() {
+        // Operator's custom PostToolUse entry stays at index 0,
+        // byte-identical. The new concord entry is appended at
+        // index 1.
+        let custom = "echo custom-posttooluse";
+        let original = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "Bash", "hooks":[{"type":"command","command": custom}]}
+                ]
+            }
+        });
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
+        let arr = updated["hooks"]["PostToolUse"].as_array().expect("array");
+        assert_eq!(arr.len(), 2, "custom + new = 2 entries");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"].as_str(),
+            Some(custom),
+            "operator's entry at index 0, byte-identical",
+        );
+        assert!(
+            arr[1]["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("/api/v1/coord/footprints")),
+            "new footprints entry appended at index 1",
+        );
+        assert!(
+            added
+                .iter()
+                .any(|s| s == "PostToolUse (concord footprints)"),
+            "footprints label reported"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1_async_and_turn_entries_byte_identical_with_concord() {
+        // Independent baseline: concord=false renders ONLY the async ingest
+        // entries, through a different code path. With P1 on, Stop and
+        // TaskCompleted must equal it byte-for-byte, and SessionStart /
+        // UserPromptSubmit must equal it once their single coord/turn entry
+        // is removed.
+        let substrate = "http://localhost:28080";
+        let (with_p1, _) =
+            super::merge_cc_hook_entries_with(&serde_json::json!({}), substrate, true);
+        let (async_only, _) =
+            super::merge_cc_hook_entries_with(&serde_json::json!({}), substrate, false);
+        let is_turn = |e: &serde_json::Value| {
+            e["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("/api/v1/coord/turn"))
+        };
+        for event in ["SessionStart", "UserPromptSubmit", "Stop", "TaskCompleted"] {
+            let with = with_p1["hooks"][event].as_array().expect("with array");
+            let base = async_only["hooks"][event].as_array().expect("base array");
+            let turn_entries = with.iter().filter(|e| is_turn(e)).count();
+            let expected_turn = usize::from(matches!(event, "SessionStart" | "UserPromptSubmit"));
+            assert_eq!(
+                turn_entries, expected_turn,
+                "{event}: coord/turn entry count"
+            );
+            let without_turn: Vec<&serde_json::Value> =
+                with.iter().filter(|e| !is_turn(e)).collect();
+            assert_eq!(
+                serde_json::to_string(&without_turn).unwrap(),
+                serde_json::to_string(&base.iter().collect::<Vec<_>>()).unwrap(),
+                "{event}: async ingest entries must be byte-identical with and without Concord",
+            );
+        }
     }
 }
 

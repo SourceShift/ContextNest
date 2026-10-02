@@ -178,6 +178,15 @@ pub struct CoordMetrics {
     pub coord_leases_granted: u64,
     /// Cumulative count of `queued` responses (conflicts at acquire time).
     pub coord_queued_total: u64,
+    /// Cumulative count of `/api/v1/coord/precheck` requests, including
+    /// the no-op returns (not-a-file-tool, unresolved path, etc). The
+    /// hook matcher filters to Edit-class tools, so the practical
+    /// denominator matches the installed hook.
+    pub coord_precheck_total: u64,
+    /// Cumulative count of `/api/v1/coord/precheck` responses where
+    /// `warn=true` (i.e. another non-lineage principal wrote the
+    /// target path after the caller's last footprint on it).
+    pub coord_precheck_warn: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the
