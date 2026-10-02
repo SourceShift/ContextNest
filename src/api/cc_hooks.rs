@@ -411,15 +411,29 @@ async fn pretool_gate(
 
     // Coordination consult: if this tool targets a file another agent holds
     // a conflicting write lease on, enforce strict-mode deny or append the
-    // Phase-1 WAIT advisory. The session_id doubles as the agent identity
-    // for the lease registry.
+    // Phase-1 WAIT advisory. The agent identity is the session's bound
+    // principal (set by `/api/v1/coord/turn`); an unbound session falls
+    // back to the raw session_id so the existing behaviour is preserved
+    // for sessions that haven't fired a turn yet.
     if let Some(path) = req
         .tool_input
         .as_ref()
         .and_then(|v| v.get("file_path"))
         .and_then(|v| v.as_str())
     {
-        match crate::api::coord::lease_decision(&services, &req.session_id, path).await {
+        let lease_agent = match services.coord_store.get_binding(&req.session_id) {
+            Ok(Some(b)) => b.principal_id,
+            Ok(None) => req.session_id.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %req.session_id,
+                    error = %e,
+                    "cc_hooks: coord_store.get_binding failed; falling back to session_id as lease agent"
+                );
+                req.session_id.clone()
+            }
+        };
+        match crate::api::coord::lease_decision(&services, &lease_agent, path).await {
             LeaseGateDecision::Deny { reason } => {
                 return Json(PreToolGateResponse {
                     session_id: req.session_id,

@@ -849,6 +849,78 @@ impl CoordStore {
         row.into_message()
     }
 
+    /// Claim and stamp up to `limit` undelivered messages for
+    /// `principal_id`, returning only the rows THIS call stamped.
+    ///
+    /// The atomicity contract: even when two callers race (e.g. two
+    /// Claude Code sessions bound to the same principal, or two server
+    /// processes sharing the SQLite file), each message is returned by
+    /// AT MOST one caller. Per-row UPDATE with `delivered_at IS NULL`
+    /// predicate plus a `changes()==1` check gives that guarantee
+    /// without needing `BEGIN IMMEDIATE`.
+    ///
+    /// An unknown or invalid `principal_id` returns `Ok(vec![])` rather
+    /// than `NotFound`, so a first-turn session that just bound a fresh
+    /// principal and the principal row hasn't propagated yet is not an
+    /// error.
+    pub fn claim_undelivered(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        limit: usize,
+    ) -> CoordStoreResult<Vec<Message>> {
+        if validate_principal_id(principal_id).is_err() {
+            return Ok(Vec::new());
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+
+        // Candidate selection: same projection as `list_messages` but
+        // filtered to undelivered rows. We order by id ASC so the
+        // caller's delivery order matches the insertion order — old
+        // messages first, so a principal that ignored its inbox for a
+        // long time reads it FIFO.
+        let mut stmt = conn.prepare(
+            "SELECT id, principal_id, from_actor, body, created_at,
+                    delivered_at, delivered_to, acked_at, acked_by
+             FROM messages
+             WHERE principal_id = ?1 AND delivered_at IS NULL
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let candidates: Vec<i64> = stmt
+            .query_map(params![principal_id, limit as i64], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut out: Vec<Message> = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            // Race-safe claim: only the call whose UPDATE affects 1 row
+            // sees this id. Another process that won gets `Ok(())` with
+            // 0 affected rows and skips us.
+            let affected = conn.execute(
+                "UPDATE messages SET delivered_at = ?1, delivered_to = ?2
+                 WHERE id = ?3 AND delivered_at IS NULL",
+                params![now_str, worker_id, id],
+            )?;
+            if affected != 1 {
+                continue;
+            }
+            let row: MessageRow = conn.query_row(
+                "SELECT id, principal_id, from_actor, body, created_at,
+                        delivered_at, delivered_to, acked_at, acked_by
+                 FROM messages WHERE id = ?1",
+                params![id],
+                MessageRow::from_row,
+            )?;
+            out.push(row.into_message()?);
+        }
+        Ok(out)
+    }
+
     /// Mark a message as delivered to a worker. Currently unused by
     /// the API surface but kept on the store so the worker side of the
     /// Concord protocol can wire it in without a schema change.

@@ -545,12 +545,20 @@ fn install_to_target(
         );
     }
     for ev in &added {
-        println!(
-            "        + {:<22} -> {}/api/v1/cc/hook/{}",
-            ev,
-            substrate.trim_end_matches('/'),
-            cc_hook_path_segment(ev)
-        );
+        if let Some(label) = ev.strip_suffix(" (concord turn)") {
+            println!(
+                "        + {:<22} -> {}/api/v1/coord/turn",
+                label,
+                substrate.trim_end_matches('/'),
+            );
+        } else {
+            println!(
+                "        + {:<22} -> {}/api/v1/cc/hook/{}",
+                ev,
+                substrate.trim_end_matches('/'),
+                cc_hook_path_segment(ev)
+            );
+        }
     }
     Ok(HookInstallOutcome::Wrote)
 }
@@ -561,7 +569,18 @@ fn install_to_target(
 /// substring (`/api/v1/cc/hook/`) so a re-run after a substrate URL
 /// change still appends — that's intentional, so a user pointing
 /// at a new substrate gets a fresh entry next to the old one.
-fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'static str>) {
+///
+/// `concord = true` also appends a synchronous `/api/v1/coord/turn`
+/// entry to SessionStart and UserPromptSubmit, one per event, detected
+/// by the bare substring `/api/v1/coord/turn` (a re-run against a new
+/// substrate URL therefore still skips — the brief is explicit on
+/// this asymmetry). The synchronous entry is what Claude Code reads
+/// on each turn; the async entries continue to do real-time ingest.
+fn merge_cc_hook_entries_with(
+    existing: &Value,
+    substrate: &str,
+    concord: bool,
+) -> (Value, Vec<String>) {
     const EVENTS: &[(&str, &str)] = &[
         ("SessionStart", "session_start"),
         ("UserPromptSubmit", "user_prompt_submit"),
@@ -583,7 +602,7 @@ fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'sta
     }
     let hooks_obj = hooks_entry.as_object_mut().expect("just ensured object");
 
-    let mut added: Vec<&'static str> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
     for (event_name, path_seg) in EVENTS {
         let url = format!("{}/api/v1/cc/hook/{}", substrate, path_seg);
         // Drain stdin into a tempfile BEFORE backgrounding the curl.
@@ -623,7 +642,7 @@ fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'sta
             }
         }
         if upgraded {
-            added.push(event_name);
+            added.push((*event_name).to_string());
         }
         if already_present {
             continue;
@@ -637,10 +656,77 @@ fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<&'sta
                 }
             ]
         }));
-        added.push(event_name);
+        added.push((*event_name).to_string());
+    }
+
+    if concord {
+        // Synchronous /api/v1/coord/turn entries on SessionStart and
+        // UserPromptSubmit. Detect an existing entry by the bare
+        // substring "/api/v1/coord/turn" (per the brief, this is
+        // deliberately looser than the cc/hook/ detection above so a
+        // re-run against a NEW substrate URL still skips).
+        const SYNCHRONOUS_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit"];
+        let turn_url = format!("{}/api/v1/coord/turn", substrate);
+        let turn_cmd = render_concord_turn_command(&turn_url);
+        for event_name in SYNCHRONOUS_EVENTS {
+            let entries = hooks_obj
+                .entry((*event_name).to_string())
+                .or_insert_with(|| json!([]));
+            if !entries.is_array() {
+                *entries = json!([]);
+            }
+            let arr = entries.as_array_mut().expect("just ensured array");
+
+            let mut already_present = false;
+            for entry in arr.iter() {
+                if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
+                    for hook in hooks {
+                        if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                            if command.contains("/api/v1/coord/turn") {
+                                already_present = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if already_present {
+                    break;
+                }
+            }
+            if already_present {
+                continue;
+            }
+
+            arr.push(json!({
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": turn_cmd.clone()
+                    }
+                ]
+            }));
+            // Distinct label so the install_to_target print loop can
+            // print the right URL path (it does NOT match
+            // cc_hook_path_segment's table).
+            added.push(format!("{event_name} (concord turn)"));
+        }
     }
 
     (root, added)
+}
+
+/// Thin wrapper that reads `CONTEXTNEST_CONCORD_HOOKS` from the
+/// environment. The env opt-out exists for users who run install-hooks
+/// inside a containerised agent fleet that doesn't talk to Concord.
+/// Tests and other callers should use `merge_cc_hook_entries_with`
+/// directly so they don't have to reset the env.
+fn merge_cc_hook_entries(existing: &Value, substrate: &str) -> (Value, Vec<String>) {
+    merge_cc_hook_entries_with(existing, substrate, concord_hooks_enabled())
+}
+
+/// `CONTEXTNEST_CONCORD_HOOKS=0` opts out of the synchronous Concord hooks.
+fn concord_hooks_enabled() -> bool {
+    std::env::var("CONTEXTNEST_CONCORD_HOOKS").as_deref() != Ok("0")
 }
 
 fn cc_hook_path_segment(event_name: &str) -> &'static str {
@@ -1147,6 +1233,38 @@ fn render_hook_command(url: &str) -> String {
     )
 }
 
+/// Render the bash command body for the synchronous Concord turn hook.
+///
+/// Unlike the four async hooks this one MUST NOT be backgrounded —
+/// Claude Code's hook protocol reads the synchronous endpoint's body
+/// directly (via `hookSpecificOutput.additionalContext`), and a
+/// backgrounded curl would race the hook return. Constraints:
+///
+/// - No `mktemp` / no subshell: stdout reaches Claude as the hook's
+///   response, so anything that buffers or replaces stdout would
+///   strip the JSON envelope Claude expects.
+/// - `-m 2` short timeout: a hung synchronous curl must not freeze the
+///   user's prompt. The hook is best-effort; retries are explicitly
+///   NOT wanted here because a retry could deliver a stale mailbox.
+/// - `|| true` after curl: any curl failure (network, timeout,
+///   non-2xx) must not propagate as a hook exit, which Claude would
+///   read as "hook errored, suppress stdout".
+/// - X-Concord-* headers carry the principal/pid/pane/tty so the
+///   server can bind the session without re-deriving them.
+fn render_concord_turn_command(url: &str) -> String {
+    let default_headers = if url.starts_with("http://localhost:28080/")
+        || url.starts_with("http://127.0.0.1:28080/")
+    {
+        "$HOME/.contextnest/tenant-auth/operator.headers"
+    } else {
+        ""
+    };
+    let url = url.replace('\'', "'\\''");
+    format!(
+        r#"H="${{CONTEXTNEST_OPERATOR_HEADERS:-{default_headers}}}"; set --; if [ -r "$H" ]; then set -- --header "@$H"; fi; curl "$@" -sf -m 2 -X POST '{url}' -H 'content-type: application/json' -H "X-Concord-Principal: ${{CONCORD_PRINCIPAL:-}}" -H "X-Concord-Pane: ${{TMUX_PANE:-}}" -H "X-Concord-Tty: $(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')" -H "X-Concord-Pid: $PPID" --data-binary @- 2>/dev/null || true"#,
+    )
+}
+
 #[cfg(test)]
 mod render_hook_command_tests {
     use super::render_hook_command;
@@ -1155,7 +1273,7 @@ mod render_hook_command_tests {
     fn generated_hooks_upgrade_in_place_and_then_remain_idempotent() {
         let original = serde_json::json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"F=$(mktemp /tmp/cnhk-XXXXXX); curl http://localhost:28080/api/v1/cc/hook/stop"}]}]}});
         let (updated, changes) = super::merge_cc_hook_entries(&original, "http://localhost:28080");
-        assert!(changes.contains(&"Stop"));
+        assert!(changes.iter().any(|s| s == "Stop"));
         assert_eq!(updated["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(updated["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -1245,6 +1363,304 @@ mod render_hook_command_tests {
         assert!(
             !cmd.contains("-m 1 "),
             "regression: -m 1 reintroduced — payloads will drop under any contention. cmd: {cmd}",
+        );
+    }
+
+    // ─────────────────── merge_cc_hook_concord_tests ───────────────────
+    //
+    // These tests prove DoD 6: install-hooks appends the synchronous
+    // /api/v1/coord/turn entry on SessionStart + UserPromptSubmit, is
+    // idempotent on re-run, leaves the async entries byte-identical,
+    // and respects the CONTEXTNEST_CONCORD_HOOKS=0 opt-out.
+    //
+    // Every test path below contains `merge_cc_hook` so the verifier
+    // `cargo test --bin contextnest merge_cc_hook` finds them all.
+    #[test]
+    fn merge_cc_hook_fresh_settings_adds_turn_entries_and_async_entries() {
+        let original = serde_json::json!({});
+        let substrate = "http://localhost:28080";
+        let (updated, added) = super::merge_cc_hook_entries_with(&original, substrate, true);
+
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let arr = updated["hooks"][event]
+                .as_array()
+                .expect("event array present");
+            assert_eq!(
+                arr.len(),
+                2,
+                "{event} must hold 2 entries (1 async + 1 turn), got: {arr:?}",
+            );
+            let turn_count = arr
+                .iter()
+                .filter(|e| {
+                    e.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|hs| {
+                            hs.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|c| c.contains("/api/v1/coord/turn"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(turn_count, 1, "{event}: exactly one turn entry");
+        }
+        for event in ["Stop", "TaskCompleted"] {
+            let arr = updated["hooks"][event]
+                .as_array()
+                .expect("event array present");
+            assert_eq!(arr.len(), 1, "{event} must hold 1 async entry");
+            let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                !cmd.contains("/api/v1/coord/turn"),
+                "{event} must not get a turn entry, got: {cmd}",
+            );
+        }
+
+        assert!(
+            added.iter().any(|s| s == "SessionStart (concord turn)"),
+            "SessionStart turn label present"
+        );
+        assert!(
+            added.iter().any(|s| s == "UserPromptSubmit (concord turn)"),
+            "UserPromptSubmit turn label present"
+        );
+        assert!(
+            added.iter().any(|s| s == "SessionStart"),
+            "SessionStart async label present"
+        );
+        assert!(
+            added.iter().any(|s| s == "UserPromptSubmit"),
+            "UserPromptSubmit async label present"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_rerun_is_idempotent_on_turn_entries() {
+        let substrate = "http://localhost:28080";
+        let (first, _) = super::merge_cc_hook_entries_with(&serde_json::json!({}), substrate, true);
+        let (second, added) = super::merge_cc_hook_entries_with(&first, substrate, true);
+        assert_eq!(
+            second, first,
+            "second merge must be a no-op when the substrate URL is unchanged"
+        );
+        assert!(added.is_empty(), "second merge must report no additions");
+    }
+
+    #[test]
+    fn merge_cc_hook_async_entries_unchanged_by_concord_toggle() {
+        // Same starting settings, same async command bytes regardless
+        // of whether `concord=true` or `concord=false`.
+        let original = serde_json::json!({});
+        let substrate = "http://localhost:28080";
+        let (with_concord, _) = super::merge_cc_hook_entries_with(&original, substrate, true);
+        let (without_concord, _) = super::merge_cc_hook_entries_with(&original, substrate, false);
+
+        for event in ["SessionStart", "UserPromptSubmit", "Stop", "TaskCompleted"] {
+            let a = with_concord["hooks"][event].as_array().expect("a array");
+            let b = without_concord["hooks"][event].as_array().expect("b array");
+            // The async entry is the same entry (same index, same bytes).
+            // The concord-true side has one MORE entry — the turn entry.
+            // Compare only the entry at index 0 (the async entry).
+            assert_eq!(
+                serde_json::to_string(&a[0]).unwrap(),
+                serde_json::to_string(&b[0]).unwrap(),
+                "{event} async entry must be byte-identical with/without concord",
+            );
+        }
+    }
+
+    #[test]
+    fn merge_cc_hook_pre_populated_async_kept_intact() {
+        // A user's existing settings already have async entries at the
+        // SAME substrate URL; the installer must upgrade them in place
+        // rather than append a duplicate. Only the turn entry is
+        // appended (per the brief, that's the new addition).
+        let async_cmd_old = "F=$(mktemp /tmp/cnhk-XXXXXX); cat > \"$F\"; curl -s -m 10 --retry 3 --retry-connrefused --retry-delay 1 -X POST 'http://localhost:28080/api/v1/cc/hook/stop' --data-binary @\"$F\"";
+        let original = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": async_cmd_old}]}
+                ],
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": "custom-user-hook"}]}
+                ]
+            }
+        });
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
+
+        // Stop: same URL + mktemp prefix → upgraded in place. Still 1
+        // entry, command bytes reflect the new operator-headers
+        // template.
+        let stop = updated["hooks"]["Stop"].as_array().expect("stop array");
+        assert_eq!(stop.len(), 1, "upgraded in place, no duplicate");
+        let stop_cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            stop_cmd.contains("CONTEXTNEST_OPERATOR_HEADERS"),
+            "in-place upgrade must inject the operator-headers env var; got: {stop_cmd}",
+        );
+        assert_ne!(stop_cmd, async_cmd_old, "command bytes changed on upgrade");
+
+        // UserPromptSubmit: custom hook (without our URL) is left
+        // alone; the installer appends a NEW async entry plus the turn
+        // entry → total 3 entries (custom + async + turn).
+        let ups = updated["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .expect("ups array");
+        assert_eq!(ups.len(), 3);
+        let cmds: Vec<&str> = ups
+            .iter()
+            .map(|e| e["hooks"][0]["command"].as_str().unwrap())
+            .collect();
+        assert!(cmds.contains(&"custom-user-hook"), "custom entry preserved");
+        assert!(
+            cmds.iter().any(|c| c.contains("/api/v1/coord/turn")),
+            "turn entry appended"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("/api/v1/cc/hook/user_prompt_submit")),
+            "async entry appended"
+        );
+
+        // Added labels mention both new turn events and the Stop
+        // upgrade.
+        assert!(added.iter().any(|s| s == "UserPromptSubmit (concord turn)"));
+        assert!(added.iter().any(|s| s == "SessionStart (concord turn)"));
+        assert!(
+            added.iter().any(|s| s == "Stop"),
+            "Stop upgrade must be reported in `added`"
+        );
+    }
+
+    #[test]
+    fn install_path_wrapper_honours_concord_hooks_env_opt_out() {
+        // install_to_target calls merge_cc_hook_entries (the env wrapper), so
+        // CONTEXTNEST_CONCORD_HOOKS=0 must suppress the turn entries there.
+        let substrate = "http://localhost:28080";
+        let has_turn = |v: &serde_json::Value| {
+            ["SessionStart", "UserPromptSubmit"].iter().any(|ev| {
+                v["hooks"][*ev].as_array().is_some_and(|arr| {
+                    arr.iter().any(|e| {
+                        e["hooks"][0]["command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("/api/v1/coord/turn"))
+                    })
+                })
+            })
+        };
+        std::env::set_var("CONTEXTNEST_CONCORD_HOOKS", "0");
+        let (off, _) = super::merge_cc_hook_entries(&serde_json::json!({}), substrate);
+        std::env::remove_var("CONTEXTNEST_CONCORD_HOOKS");
+        let (on, _) = super::merge_cc_hook_entries(&serde_json::json!({}), substrate);
+        assert!(!has_turn(&off), "opt-out must suppress coord/turn entries");
+        assert!(has_turn(&on), "default install must add coord/turn entries");
+    }
+
+    #[test]
+    fn merge_cc_hook_concord_false_adds_no_turn_entries() {
+        let original = serde_json::json!({});
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", false);
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let arr = updated["hooks"][event].as_array().expect("event array");
+            for entry in arr {
+                let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+                assert!(
+                    !cmd.contains("/api/v1/coord/turn"),
+                    "{event} must NOT carry a turn entry when concord=false; cmd: {cmd}",
+                );
+            }
+        }
+        assert!(
+            !added.iter().any(|s| s.contains("concord turn")),
+            "added must not contain any concord turn label"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_existing_custom_turn_command_is_not_duplicated() {
+        // Operator-customised command already contains /api/v1/coord/turn.
+        // The merge must NOT add a second turn entry.
+        let custom_turn = "curl -X POST http://example/api/v1/coord/turn -H 'x: y'";
+        let original = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"hooks":[{"type":"command","command": custom_turn}]}
+                ]
+            }
+        });
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
+        let arr = updated["hooks"]["SessionStart"].as_array().expect("array");
+        // 1 turn (existing) + 1 async (added) = 2 total.
+        assert_eq!(arr.len(), 2);
+        let turn_count = arr
+            .iter()
+            .filter(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("/api/v1/coord/turn")
+            })
+            .count();
+        assert_eq!(
+            turn_count, 1,
+            "operator's turn entry must not be duplicated"
+        );
+        assert!(
+            !added.iter().any(|s| s == "SessionStart (concord turn)"),
+            "no concord-turn label must be reported when one already exists"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_rendered_command_is_synchronous_and_carries_headers() {
+        let cmd = super::render_concord_turn_command("http://localhost:28080/api/v1/coord/turn");
+        assert!(cmd.contains("-m 2"), "short timeout required; got: {cmd}");
+        assert!(
+            cmd.contains("|| true"),
+            "must swallow curl errors; got: {cmd}"
+        );
+        assert!(
+            cmd.contains("X-Concord-Pane: ${TMUX_PANE:-}"),
+            "must forward TMUX_PANE; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("X-Concord-Pid: $PPID"),
+            "must forward PPID; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("CONTEXTNEST_OPERATOR_HEADERS"),
+            "must use the operator headers env var; got: {cmd}",
+        );
+        // Synchronous — must NOT end with '&'.
+        assert!(
+            !cmd.trim_end().ends_with('&'),
+            "synchronous turn hook must not be backgrounded; got: {cmd}",
+        );
+        // Must NOT use a subshell or mktemp dance — those would swallow
+        // the JSON body Claude Code reads.
+        assert!(
+            !cmd.contains("mktemp"),
+            "no tempfile drain; stdout must reach Claude directly; got: {cmd}",
+        );
+        // localhost/28080 gets the tenant headers default.
+        assert!(
+            cmd.contains("$HOME/.contextnest/tenant-auth/operator.headers"),
+            "localhost 28080 must use the default operator headers path; got: {cmd}",
+        );
+
+        // Off-default host: no operator headers env var default.
+        let off_default =
+            super::render_concord_turn_command("http://other-host:9000/api/v1/coord/turn");
+        assert!(
+            !off_default.contains("$HOME/.contextnest"),
+            "off-default substrate must NOT inject tenant headers path; got: {off_default}",
         );
     }
 }
