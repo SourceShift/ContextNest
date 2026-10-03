@@ -198,6 +198,31 @@ pub struct OtherWriter {
     pub cwd: Option<String>,
 }
 
+/// A live TTL-bound claim on a hot shared-config path (Concord P2).
+/// One row per path in `hot_claims`; `last_write_ts` is hydrated from
+/// the `footprints` row whose `seq == last_write_seq` (rendered as
+/// `unknown` when retention pruned that row).
+#[derive(Debug, Clone, Serialize)]
+pub struct HotClaim {
+    pub path: String,
+    pub principal_id: String,
+    pub expires_at: DateTime<Utc>,
+    pub last_write_seq: i64,
+    pub last_write_ts: Option<DateTime<Utc>>,
+}
+
+/// Result of a `claim_hot` attempt against a hot path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotClaimOutcome {
+    /// No live claim existed (or it expired) — this writer took it.
+    Taken,
+    /// The caller is the holder or in the holder's lineage — claim
+    /// refreshed, holder unchanged.
+    Renewed,
+    /// A principal outside the caller's lineage holds a live claim.
+    Contended { holder: String },
+}
+
 /// Computed status. Persisted as lowercase text per the wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalStatus {
@@ -420,6 +445,13 @@ const SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_footprints_path ON footprints(path, seq);
     CREATE INDEX IF NOT EXISTS idx_footprints_principal_path ON footprints(principal_id, path, seq);
+    CREATE TABLE IF NOT EXISTS hot_claims (
+        path           TEXT PRIMARY KEY,
+        principal_id   TEXT NOT NULL,
+        expires_at     TEXT NOT NULL,
+        last_write_seq INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_hot_claims_expires ON hot_claims(expires_at);
 ";
 
 pub struct CoordStore {
@@ -1105,78 +1137,18 @@ impl CoordStore {
     }
 
     /// The set of principals in `principal_id`'s lineage, capped at
-    /// `max_hops` per direction. Self is always included. The
-    /// traversal is BFS-like with a visited set so cycles (a→b→a)
-    /// don't loop forever.
-    ///
-    /// Lineage = ancestors (walk `labels.parent` upward) ∪
-    /// descendants (principals whose `labels.parent` equals a lineage
-    /// member, walk downward). Siblings and cousins are NOT lineage.
-    /// That matches the brief's "labels.parent chains in either
-    /// direction" reading — revalidate if the design doc changes.
+    /// `max_hops` per direction. Self is always included. See
+    /// [`lineage_in`] for the traversal; this is a thin lock-then-delegate
+    /// wrapper so callers that already hold the lock (e.g. `claim_hot`)
+    /// can run the same query without re-entering the non-reentrant
+    /// `std::sync::Mutex`.
     pub fn lineage(
         &self,
         principal_id: &str,
         max_hops: usize,
     ) -> CoordStoreResult<HashSet<String>> {
         let conn = self.lock();
-        // Two parallel queues for the BFS. The visited set grows as
-        // we pull a principal off either queue so a cycle that
-        // touches the same node from both sides still terminates.
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut up: VecDeque<(String, usize)> = VecDeque::new();
-        let mut down: VecDeque<(String, usize)> = VecDeque::new();
-        visited.insert(principal_id.to_string());
-        up.push_back((principal_id.to_string(), 0));
-        down.push_back((principal_id.to_string(), 0));
-
-        while let Some((pid, depth)) = up.pop_front() {
-            if depth > 0 {
-                // depth=0 is self — already in `visited`.
-                visited.insert(pid.clone());
-            }
-            if depth >= max_hops {
-                continue;
-            }
-            // Walk up via labels.parent (a JSON string).
-            let parent: Option<String> = conn
-                .query_row(
-                    "SELECT json_extract(labels, '$.parent') FROM principals
-                     WHERE principal_id = ?1 AND json_valid(labels) = 1",
-                    params![&pid],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
-            if let Some(p) = parent {
-                if !p.is_empty() && visited.insert(p.clone()) {
-                    up.push_back((p, depth + 1));
-                }
-            }
-        }
-        while let Some((pid, depth)) = down.pop_front() {
-            if depth > 0 {
-                visited.insert(pid.clone());
-            }
-            if depth >= max_hops {
-                continue;
-            }
-            // Walk down: every principal whose labels.parent == pid.
-            let mut stmt = conn.prepare(
-                "SELECT principal_id FROM principals
-                 WHERE json_valid(labels) = 1
-                   AND json_extract(labels, '$.parent') = ?1",
-            )?;
-            let children: Vec<String> = stmt
-                .query_map(params![&pid], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for c in children {
-                if visited.insert(c.clone()) {
-                    down.push_back((c, depth + 1));
-                }
-            }
-        }
-        Ok(visited)
+        lineage_in(&conn, principal_id, max_hops)
     }
 
     /// Distinct write footprints on `path` with `seq > after_seq`,
@@ -1238,6 +1210,221 @@ impl CoordStore {
         }
         Ok(out)
     }
+
+    // ────────────── hot claims (Concord P2) ──────────────
+
+    /// Claim (or refresh) the hot claim on `path` for a write of
+    /// `write_seq` by `principal_id`, expiring `ttl_secs` from now.
+    ///
+    /// The whole decision runs under one connection lock so two
+    /// writers can't both take an expired claim:
+    ///   (a) no row, or `expires_at <= now` → take (`Taken`),
+    ///   (b) holder == caller or holder ∈ caller's lineage → refresh
+    ///       (`Renewed`, holder unchanged),
+    ///   (c) otherwise → `Contended { holder }`, row untouched.
+    ///
+    /// `expires_at` is stored through `fmt_ts` (fixed-width RFC3339
+    /// micros) so the `<= now` liveness test and the read-side sweep
+    /// compare strings lexicographically, exactly like
+    /// `prune_old_footprints`.
+    pub fn claim_hot(
+        &self,
+        path: &str,
+        principal_id: &str,
+        write_seq: i64,
+        ttl_secs: i64,
+    ) -> CoordStoreResult<HotClaimOutcome> {
+        let now = Utc::now();
+        let now_str = fmt_ts(now);
+        let expires_str = fmt_ts(now + ChronoDuration::seconds(ttl_secs));
+        let conn = self.lock();
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT principal_id, expires_at FROM hot_claims WHERE path = ?1",
+                params![path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let holder = match existing {
+            None => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO hot_claims
+                        (path, principal_id, expires_at, last_write_seq)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![path, principal_id, expires_str, write_seq],
+                )?;
+                return Ok(HotClaimOutcome::Taken);
+            }
+            Some((holder, expires_at)) => {
+                if expires_at <= now_str {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO hot_claims
+                            (path, principal_id, expires_at, last_write_seq)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![path, principal_id, expires_str, write_seq],
+                    )?;
+                    return Ok(HotClaimOutcome::Taken);
+                }
+                holder
+            }
+        };
+        if holder == principal_id
+            || lineage_in(&conn, principal_id, LINEAGE_MAX_HOPS)?.contains(&holder)
+        {
+            conn.execute(
+                "UPDATE hot_claims SET expires_at = ?1, last_write_seq = ?2 WHERE path = ?3",
+                params![expires_str, write_seq, path],
+            )?;
+            Ok(HotClaimOutcome::Renewed)
+        } else {
+            Ok(HotClaimOutcome::Contended { holder })
+        }
+    }
+
+    /// The live claim on `path`, if any (`expires_at > now`), hydrated
+    /// with `last_write_ts` from the matching footprint row. `None`
+    /// when there is no claim or it has expired.
+    pub fn live_hot_claim(&self, path: &str) -> CoordStoreResult<Option<HotClaim>> {
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+        let row: Option<(String, String, i64, Option<String>)> = conn
+            .query_row(
+                "SELECT h.principal_id, h.expires_at, h.last_write_seq, f.ts
+                 FROM hot_claims h
+                 LEFT JOIN footprints f ON f.seq = h.last_write_seq
+                 WHERE h.path = ?1 AND h.expires_at > ?2",
+                params![path, now_str],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(
+            |(principal_id, expires_at, last_write_seq, last_write_ts)| {
+                Ok(HotClaim {
+                    path: path.to_string(),
+                    principal_id,
+                    expires_at: parse_ts(&expires_at)?,
+                    last_write_seq,
+                    last_write_ts: last_write_ts.as_deref().map(parse_ts).transpose()?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// All live claims, ordered by path. Sweeps expired rows first
+    /// (read-side TTL), then selects the survivors with the same
+    /// footprint JOIN as [`CoordStore::live_hot_claim`].
+    pub fn list_live_hot_claims(&self) -> CoordStoreResult<Vec<HotClaim>> {
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM hot_claims WHERE expires_at <= ?1",
+            params![now_str],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT h.path, h.principal_id, h.expires_at, h.last_write_seq, f.ts
+             FROM hot_claims h
+             LEFT JOIN footprints f ON f.seq = h.last_write_seq
+             ORDER BY h.path",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, principal_id, expires_at, last_write_seq, last_write_ts) in rows {
+            out.push(HotClaim {
+                path,
+                principal_id,
+                expires_at: parse_ts(&expires_at)?,
+                last_write_seq,
+                last_write_ts: last_write_ts.as_deref().map(parse_ts).transpose()?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Lineage traversal on an already-locked `Connection`. Split out of
+/// [`CoordStore::lineage`] so `claim_hot` can test "holder ∈ lineage"
+/// under the SAME lock it uses for the read/upsert — `std::sync::Mutex`
+/// is not reentrant, so calling the public `self.lineage()` while
+/// holding `self.lock()` would deadlock.
+///
+/// Lineage = ancestors (walk `labels.parent` upward) ∪ descendants
+/// (principals whose `labels.parent` equals a lineage member, walked
+/// downward). Self is always included. Siblings and cousins are NOT
+/// lineage. BFS-like with a visited set so cycles (a→b→a) terminate.
+fn lineage_in(
+    conn: &Connection,
+    principal_id: &str,
+    max_hops: usize,
+) -> CoordStoreResult<HashSet<String>> {
+    // Two parallel queues for the BFS. The visited set grows as
+    // we pull a principal off either queue so a cycle that
+    // touches the same node from both sides still terminates.
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut up: VecDeque<(String, usize)> = VecDeque::new();
+    let mut down: VecDeque<(String, usize)> = VecDeque::new();
+    visited.insert(principal_id.to_string());
+    up.push_back((principal_id.to_string(), 0));
+    down.push_back((principal_id.to_string(), 0));
+
+    while let Some((pid, depth)) = up.pop_front() {
+        if depth > 0 {
+            // depth=0 is self — already in `visited`.
+            visited.insert(pid.clone());
+        }
+        if depth >= max_hops {
+            continue;
+        }
+        // Walk up via labels.parent (a JSON string).
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(labels, '$.parent') FROM principals
+                 WHERE principal_id = ?1 AND json_valid(labels) = 1",
+                params![&pid],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(p) = parent {
+            if !p.is_empty() && visited.insert(p.clone()) {
+                up.push_back((p, depth + 1));
+            }
+        }
+    }
+    while let Some((pid, depth)) = down.pop_front() {
+        if depth > 0 {
+            visited.insert(pid.clone());
+        }
+        if depth >= max_hops {
+            continue;
+        }
+        // Walk down: every principal whose labels.parent == pid.
+        let mut stmt = conn.prepare(
+            "SELECT principal_id FROM principals
+             WHERE json_valid(labels) = 1
+               AND json_extract(labels, '$.parent') = ?1",
+        )?;
+        let children: Vec<String> = stmt
+            .query_map(params![&pid], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for c in children {
+            if visited.insert(c.clone()) {
+                down.push_back((c, depth + 1));
+            }
+        }
+    }
+    Ok(visited)
 }
 
 fn status_str(s: &str) -> PrincipalStatus {
@@ -1819,5 +2006,82 @@ mod tests {
         let out = s.writes_after("/f.rs", 0, &excl, 10).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].principal_id, "loop:b");
+    }
+
+    // ────────────── hot-claim tests (Concord P2) ──────────────
+
+    #[test]
+    fn hot_claim_take_renew_lineage_contend() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "run:x", Some("loop:a"));
+        upsert_with_labels(&s, "loop:b", None);
+
+        // Take on first write.
+        assert_eq!(
+            s.claim_hot("/hot/x.yaml", "loop:a", 1, 60).unwrap(),
+            HotClaimOutcome::Taken
+        );
+        // Renew by holder.
+        assert_eq!(
+            s.claim_hot("/hot/x.yaml", "loop:a", 2, 60).unwrap(),
+            HotClaimOutcome::Renewed
+        );
+        // Renew by a lineage child (labels.parent → loop:a). Holder
+        // stays loop:a.
+        assert_eq!(
+            s.claim_hot("/hot/x.yaml", "run:x", 3, 60).unwrap(),
+            HotClaimOutcome::Renewed
+        );
+        let claim = s.live_hot_claim("/hot/x.yaml").unwrap().expect("live");
+        assert_eq!(claim.principal_id, "loop:a");
+        assert_eq!(claim.last_write_seq, 3);
+        // Contend by an outsider keeps the holder and last_write_seq.
+        assert_eq!(
+            s.claim_hot("/hot/x.yaml", "loop:b", 4, 60).unwrap(),
+            HotClaimOutcome::Contended {
+                holder: "loop:a".to_string()
+            }
+        );
+        let claim = s.live_hot_claim("/hot/x.yaml").unwrap().expect("live");
+        assert_eq!(claim.principal_id, "loop:a");
+        assert_eq!(claim.last_write_seq, 3);
+    }
+
+    #[test]
+    fn hot_claim_ttl_expiry_lets_outsider_take() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", None);
+        // Negative ttl → expires_at is already in the past.
+        assert_eq!(
+            s.claim_hot("/hot/y.yaml", "loop:a", 5, -1).unwrap(),
+            HotClaimOutcome::Taken
+        );
+        // Expired claim is not "live".
+        assert!(s.live_hot_claim("/hot/y.yaml").unwrap().is_none());
+        // Outsider takes the expired claim.
+        assert_eq!(
+            s.claim_hot("/hot/y.yaml", "loop:b", 6, 60).unwrap(),
+            HotClaimOutcome::Taken
+        );
+        let claim = s.live_hot_claim("/hot/y.yaml").unwrap().expect("live");
+        assert_eq!(claim.principal_id, "loop:b");
+    }
+
+    #[test]
+    fn list_live_hot_claims_sweeps_expired_rows() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", None);
+        // Path A is expired on arrival; path B is live.
+        s.claim_hot("/hot/a.yaml", "loop:a", 1, -1).unwrap();
+        s.claim_hot("/hot/b.yaml", "loop:b", 2, 600).unwrap();
+        let list = s.list_live_hot_claims().unwrap();
+        assert_eq!(list.len(), 1, "sweep must drop the expired row");
+        assert_eq!(list[0].path, "/hot/b.yaml");
+        assert_eq!(list[0].principal_id, "loop:b");
+        // The sweep deleted path A from the table.
+        assert!(s.live_hot_claim("/hot/a.yaml").unwrap().is_none());
     }
 }

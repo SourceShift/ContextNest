@@ -22,13 +22,17 @@
 //!   3. Derived lineage id (`session:<term>@<repo>` or
 //!      `session:<sanitized session_id>`).
 //!
-//! The precheck is **advisory only** and never sets `permissionDecision`:
-//! in Claude Code's hook contract `"allow"` skips the user's permission
-//! prompt, so a globally installed hook answering `allow` would auto-approve
-//! every Edit/Write. Omitting the field leaves the user's normal permission
-//! flow untouched while `additionalContext` still reaches the model. When
-//! the substrate is down, the synchronous curl's `|| true` keeps Claude Code
-//! on that same prompt path.
+//! The precheck is **advisory by default** and `permissionDecision` is
+//! never `"allow"`: in Claude Code's hook contract `"allow"` skips the
+//! user's permission prompt, so a globally installed hook answering
+//! `allow` would auto-approve every Edit/Write. The field is inserted
+//! ONLY for a hot-conflict on an env-configured shared-config path when
+//! the operator set `CONTEXTNEST_CONCORD_HOT_MODE=ask|deny`, and even
+//! then its value is `"ask"`/`"deny"` — never `"allow"`. Omitting the
+//! field leaves the user's normal permission flow untouched while
+//! `additionalContext` still reaches the model. When the substrate is
+//! down, the synchronous curl's `|| true` keeps Claude Code on that same
+//! prompt path.
 //!
 //! ## Scope
 //!
@@ -38,7 +42,13 @@
 //! every store call returns, then the metrics RwLock is dropped
 //! before the handler returns.
 
-use axum::{extract::State, http::HeaderMap, response::Json, routing::post, Router};
+use axum::{
+    extract::State,
+    http::HeaderMap,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use chrono::SecondsFormat;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -48,11 +58,150 @@ use tracing::error;
 
 use crate::api::coord_turn::{self, TurnInputWithHeaders};
 use crate::services::coord_store::{
-    CoordStore, CoordStoreResult, OtherWriter, PrincipalUpsert, LINEAGE_MAX_HOPS,
+    CoordStore, CoordStoreResult, HotClaim, HotClaimOutcome, OtherWriter, PrincipalUpsert,
+    LINEAGE_MAX_HOPS,
 };
 use crate::services::ContextNestServices;
 
 // ───────────────────────── pure helpers ─────────────────────────
+
+/// Default hot-path globs used when `CONTEXTNEST_CONCORD_HOT_GLOBS` is
+/// unset. Comma-separated; the same list the mini-ork concord brief
+/// names as shared live config: `.mini-ork/config`, `secrets*.sh`,
+/// `providers.yaml`, `agents.yaml`, `.claude/settings*.json`, `.env`
+/// (and siblings), and `db/migrations`.
+const DEFAULT_HOT_GLOBS: &str = "**/.mini-ork/config/**,**/secrets*.sh,**/providers.yaml,**/agents.yaml,**/.claude/settings*.json,**/.env,**/.env.*,**/db/migrations/**";
+
+/// The hot-path globs, read fresh from env on every call so test
+/// suites can flip them without restarting the binary. An explicitly
+/// set value is split on ',', trimmed, and stripped of empty entries —
+/// so an empty string disables the hot set. Unset → [`DEFAULT_HOT_GLOBS`].
+pub fn hot_globs() -> Vec<String> {
+    parse_hot_globs(
+        std::env::var("CONTEXTNEST_CONCORD_HOT_GLOBS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`hot_globs`]: `None` (unset) → the defaults; a set
+/// value is split on ',', trimmed, and stripped of empties (so "" disables).
+/// Unit tests call this directly — mutating the process env from parallel
+/// test threads raced (`cargo test` runs tests concurrently).
+pub fn parse_hot_globs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or(DEFAULT_HOT_GLOBS)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How a hot conflict should be surfaced on the precheck. `ask` and
+/// `deny` add a `permissionDecision` to `hookSpecificOutput`; anything
+/// else (including unset) is the advisory-only default [`HotMode::Warn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotMode {
+    Warn,
+    Ask,
+    Deny,
+}
+
+/// Read `CONTEXTNEST_CONCORD_HOT_MODE` fresh on every call: trim +
+/// ascii-lowercase, `ask`/`deny` map to their modes, anything else
+/// (bogus or unset) is [`HotMode::Warn`].
+pub fn hot_mode() -> HotMode {
+    parse_hot_mode(
+        std::env::var("CONTEXTNEST_CONCORD_HOT_MODE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`hot_mode`]; anything but `ask`/`deny` is `Warn`.
+pub fn parse_hot_mode(raw: Option<&str>) -> HotMode {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("ask") => HotMode::Ask,
+        Some("deny") => HotMode::Deny,
+        _ => HotMode::Warn,
+    }
+}
+
+/// Claim TTL in seconds from `CONTEXTNEST_CONCORD_HOT_TTL_SECS`,
+/// read fresh per call. Unparseable or non-positive falls back to 600.
+pub fn hot_ttl_secs() -> i64 {
+    parse_hot_ttl_secs(
+        std::env::var("CONTEXTNEST_CONCORD_HOT_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`hot_ttl_secs`]; unparseable or non-positive → 600.
+pub fn parse_hot_ttl_secs(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(600)
+}
+
+/// Match `path` against a component glob `pattern`. Both are split on
+/// '/': a `**` segment matches zero or more whole components; within a
+/// segment `*` matches any run of chars and `?` exactly one; everything
+/// else is a case-sensitive literal. No `glob`/`globset` dependency —
+/// this is the hand-written matcher the brief calls for.
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    components_match(&pat, &segs)
+}
+
+fn components_match(pat: &[&str], segs: &[&str]) -> bool {
+    if pat.is_empty() {
+        return segs.is_empty();
+    }
+    match pat[0] {
+        "**" => (0..=segs.len()).any(|skip| components_match(&pat[1..], &segs[skip..])),
+        p => {
+            if segs.is_empty() {
+                return false;
+            }
+            segment_match(p, segs[0]) && components_match(&pat[1..], &segs[1..])
+        }
+    }
+}
+
+fn segment_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // dp[i][j] == "pattern[..i] matches text[..j]" under the glob
+    // semantics above. `*` is zero-or-more, `?` exactly one.
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        dp[i][0] = p[i - 1] == '*' && dp[i - 1][0];
+    }
+    for i in 1..=p.len() {
+        for j in 1..=t.len() {
+            dp[i][j] = match p[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && c == t[j - 1],
+            };
+        }
+    }
+    dp[p.len()][t.len()]
+}
+
+/// True iff `path` matches any of the configured hot globs. Reads the
+/// glob list fresh per call (see [`hot_globs`]).
+pub fn is_hot_path(path: &str) -> bool {
+    is_hot_path_with(path, &hot_globs())
+}
+
+/// [`is_hot_path`] against an explicit glob list (env-free, for tests).
+pub fn is_hot_path_with(path: &str, globs: &[String]) -> bool {
+    globs.iter().any(|g| glob_match(g, path))
+}
 
 /// Map a Claude Code tool name to the footprint `op` it represents.
 /// `Read` → `"read"`; the Edit-class tools → `"write"`. Anything else
@@ -214,6 +363,26 @@ pub fn render_precheck_context(path: &Path, others: &[OtherWriter]) -> String {
     out
 }
 
+/// Render the hot-conflict advisory for a shared-config path. Exact
+/// shape the brief specifies: the 🔒 glyph, the canonical path, the
+/// holder, the last-write `<ts>` (RFC3339 seconds Z, `unknown` when the
+/// footprint row was pruned), and the claim's expiry. Ends with the
+/// ready-made `mini-ork concord send` handoff.
+pub fn render_hot_context(path: &Path, claim: &HotClaim) -> String {
+    let ts = claim
+        .last_write_ts
+        .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "[concord] \u{1F512} {} is shared live config, claimed by {} (last write {}, claim until {}). Concurrent edits clobber running agents. Coordinate first: mini-ork concord send {} \"...\"",
+        path.display(),
+        claim.principal_id,
+        ts,
+        claim.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        claim.principal_id,
+    )
+}
+
 // ───────────────────────── handlers ─────────────────────────
 
 /// `POST /api/v1/coord/footprints` — PostToolUse hook. Records a
@@ -311,6 +480,25 @@ pub async fn coord_footprints(
         }
     };
 
+    // Behaviour 1 — writes to a hot shared-config path take or renew a
+    // TTL claim. The footprint has already landed, so a store error or
+    // contention never changes the response (the hook must keep
+    // answering 200). The claim call releases the store lock before we
+    // take the metrics lock, matching the module's "no lock across
+    // await / bump metrics only after the store call returns" rule.
+    if op == "write" && is_hot_path(&path_str) {
+        match store.claim_hot(&path_str, &principal_id, seq, hot_ttl_secs()) {
+            Ok(HotClaimOutcome::Contended { .. }) => {
+                let mut m = services.coord_metrics.write().await;
+                m.coord_hot_contended_total = m.coord_hot_contended_total.saturating_add(1);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, principal_id = %principal_id, path = %path_str, "coord_footprints: claim_hot failed");
+            }
+        }
+    }
+
     Json(json!({
         "recorded": true,
         "seq": seq,
@@ -321,31 +509,50 @@ pub async fn coord_footprints(
 /// `POST /api/v1/coord/precheck` — PreToolUse hook. Resolves the
 /// caller (read-only — no upsert, no bind), finds the newest writes to
 /// `path` from any non-lineage principal since the caller's last
-/// footprint on it, and returns an advisory.
+/// footprint on it (P1), and layers on the hot-conflict check for
+/// shared-config paths (P2).
 ///
-/// Always answers 200 and never sets `permissionDecision` (see the module
-/// doc). Every request — no-op tools, unresolved paths or principals, and
-/// store errors included — counts toward `coord_precheck_total`;
-/// `coord_precheck_warn` counts only the warnings.
+/// Always answers 200. `permissionDecision` is set — to `"ask"` or
+/// `"deny"`, never `"allow"` — only when `hot` is some AND
+/// `CONTEXTNEST_CONCORD_HOT_MODE` is `ask`/`deny`; otherwise the key is
+/// absent (see the module doc). Every request — no-op tools, unresolved
+/// paths or principals, and store errors included — counts toward
+/// `coord_precheck_total`; `coord_precheck_warn` counts only the P1
+/// stale-premise warnings; `coord_hot_conflicts_total` counts only the
+/// hot conflicts.
 pub async fn coord_precheck(
     State(services): State<ContextNestServices>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Json<Value> {
     let input = coord_turn::parse_input(&headers, &body);
-    let (warn, others, path) = precheck_decision(&services.coord_store, &input);
+    let outcome = precheck_decision(&services.coord_store, &input);
     {
         let mut m = services.coord_metrics.write().await;
         m.coord_precheck_total = m.coord_precheck_total.saturating_add(1);
-        if warn {
+        if outcome.warn {
             m.coord_precheck_warn = m.coord_precheck_warn.saturating_add(1);
         }
+        if outcome.hot.is_some() {
+            m.coord_hot_conflicts_total = m.coord_hot_conflicts_total.saturating_add(1);
+        }
     }
-    let additional_context = match (&path, warn) {
-        (Some(p), true) => render_precheck_context(p, &others),
+    let p1_text = match (&outcome.path, outcome.warn) {
+        (Some(p), true) => render_precheck_context(p, &outcome.others),
         _ => String::new(),
     };
-    let others_json: Vec<Value> = others
+    let hot_text = match (&outcome.path, &outcome.hot) {
+        (Some(p), Some(claim)) => render_hot_context(p, claim),
+        _ => String::new(),
+    };
+    let additional_context = match (p1_text.is_empty(), hot_text.is_empty()) {
+        (false, false) => format!("{p1_text}\n\n{hot_text}"),
+        (false, true) => p1_text,
+        (true, false) => hot_text.clone(),
+        (true, true) => String::new(),
+    };
+    let others_json: Vec<Value> = outcome
+        .others
         .iter()
         .map(|w| {
             json!({
@@ -357,23 +564,55 @@ pub async fn coord_precheck(
             })
         })
         .collect();
-    Json(json!({
-        "warn": warn,
-        "others": others_json,
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": additional_context,
+
+    // Build hookSpecificOutput as a Map so `permissionDecision` can be
+    // inserted conditionally — absent (not null, not "allow") everywhere
+    // except the hot-conflict + ask/deny branch.
+    let mut hook = serde_json::Map::new();
+    hook.insert("hookEventName".to_string(), json!("PreToolUse"));
+    hook.insert("additionalContext".to_string(), json!(additional_context));
+    if outcome.hot.is_some() {
+        match hot_mode() {
+            HotMode::Ask => {
+                hook.insert("permissionDecision".to_string(), json!("ask"));
+                hook.insert("permissionDecisionReason".to_string(), json!(hot_text));
+            }
+            HotMode::Deny => {
+                hook.insert("permissionDecision".to_string(), json!("deny"));
+                hook.insert("permissionDecisionReason".to_string(), json!(hot_text));
+            }
+            HotMode::Warn => {}
         }
+    }
+
+    Json(json!({
+        "warn": outcome.warn,
+        "others": others_json,
+        "hot_conflict": outcome.hot.is_some(),
+        "hookSpecificOutput": hook,
     }))
 }
 
-/// The pure decision behind `coord_precheck`: `(warn, others, path)`.
-/// Every early exit is a no-op (`false`, empty); a store error is logged
-/// and treated the same way, so the hook can never block Claude Code.
-fn precheck_decision(
-    store: &CoordStore,
-    input: &TurnInputWithHeaders,
-) -> (bool, Vec<OtherWriter>, Option<PathBuf>) {
+/// The pure decision behind `coord_precheck`. `warn`/`others` carry the
+/// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim.
+/// The hot check runs right after principal resolution and BEFORE the
+/// P1 no-prior-footprint early return, so a caller who has never touched
+/// the path still sees a live claim held by an outsider. Store errors are
+/// logged and treated as no-ops so the hook can never block Claude Code.
+struct PrecheckOutcome {
+    warn: bool,
+    others: Vec<OtherWriter>,
+    path: Option<PathBuf>,
+    hot: Option<HotClaim>,
+}
+
+fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> PrecheckOutcome {
+    let noop = PrecheckOutcome {
+        warn: false,
+        others: Vec::new(),
+        path: None,
+        hot: None,
+    };
     let tool_name = input
         .inner
         .extra
@@ -381,18 +620,49 @@ fn precheck_decision(
         .and_then(Value::as_str)
         .unwrap_or("");
     if file_tool_op(tool_name) != Some("write") {
-        return (false, Vec::new(), None);
+        return noop;
     }
     let cwd_str = input.inner.cwd.clone().unwrap_or_default();
     let path = match resolve_tool_path(tool_name, &input.inner.extra, Path::new(&cwd_str)) {
         Some(p) => p,
-        None => return (false, Vec::new(), None),
+        None => return noop,
     };
     let principal_id = match resolve_hook_principal(store, input) {
         Ok(Some(p)) => p,
-        _ => return (false, Vec::new(), Some(path)),
+        _ => {
+            return PrecheckOutcome {
+                warn: false,
+                others: Vec::new(),
+                path: Some(path),
+                hot: None,
+            }
+        }
     };
     let path_str = path.to_string_lossy().to_string();
+
+    // Hot-conflict check. Must run even when the caller has no prior
+    // footprint (the P1 early return below), because a caller that has
+    // never touched a hot file still needs the 🔒 advisory.
+    let hot: Option<HotClaim> = if is_hot_path(&path_str) {
+        match store.live_hot_claim(&path_str) {
+            Ok(Some(claim)) => match store.lineage(&principal_id, LINEAGE_MAX_HOPS) {
+                Ok(lin) if lin.contains(&claim.principal_id) => None,
+                Ok(_) => Some(claim),
+                Err(e) => {
+                    error!(error = %e, principal_id = %principal_id, "coord_precheck: lineage lookup failed");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                error!(error = %e, principal_id = %principal_id, "coord_precheck: live_hot_claim failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let outcome: CoordStoreResult<(bool, Vec<OtherWriter>)> = (|| {
         let last = match store.last_footprint_seq(&principal_id, &path_str)? {
             Some(s) => s,
@@ -402,20 +672,55 @@ fn precheck_decision(
         let others = store.writes_after(&path_str, last, &excl, 3)?;
         Ok((!others.is_empty(), others))
     })();
-    match outcome {
-        Ok((warn, others)) => (warn, others, Some(path)),
+    let (warn, others) = match outcome {
+        Ok((warn, others)) => (warn, others),
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_precheck: store query failed");
-            (false, Vec::new(), Some(path))
+            (false, Vec::new())
+        }
+    };
+    PrecheckOutcome {
+        warn,
+        others,
+        path: Some(path),
+        hot,
+    }
+}
+
+/// `GET /api/v1/coord/hot-claims` — live hot claims, each shaped as
+/// exactly `{path, principal_id, expires_at (RFC3339), last_write_seq}`
+/// under `{"claims": [...]}`. The read-side sweep of expired rows happens
+/// inside `list_live_hot_claims`. A store error logs and returns an
+/// empty list with 200 — the endpoint is observability, not a gate.
+pub async fn coord_hot_claims(State(services): State<ContextNestServices>) -> Json<Value> {
+    match services.coord_store.list_live_hot_claims() {
+        Ok(claims) => {
+            let arr: Vec<Value> = claims
+                .iter()
+                .map(|c| {
+                    json!({
+                        "path": c.path,
+                        "principal_id": c.principal_id,
+                        "expires_at": c.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                        "last_write_seq": c.last_write_seq,
+                    })
+                })
+                .collect();
+            Json(json!({ "claims": arr }))
+        }
+        Err(e) => {
+            error!(error = %e, "coord_hot_claims: list_live_hot_claims failed");
+            Json(json!({ "claims": [] }))
         }
     }
 }
 
-/// Mount the P1 endpoints. Merged into `base_router` by `simple.rs`.
+/// Mount the P1 + P2 endpoints. Merged into `base_router` by `simple.rs`.
 pub fn create_coord_footprints_router() -> Router<ContextNestServices> {
     Router::new()
         .route("/api/v1/coord/footprints", post(coord_footprints))
         .route("/api/v1/coord/precheck", post(coord_precheck))
+        .route("/api/v1/coord/hot-claims", get(coord_hot_claims))
 }
 
 // ───────────────────────── tests ─────────────────────────
@@ -552,5 +857,111 @@ mod tests {
         let out = render_precheck_context(Path::new("/x.rs"), &rows);
         // 1 "Newest" line + 4 "Also:" lines.
         assert!(out.matches("Also:").count() == 4);
+    }
+
+    // ────────────── hot-path matcher + config (Concord P2) ──────────────
+
+    #[test]
+    fn glob_match_segment_star_and_question() {
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(glob_match("*.rs", ".rs"), "star matches empty run");
+        assert!(!glob_match("*.rs", "main.rs.bak"));
+        assert!(glob_match("secrets*.sh", "secrets-prod.sh"));
+        assert!(!glob_match("secrets*.sh", "mysecrets.sh"));
+        assert!(glob_match("file?.txt", "file1.txt"));
+        assert!(!glob_match("file?.txt", "file10.txt"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+    }
+
+    #[test]
+    fn glob_match_double_star_whole_components() {
+        assert!(glob_match("**/.env", "/r/.env"));
+        assert!(glob_match("**/.env", ".env"));
+        assert!(glob_match("**/.env.*", "/r/.env.local"));
+        assert!(glob_match(
+            "**/.mini-ork/config/**",
+            "/private/var/x/.mini-ork/config/agents.yaml"
+        ));
+        assert!(glob_match(
+            "**/db/migrations/**",
+            "/r/db/migrations/001.sql"
+        ));
+        // `**` must match whole components — `configs` is not `config`.
+        assert!(!glob_match(
+            "**/.mini-ork/config/**",
+            "/a/.mini-ork/configs/x"
+        ));
+        // Case-sensitive literals.
+        assert!(!glob_match("**/.env", "/r/.ENV"));
+    }
+
+    #[test]
+    fn default_globs_match_positives_and_reject_near_misses() {
+        // Env-free: test the default list directly (no process-env races).
+        let defaults = parse_hot_globs(None);
+        let positives = [
+            "/private/var/x/.mini-ork/config/agents.yaml",
+            "/r/.env",
+            "/r/.env.local",
+            "/Users/u/.claude/settings.local.json",
+            "/r/db/migrations/001.sql",
+            "/x/secrets-prod.sh",
+        ];
+        for p in positives {
+            assert!(is_hot_path_with(p, &defaults), "expected hot: {p}");
+        }
+        let negatives = [
+            "/r/.envrc",
+            "/x/mysecrets.sh",
+            "/a/.mini-ork/configs/x",
+            "/w/src/main.rs",
+        ];
+        for p in negatives {
+            assert!(!is_hot_path_with(p, &defaults), "expected NOT hot: {p}");
+        }
+    }
+
+    #[test]
+    fn hot_mode_parses_ask_deny_and_falls_back_to_warn() {
+        assert_eq!(parse_hot_mode(Some("ASK")), HotMode::Ask);
+        assert_eq!(parse_hot_mode(Some("deny")), HotMode::Deny);
+        assert_eq!(parse_hot_mode(Some("bogus")), HotMode::Warn);
+        assert_eq!(parse_hot_mode(None), HotMode::Warn);
+    }
+
+    #[test]
+    fn hot_ttl_secs_parses_and_falls_back() {
+        assert_eq!(parse_hot_ttl_secs(Some("42")), 42);
+        assert_eq!(parse_hot_ttl_secs(Some("0")), 600);
+        assert_eq!(parse_hot_ttl_secs(Some("-3")), 600);
+        assert_eq!(parse_hot_ttl_secs(Some("garbage")), 600);
+        assert_eq!(parse_hot_ttl_secs(None), 600);
+    }
+
+    #[test]
+    fn hot_globs_empty_string_disables_and_splits() {
+        assert!(parse_hot_globs(Some("")).is_empty());
+        assert_eq!(
+            parse_hot_globs(Some(" **/a.yaml , , **/b.yaml ")),
+            vec!["**/a.yaml".to_string(), "**/b.yaml".to_string()]
+        );
+        assert!(!parse_hot_globs(None).is_empty(), "defaults when unset");
+    }
+
+    #[test]
+    fn render_hot_context_names_holder_and_unknown_ts() {
+        let claim = HotClaim {
+            path: "/r/.env".into(),
+            principal_id: "loop:a".into(),
+            expires_at: "2026-10-02T12:34:56Z".parse().unwrap(),
+            last_write_seq: 1,
+            last_write_ts: None,
+        };
+        let out = render_hot_context(Path::new("/r/.env"), &claim);
+        assert!(out.contains("\u{1F512}"));
+        assert!(out.contains("claimed by loop:a"));
+        assert!(out.contains("last write unknown"));
+        assert!(out.contains("claim until 2026-10-02T12:34:56Z"));
+        assert!(out.contains("mini-ork concord send loop:a"));
     }
 }

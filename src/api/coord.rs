@@ -187,6 +187,15 @@ pub struct CoordMetrics {
     /// `warn=true` (i.e. another non-lineage principal wrote the
     /// target path after the caller's last footprint on it).
     pub coord_precheck_warn: u64,
+    /// Cumulative count of write-class footprints on a hot path that
+    /// contended with a live claim held by a principal outside the
+    /// writer's lineage (Behaviour 1 — the write landed, the claim was
+    /// not taken).
+    pub coord_hot_contended_total: u64,
+    /// Cumulative count of `/api/v1/coord/precheck` responses that
+    /// reported a hot conflict (a live claim on a hot path held by a
+    /// principal outside the caller's lineage).
+    pub coord_hot_conflicts_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the
