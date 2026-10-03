@@ -263,6 +263,13 @@ impl CheckpointStore {
         allowed: &HashSet<String>,
         mut emit: impl FnMut(RestoreBatch) -> Result<()>,
     ) -> Result<RestoreSummary> {
+        // This phase runs for minutes on a large substrate and used to log
+        // nothing between "vector arena is file-backed" and the final
+        // "restored canonical operator checkpoint" — so a slow boot and a hung
+        // boot looked identical from outside. Report stage transitions and a
+        // throttled progress line instead.
+        let started = std::time::Instant::now();
+        let mut last_progress = started;
         let db = self.connection.lock().unwrap();
         let mut deleted = HashSet::new();
         for row in db
@@ -305,7 +312,15 @@ impl CheckpointStore {
             }
         }
 
+        tracing::info!(
+            basins = basins.len(),
+            members = member_ids.len(),
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: basins loaded"
+        );
+
         let mut kept: HashSet<String> = HashSet::new();
+        let mut scanned: usize = 0;
         {
             let mut statement = db.prepare(
                 "SELECT o.id, o.payload, v.data FROM objects o \
@@ -315,6 +330,7 @@ impl CheckpointStore {
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
+                scanned += 1;
                 if !allowed.contains(&id)
                     || deleted.contains(&id)
                     || !node_ids.contains(&id)
@@ -338,6 +354,15 @@ impl CheckpointStore {
                 batch.push(fragment);
                 if batch.len() == RESTORE_BATCH {
                     emit(RestoreBatch::Fragments(std::mem::take(&mut batch)))?;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                        tracing::info!(
+                            scanned,
+                            kept = kept.len(),
+                            elapsed_s = started.elapsed().as_secs(),
+                            "checkpoint restore: fragments"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
             }
             if !batch.is_empty() {
@@ -346,6 +371,14 @@ impl CheckpointStore {
         }
         drop(node_ids);
         drop(member_ids);
+
+        tracing::info!(
+            scanned,
+            kept = kept.len(),
+            basins = basins.len(),
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: reader finished streaming"
+        );
 
         basins.retain_mut(|b| {
             b.associated_fragments.retain(|id| kept.contains(id));
