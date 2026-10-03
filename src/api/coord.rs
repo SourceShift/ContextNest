@@ -214,6 +214,12 @@ pub struct CoordMetrics {
     /// returned an unrecorded change. Advisory only — never feeds
     /// `permissionDecision`.
     pub coord_precheck_unrecorded_total: u64,
+    /// Cumulative count of topic-overlap advisory lines emitted by
+    /// `coord_turn` after `CONTEXTNEST_CONCORD_TOPIC` was enabled
+    /// (Concord P3). Bumped once per UPS whose `claim_topic_notice`
+    /// returned `Ok(true)` — the dedup table prevents two consecutive
+    /// UPSes on the same pair from double-counting.
+    pub coord_topic_notices_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the

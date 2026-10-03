@@ -273,6 +273,72 @@ pub struct OwnsViolation {
     pub ts: DateTime<Utc>,
 }
 
+/// Concord P3 — one captured UserPromptSubmit prompt + its intent
+/// embedding. `dim` is stored separately from the BLOB length so a
+/// malformed blob (caught by `decode_embedding`) doesn't poison
+/// similarity comparisons with zero-dim neighbours.
+#[derive(Debug, Clone)]
+pub struct Intent {
+    pub principal_id: String,
+    pub text: String,
+    pub embedding: Vec<f32>,
+    pub dim: usize,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Concord P3 — best match across non-lineage live intents (used by the
+/// per-turn hook to decide whether to emit a notice).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicMatch {
+    pub other: String,
+    pub other_text: String,
+    pub similarity: f32,
+}
+
+/// Concord P3 — one pairing surfaced by `GET /api/v1/coord/topic-pairs`
+/// for threshold calibration. `a_text`/`b_text` ride along so the
+/// operator can tell WHY a near-pair fires.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicPair {
+    pub a: String,
+    pub b: String,
+    pub similarity: f32,
+    pub a_text: String,
+    pub b_text: String,
+}
+
+/// Encode an `f32` slice to little-endian bytes. The on-disk shape is
+/// `Vec<u8>` packed as `f32::to_le_bytes()` per element; the matching
+/// decoder [`decode_embedding`] round-trips every defined float bit-for-bit
+/// (including `-0.0`, subnormals, `f32::MIN_POSITIVE`, `f32::MAX`).
+pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`encode_embedding`]. Returns `Err(InvalidBody)` when the
+/// blob length isn't a multiple of 4 bytes — there's no other
+/// reasonable encoding failure mode, and the brief forbids new error
+/// variants, so we reuse the existing one.
+pub fn decode_embedding(b: &[u8]) -> CoordStoreResult<Vec<f32>> {
+    if b.len() % 4 != 0 {
+        return Err(CoordStoreError::InvalidBody(format!(
+            "embedding blob length {} is not a multiple of 4 bytes",
+            b.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(chunk);
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
 /// One active worktree principal surfaced by [`CoordStore::owning_worktree_principal`].
 /// `worktree` is canonicalized; `owns` is normalized (trimmed, leading
 /// `./` stripped, trailing `/` stripped, empties dropped). An empty Vec
@@ -548,6 +614,18 @@ const SCHEMA: &str = "
         ts                TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_owns_violations_wt ON owns_violations(worktree_principal, seq);
+    CREATE TABLE IF NOT EXISTS intents (
+        principal_id TEXT PRIMARY KEY,
+        text         TEXT NOT NULL,
+        embedding    BLOB NOT NULL,
+        dim          INTEGER NOT NULL,
+        updated_at   TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_intents_updated ON intents(updated_at);
+    CREATE TABLE IF NOT EXISTS topic_notices (
+        pair_key    TEXT PRIMARY KEY,
+        notified_at TEXT NOT NULL
+    );
 ";
 
 pub struct CoordStore {
@@ -1813,6 +1891,320 @@ impl CoordStore {
         }
         Ok(out)
     }
+
+    // ────────────── intents (Concord P3) ──────────────
+
+    /// Upsert one captured prompt + its embedding for `principal_id`.
+    /// Embedding is encoded as little-endian bytes via [`encode_embedding`]
+    /// so a fixed-width round-trip survives schema dumps. `at` is the
+    /// `updated_at` timestamp so tests can plant stale rows without
+    /// sleeping. An empty embedding is rejected with `InvalidBody` —
+    /// the hook's spawned task would otherwise write a 0-vector that
+    /// matches every other 0-vector by definition.
+    pub fn upsert_intent(
+        &self,
+        principal_id: &str,
+        text: &str,
+        embedding: &[f32],
+        at: DateTime<Utc>,
+    ) -> CoordStoreResult<()> {
+        validate_principal_id(principal_id)?;
+        if embedding.is_empty() {
+            return Err(CoordStoreError::InvalidBody(
+                "intent embedding must be non-empty".into(),
+            ));
+        }
+        let blob = encode_embedding(embedding);
+        let now_str = fmt_ts(at);
+        let dim = embedding.len() as i64;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO intents (principal_id, text, embedding, dim, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(principal_id) DO UPDATE SET
+                text       = excluded.text,
+                embedding  = excluded.embedding,
+                dim        = excluded.dim,
+                updated_at = excluded.updated_at",
+            params![principal_id, text, blob, dim, now_str],
+        )?;
+        Ok(())
+    }
+
+    /// Read a single intent. `None` when the principal has never had a
+    /// prompt captured (or when `principal_id` is malformed, to match
+    /// `get_principal`'s 404-vs-400 contract).
+    pub fn get_intent(&self, principal_id: &str) -> CoordStoreResult<Option<Intent>> {
+        if validate_principal_id(principal_id).is_err() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let row: Option<(String, String, Vec<u8>, i64, String)> = conn
+            .query_row(
+                "SELECT principal_id, text, embedding, dim, updated_at
+                 FROM intents WHERE principal_id = ?1",
+                params![principal_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((pid, text, blob, dim, updated_at)) => {
+                let embedding = decode_embedding(&blob)?;
+                Ok(Some(Intent {
+                    principal_id: pid,
+                    text,
+                    embedding,
+                    dim: dim.max(0) as usize,
+                    updated_at: parse_ts(&updated_at)?,
+                }))
+            }
+        }
+    }
+
+    /// All intents whose principal row is still live (`ended_at IS NULL`)
+    /// and whose `updated_at >= now - window_secs`. Newest first. The
+    /// caller passes `now` so tests can simulate staleness without
+    /// sleeping. Thin wrapper over [`live_intents_in`] so callers that
+    /// already hold the lock (e.g. `best_topic_match`) can run the same
+    /// query without re-entering the non-reentrant `std::sync::Mutex`.
+    pub fn list_live_intents(
+        &self,
+        window_secs: i64,
+        now: DateTime<Utc>,
+    ) -> CoordStoreResult<Vec<Intent>> {
+        let conn = self.lock();
+        live_intents_in(&conn, window_secs, now)
+    }
+
+    /// Upsert one (a, b) notice if (a, b) has not been noticed in the
+    /// last `dedup_secs`. `pair_key` is the two ids sorted
+    /// lexicographically and joined by '|' — a separator outside the
+    /// principal-id alphabet `[A-Za-z0-9._@/-:]`. Returns `true` when
+    /// this call took the notice (caller should emit the line and bump
+    /// the metric); `false` when the dedup window suppressed it.
+    ///
+    /// Atomicity: `INSERT ... ON CONFLICT DO UPDATE ... WHERE
+    /// notified_at < cutoff` then `conn.changes() > 0`. Two concurrent
+    /// hook calls cannot both notice the same pair.
+    pub fn claim_topic_notice(
+        &self,
+        a: &str,
+        b: &str,
+        dedup_secs: i64,
+        now: DateTime<Utc>,
+    ) -> CoordStoreResult<bool> {
+        let mut ids = [a.to_string(), b.to_string()];
+        ids.sort();
+        let pair_key = format!("{}|{}", ids[0], ids[1]);
+        let cutoff = fmt_ts(now - ChronoDuration::seconds(dedup_secs));
+        let now_str = fmt_ts(now);
+        let conn = self.lock();
+        let changes = conn.execute(
+            "INSERT INTO topic_notices (pair_key, notified_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(pair_key) DO UPDATE SET
+                notified_at = excluded.notified_at
+             WHERE topic_notices.notified_at < ?3",
+            params![pair_key, now_str, cutoff],
+        )?;
+        Ok(changes > 0)
+    }
+
+    // ────────────── topic pairs (Concord P3) ──────────────
+
+    /// Best-similarity match against non-lineage live intents. `None`
+    /// when (a) the caller has no stored intent, or (b) every other live
+    /// intent is self / lineage / dim-mismatched. The similarity is
+    /// computed via the caller's closure — keeps `EmbeddingService` out
+    /// of `CoordStore`'s dependency graph (the API layer passes
+    /// `services.embedding.calculate_similarity`).
+    ///
+    /// Concurrency: takes the lock once. `lineage_in(&conn, ...)` is
+    /// the free helper; calling `self.lineage()` here would deadlock
+    /// the non-reentrant `std::sync::Mutex`.
+    pub fn best_topic_match<F>(
+        &self,
+        caller: &str,
+        window_secs: i64,
+        now: DateTime<Utc>,
+        sim: F,
+    ) -> CoordStoreResult<Option<TopicMatch>>
+    where
+        F: Fn(&[f32], &[f32]) -> f32,
+    {
+        let conn = self.lock();
+        let caller_row: Option<(Vec<u8>, i64)> = conn
+            .query_row(
+                "SELECT embedding, dim FROM intents WHERE principal_id = ?1",
+                params![caller],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let (caller_blob, caller_dim) = match caller_row {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        if caller_dim <= 0 {
+            return Ok(None);
+        }
+        let caller_vec = decode_embedding(&caller_blob)?;
+        let lineage = lineage_in(&conn, caller, LINEAGE_MAX_HOPS)?;
+        let others = live_intents_in(&conn, window_secs, now)?;
+        let mut best: Option<TopicMatch> = None;
+        for o in others {
+            if o.principal_id == caller || lineage.contains(&o.principal_id) {
+                continue;
+            }
+            if o.dim != caller_dim as usize {
+                continue;
+            }
+            let s = sim(&caller_vec, &o.embedding);
+            if !s.is_finite() {
+                continue;
+            }
+            let dominated = match &best {
+                Some(prev) => s <= prev.similarity,
+                None => false,
+            };
+            if dominated {
+                continue;
+            }
+            best = Some(TopicMatch {
+                other: o.principal_id,
+                other_text: o.text,
+                similarity: s,
+            });
+        }
+        Ok(best)
+    }
+
+    /// All i<j pairs of live intents with equal dim where neither side
+    /// is in the other's lineage, filtered by `min`, sorted descending
+    /// (NaN treated as less-than), truncated to `limit`. Computes each
+    /// lineage exactly once per principal under one lock acquisition.
+    pub fn topic_pairs<F>(
+        &self,
+        window_secs: i64,
+        now: DateTime<Utc>,
+        min: f32,
+        limit: usize,
+        sim: F,
+    ) -> CoordStoreResult<Vec<TopicPair>>
+    where
+        F: Fn(&[f32], &[f32]) -> f32,
+    {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let intents = live_intents_in(&conn, window_secs, now)?;
+        // live_intents_in already decoded the blob into Vec<f32>, so
+        // here we just project the struct fields.
+        let mut decoded: Vec<(String, String, Vec<f32>, usize)> = Vec::with_capacity(intents.len());
+        for i in intents {
+            decoded.push((i.principal_id, i.text, i.embedding, i.dim));
+        }
+        // Group by dim so we only compare same-dim pairs.
+        let mut by_dim: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (idx, (_, _, _, d)) in decoded.iter().enumerate() {
+            by_dim.entry(*d).or_default().push(idx);
+        }
+        // Cache lineage sets keyed by principal_id.
+        let mut lineage_cache: std::collections::HashMap<String, HashSet<String>> =
+            std::collections::HashMap::new();
+        let mut pairs: Vec<TopicPair> = Vec::new();
+        for indices in by_dim.values() {
+            for (pos, &i) in indices.iter().enumerate() {
+                let (ref pid_i, ref text_i, ref emb_i, _) = decoded[i];
+                // A lineage lookup error propagates, as in best_topic_match:
+                // an empty fallback would surface lineage pairs as overlaps.
+                if !lineage_cache.contains_key(pid_i) {
+                    let l = lineage_in(&conn, pid_i, LINEAGE_MAX_HOPS)?;
+                    lineage_cache.insert(pid_i.clone(), l);
+                }
+                let lin_i = &lineage_cache[pid_i];
+                for &j in &indices[pos + 1..] {
+                    let (ref pid_j, ref text_j, ref emb_j, _) = decoded[j];
+                    if lin_i.contains(pid_j) {
+                        continue;
+                    }
+                    let s = sim(emb_i, emb_j);
+                    if !s.is_finite() || s < min {
+                        continue;
+                    }
+                    pairs.push(TopicPair {
+                        a: pid_i.clone(),
+                        b: pid_j.clone(),
+                        similarity: s,
+                        a_text: text_i.clone(),
+                        b_text: text_j.clone(),
+                    });
+                }
+            }
+        }
+        // Descending by similarity; NaN treated as less so a stray NaN
+        // never crowds the top of the list.
+        pairs.sort_by(|x, y| {
+            y.similarity
+                .partial_cmp(&x.similarity)
+                .unwrap_or(std::cmp::Ordering::Less)
+        });
+        pairs.truncate(limit);
+        Ok(pairs)
+    }
+}
+
+/// Free helper behind [`CoordStore::list_live_intents`] — same
+/// INNER JOIN `principals WHERE ended_at IS NULL` + `updated_at >=
+/// cutoff`, with the connection already locked by the caller. Newest
+/// first.
+fn live_intents_in(
+    conn: &Connection,
+    window_secs: i64,
+    now: DateTime<Utc>,
+) -> CoordStoreResult<Vec<Intent>> {
+    let cutoff = fmt_ts(now - ChronoDuration::seconds(window_secs));
+    let mut stmt = conn.prepare(
+        "SELECT i.principal_id, i.text, i.embedding, i.dim, i.updated_at
+         FROM intents i
+         INNER JOIN principals p ON p.principal_id = i.principal_id
+         WHERE p.ended_at IS NULL AND i.updated_at >= ?1
+         ORDER BY i.updated_at DESC",
+    )?;
+    let rows: Vec<(String, String, Vec<u8>, i64, String)> = stmt
+        .query_map(params![cutoff], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut out = Vec::with_capacity(rows.len());
+    for (pid, text, blob, dim, updated_at) in rows {
+        let embedding = decode_embedding(&blob)?;
+        out.push(Intent {
+            principal_id: pid,
+            text,
+            embedding,
+            dim: dim.max(0) as usize,
+            updated_at: parse_ts(&updated_at)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Canonicalize a path with the deepest-existing-ancestor strategy
