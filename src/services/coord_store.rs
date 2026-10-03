@@ -1234,6 +1234,25 @@ impl CoordStore {
         Ok(max)
     }
 
+    /// Newest footprint on `path` by ANY principal, either op. Used by
+    /// the precheck's disk-truth check (Concord P1b) to find the last
+    /// `(mtime_ns, size)` Concord knows about for the file — so the
+    /// handler can compare it with the current `stat_file` result and
+    /// warn when a writer outside the footprinter changed the file.
+    /// The existing `idx_footprints_path(path, seq)` covers the query.
+    pub fn latest_footprint(&self, path: &str) -> CoordStoreResult<Option<Footprint>> {
+        let conn = self.lock();
+        let row: Option<FootprintRow> = conn
+            .query_row(
+                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, ts
+                 FROM footprints WHERE path = ?1 ORDER BY seq DESC LIMIT 1",
+                params![path],
+                FootprintRow::from_row,
+            )
+            .optional()?;
+        row.map(FootprintRow::into_footprint).transpose()
+    }
+
     /// The set of principals in `principal_id`'s lineage, capped at
     /// `max_hops` per direction. Self is always included. See
     /// [`lineage_in`] for the traversal; this is a thin lock-then-delegate
@@ -2424,6 +2443,33 @@ mod tests {
         assert!(r2 > w1 && w1 > r1);
         // Other path → None.
         assert!(s.last_footprint_seq("loop:a", "/y.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_footprint_returns_newest_across_principals_on_path() {
+        let s = store();
+        upsert_with_labels(&s, "loop:a", None);
+        upsert_with_labels(&s, "loop:b", None);
+        // loop:a read on P, loop:b write on P (distinct mtime/size),
+        // and a write on Q — Q must NOT bleed into P's result.
+        let _r = s
+            .record_footprint("loop:a", "w1", "read", "/P", Some(100), Some(10))
+            .unwrap();
+        let w = s
+            .record_footprint("loop:b", "w2", "write", "/P", Some(200), Some(20))
+            .unwrap();
+        let _q = s
+            .record_footprint("loop:a", "w1", "write", "/Q", Some(300), Some(30))
+            .unwrap();
+        let got = s.latest_footprint("/P").unwrap().expect("present");
+        assert_eq!(got.seq, w);
+        assert_eq!(got.principal_id, "loop:b");
+        assert_eq!(got.op, "write");
+        assert_eq!(got.mtime_ns, Some(200));
+        assert_eq!(got.size, Some(20));
+        assert_eq!(got.path, "/P");
+        // Unknown path → None.
+        assert!(s.latest_footprint("/nope").unwrap().is_none());
     }
 
     #[test]

@@ -41,6 +41,20 @@
 //! store lock is held. The metrics counter is bumped only after
 //! every store call returns, then the metrics RwLock is dropped
 //! before the handler returns.
+//!
+//! ## Disk truth (P1b)
+//!
+//! The P1 precheck warns when a **recorded** footprint shows another
+//! principal wrote the file after the caller last read it. That misses
+//! writers Concord never sees — shell redirects, `sed -i`, editors,
+//! formatters, `git checkout`, humans. The P1b disk check fills that
+//! hole: when the P1 path comes back clean (the caller has a prior
+//! footprint and no foreign writer), load the newest footprint on the
+//! path from any principal, stat the file now, and report an advisory
+//! paragraph if the on-disk state diverges. Advisory only — never
+//! feeds `permissionDecision`. Enabled by default; toggled by
+//! `CONTEXTNEST_CONCORD_DISK_CHECK` and tuned with
+//! `CONTEXTNEST_CONCORD_DISK_GRACE_MS`.
 
 use axum::{
     extract::{Query, State},
@@ -49,11 +63,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::error;
 
 use crate::api::coord_turn::{self, TurnInputWithHeaders};
@@ -204,6 +218,122 @@ pub fn parse_hot_ttl_secs(raw: Option<&str>) -> i64 {
     raw.and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(600)
+}
+
+// ─────────────────────── disk-truth (P1b) config ───────────────────────
+
+/// Default grace window for the disk-truth check. Absorbs the lag of
+/// the caller's own async PostToolUse footprint: Edit #1's write
+/// footprint may not be stored yet when Edit #2's precheck fires, so a
+/// just-recorded reference stat that matches the current stat up to
+/// `DEFAULT_DISK_GRACE_MS` old is treated as "still our write".
+const DEFAULT_DISK_GRACE_MS: u64 = 2000;
+
+/// Pure parser behind [`disk_check_enabled`]. Only an exact `"0"`
+/// (trimmed) disables the check; unset or any other value enables it.
+pub fn parse_disk_check_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|s| s.trim()), Some("0"))
+}
+
+/// Pure parser behind [`disk_grace_ms`]. Non-negative integer; any
+/// failure (missing, non-numeric, negative, fractional) falls back to
+/// [`DEFAULT_DISK_GRACE_MS`].
+pub fn parse_disk_grace_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DISK_GRACE_MS)
+}
+
+/// Read `CONTEXTNEST_CONCORD_DISK_CHECK` fresh on every call. `=0`
+/// disables the disk-truth check; anything else (or unset) enables it.
+pub fn disk_check_enabled() -> bool {
+    parse_disk_check_enabled(
+        std::env::var("CONTEXTNEST_CONCORD_DISK_CHECK")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Read `CONTEXTNEST_CONCORD_DISK_GRACE_MS` fresh on every call.
+/// Invalid values fall back to [`DEFAULT_DISK_GRACE_MS`].
+pub fn disk_grace_ms() -> u64 {
+    parse_disk_grace_ms(
+        std::env::var("CONTEXTNEST_CONCORD_DISK_GRACE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// What kind of on-disk drift the precheck saw (Concord P1b). The
+/// renderer maps each variant to a slightly different paragraph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskDrift {
+    /// File still exists but `(mtime, size)` differs from the
+    /// reference and the change is older than the grace window.
+    Changed,
+    /// File is gone entirely. No grace window: a deleted file is
+    /// always a deletion, regardless of how fresh the last footprint
+    /// was — `mktemp` cleanup races don't help a future Edit.
+    Deleted,
+}
+
+/// Decide whether `current` is a drift from `ref_mtime_ns`/`ref_size`.
+/// Returns `None` for "no drift", `Some(DiskDrift::Changed)` for a
+/// stale change past `grace_ms`, and `Some(DiskDrift::Deleted)` for a
+/// file gone missing. The grace window is symmetric around `now_ns`:
+/// a recent edit by the caller (whose PostToolUse footprint hasn't
+/// landed yet) is suppressed, but so is a tiny clock skew on a network
+/// filesystem. `i128` math prevents overflow even with extreme values
+/// (mtime ~ year 2262 in ns).
+pub fn classify_disk_drift(
+    ref_mtime_ns: Option<i64>,
+    ref_size: Option<i64>,
+    current: (Option<i64>, Option<i64>),
+    now_ns: i64,
+    grace_ms: u64,
+) -> Option<DiskDrift> {
+    // No recorded stat → nothing to compare against.
+    let ref_mtime = ref_mtime_ns?;
+    let (cur_mtime, cur_size) = current;
+    // File is gone. Always a deletion — a deleted file is gone, and
+    // the grace window does not apply (a vanished file is a vanished
+    // file regardless of how fresh the last footprint was).
+    let cur_mtime = match cur_mtime {
+        Some(m) => m,
+        None => return Some(DiskDrift::Deleted),
+    };
+    // Identical stat → no drift.
+    if cur_mtime == ref_mtime && cur_size == ref_size {
+        return None;
+    }
+    // Symmetric grace window around `now_ns`. Suppresses a just-made
+    // change (recent past) AND a tiny clock skew (recent future).
+    let grace_ns = grace_ms as i128 * 1_000_000;
+    let diff_ns = (now_ns as i128 - cur_mtime as i128).abs();
+    if diff_ns < grace_ns {
+        return None;
+    }
+    Some(DiskDrift::Changed)
+}
+
+/// Render the unrecorded-change advisory. Exact shape the brief
+/// specifies: `[concord]` header, the backticked path, the
+/// `"<ts RFC3339 Z>"` of the latest recorded footprint, the writer
+/// attribution line, and the U+2014 em dash before "Re-read it before
+/// editing." For `Deleted`, "changed on disk" becomes "was deleted on
+/// disk" — the rest of the sentence is identical so the model has the
+/// same instruction regardless of variant.
+pub fn render_unrecorded_context(path: &Path, drift: DiskDrift, last_ts: DateTime<Utc>) -> String {
+    let ts = last_ts.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let verb = match drift {
+        DiskDrift::Changed => "changed on disk",
+        DiskDrift::Deleted => "was deleted on disk",
+    };
+    format!(
+        "[concord] `{}` {} after the last change any agent recorded ({}), and no agent recorded this write \u{2014} a shell command (possibly your own), an editor, a formatter, or a git operation. Re-read it before editing.",
+        path.display(),
+        verb,
+        ts,
+    )
 }
 
 /// Match `path` against a component glob `pattern`. Both are split on
@@ -572,16 +702,23 @@ pub async fn coord_footprints(
 /// caller (read-only — no upsert, no bind), finds the newest writes to
 /// `path` from any non-lineage principal since the caller's last
 /// footprint on it (P1), and layers on the hot-conflict check for
-/// shared-config paths (P2).
+/// shared-config paths (P2). When the P1 path is clean (caller has a
+/// premise and no recorded foreign writer), the P1b disk check
+/// compares the newest recorded footprint on the path with the
+/// current stat and appends an advisory paragraph when an unrecorded
+/// writer changed the file (Concord P1b).
 ///
 /// Always answers 200. `permissionDecision` is set — to `"ask"` or
 /// `"deny"`, never `"allow"` — only when `hot` is some AND
 /// `CONTEXTNEST_CONCORD_HOT_MODE` is `ask`/`deny`; otherwise the key is
-/// absent (see the module doc). Every request — no-op tools, unresolved
-/// paths or principals, and store errors included — counts toward
-/// `coord_precheck_total`; `coord_precheck_warn` counts only the P1
-/// stale-premise warnings; `coord_hot_conflicts_total` counts only the
-/// hot conflicts.
+/// absent (see the module doc). The unrecorded advisory is
+/// strictly informational and never feeds `permissionDecision`. Every
+/// request — no-op tools, unresolved paths or principals, and store
+/// errors included — counts toward `coord_precheck_total`;
+/// `coord_precheck_warn` counts only the P1 stale-premise warnings;
+/// `coord_hot_conflicts_total` counts only the hot conflicts;
+/// `coord_precheck_unrecorded_total` counts only the P1b unrecorded
+/// disk hits.
 pub async fn coord_precheck(
     State(services): State<ContextNestServices>,
     headers: HeaderMap,
@@ -601,9 +738,16 @@ pub async fn coord_precheck(
         if outcome.owns.is_some() {
             m.coord_owns_violations_total = m.coord_owns_violations_total.saturating_add(1);
         }
+        if outcome.unrecorded.is_some() {
+            m.coord_precheck_unrecorded_total = m.coord_precheck_unrecorded_total.saturating_add(1);
+        }
     }
     let p1_text = match (&outcome.path, outcome.warn) {
         (Some(p), true) => render_precheck_context(p, &outcome.others),
+        _ => String::new(),
+    };
+    let unrecorded_text = match (&outcome.path, &outcome.unrecorded) {
+        (Some(p), Some((drift, ts))) => render_unrecorded_context(p, *drift, *ts),
         _ => String::new(),
     };
     let hot_text = match (&outcome.path, &outcome.hot) {
@@ -614,10 +758,10 @@ pub async fn coord_precheck(
         Some(hit) => render_owns_context(&hit.rel, &hit.owns),
         None => String::new(),
     };
-    // Compose the three advisory strings in [p1, hot, owns] order so
-    // existing hot/p1 reasons (and tests that read them) stay
+    // Compose the four advisory strings in [p1, unrecorded, hot, owns]
+    // order so existing hot/p1 reasons (and tests that read them) stay
     // byte-identical when only one branch fires.
-    let additional_context = join_context(&[&p1_text, &hot_text, &owns_text]);
+    let additional_context = join_context(&[&p1_text, &unrecorded_text, &hot_text, &owns_text]);
 
     let others_json: Vec<Value> = outcome
         .others
@@ -634,7 +778,9 @@ pub async fn coord_precheck(
         .collect();
 
     // Compose the hot + owns decisions strictest-wins. Both contribute
-    // ONLY when their check fired; Audit / Warn map to None.
+    // ONLY when their check fired; Audit / Warn map to None. The
+    // unrecorded signal is advisory only — never participates in the
+    // permissionDecision composition.
     #[derive(PartialOrd, Ord, Eq, PartialEq, Clone, Copy)]
     enum Decision {
         None,
@@ -692,6 +838,7 @@ pub async fn coord_precheck(
         "others": others_json,
         "hot_conflict": outcome.hot.is_some(),
         "owns_violation": outcome.owns.is_some(),
+        "unrecorded_change": outcome.unrecorded.is_some(),
         "hookSpecificOutput": hook,
     }))
 }
@@ -716,7 +863,9 @@ fn join_context(parts: &[&str]) -> String {
 /// The pure decision behind `coord_precheck`. `warn`/`others` carry the
 /// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim;
 /// `owns` carries the P2d owns-scope audit hit (some when the target
-/// is outside the worktree's claim, none otherwise).
+/// is outside the worktree's claim, none otherwise); `unrecorded`
+/// carries the P1b disk-truth drift (when the file on disk no longer
+/// matches the newest recorded footprint on the path).
 ///
 /// The hot and owns checks both run BEFORE the P1 no-prior-footprint
 /// early return so a caller that has never touched the path still sees
@@ -730,6 +879,10 @@ struct PrecheckOutcome {
     path: Option<PathBuf>,
     hot: Option<HotClaim>,
     owns: Option<OwnsHit>,
+    /// `(drift, ts)` when the P1b disk check fired: on-disk state
+    /// diverged from the latest recorded footprint on the path, past
+    /// the grace window (or the file is gone). `None` otherwise.
+    unrecorded: Option<(DiskDrift, DateTime<Utc>)>,
 }
 
 /// One owns-scope audit hit (Concord P2d). `worktree_principal` is the
@@ -756,6 +909,7 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         path: None,
         hot: None,
         owns: None,
+        unrecorded: None,
     };
     let tool_name = input
         .inner
@@ -826,6 +980,7 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 path: Some(path),
                 hot: None,
                 owns,
+                unrecorded: None,
             }
         }
     };
@@ -854,28 +1009,70 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         None
     };
 
-    let outcome: CoordStoreResult<(bool, Vec<OtherWriter>)> = (|| {
+    let outcome: CoordStoreResult<(bool, Vec<OtherWriter>, Option<i64>)> = (|| {
         let last = match store.last_footprint_seq(&principal_id, &path_str)? {
             Some(s) => s,
-            None => return Ok((false, Vec::new())),
+            None => return Ok((false, Vec::new(), None)),
         };
         let excl: HashSet<String> = store.lineage(&principal_id, LINEAGE_MAX_HOPS)?;
         let others = store.writes_after(&path_str, last, &excl, 3)?;
-        Ok((!others.is_empty(), others))
+        Ok((!others.is_empty(), others, Some(last)))
     })();
-    let (warn, others) = match outcome {
-        Ok((warn, others)) => (warn, others),
+    let (warn, others, last) = match outcome {
+        Ok((warn, others, last)) => (warn, others, last),
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_precheck: store query failed");
-            (false, Vec::new())
+            (false, Vec::new(), None)
         }
     };
+
+    // Disk-truth check (Concord P1b). Only fires when the P1 path was
+    // clean: caller has a prior footprint on the path AND no recorded
+    // foreign writer. Compares the newest recorded footprint on the
+    // path (any principal) with the current stat — past the grace
+    // window, this is an unrecorded write. Disabled by setting
+    // CONTEXTNEST_CONCORD_DISK_CHECK=0. Errors log and degrade to
+    // "no unrecorded change" so the hook can never block.
+    let unrecorded: Option<(DiskDrift, DateTime<Utc>)> = if !others.is_empty()
+        || last.is_none()
+        || !disk_check_enabled()
+    {
+        None
+    } else {
+        match store.latest_footprint(&path_str) {
+            Ok(Some(fp)) => {
+                let now_ns: i64 = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(d) => {
+                        let n = d.as_nanos();
+                        if n > i64::MAX as u128 {
+                            i64::MAX
+                        } else {
+                            n as i64
+                        }
+                    }
+                    Err(_) => 0,
+                };
+                let current = stat_file(&path);
+                match classify_disk_drift(fp.mtime_ns, fp.size, current, now_ns, disk_grace_ms()) {
+                    Some(drift) => Some((drift, fp.ts)),
+                    None => None,
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                error!(error = %e, principal_id = %principal_id, "coord_precheck: latest_footprint failed");
+                None
+            }
+        }
+    };
+
     PrecheckOutcome {
         warn,
         others,
         path: Some(path),
         hot,
         owns,
+        unrecorded,
     }
 }
 
@@ -1239,5 +1436,146 @@ mod tests {
         assert!(out.contains("src/a.rs, docs"));
         assert!(out.contains("Stay inside the claim"));
         assert!(out.contains("re-scope the worktree"));
+    }
+
+    // ────────────── disk-truth (P1b) ──────────────
+
+    #[test]
+    fn parse_disk_check_enabled_treats_only_exact_zero_as_off() {
+        assert!(!parse_disk_check_enabled(Some("0")));
+        assert!(!parse_disk_check_enabled(Some(" 0 ")));
+        assert!(parse_disk_check_enabled(None));
+        assert!(parse_disk_check_enabled(Some("")));
+        assert!(parse_disk_check_enabled(Some("1")));
+        assert!(parse_disk_check_enabled(Some("false")));
+    }
+
+    #[test]
+    fn parse_disk_grace_ms_falls_back_on_garbage() {
+        assert_eq!(parse_disk_grace_ms(None), 2000);
+        assert_eq!(parse_disk_grace_ms(Some("abc")), 2000);
+        assert_eq!(parse_disk_grace_ms(Some("-5")), 2000);
+        assert_eq!(parse_disk_grace_ms(Some("1.5")), 2000);
+        assert_eq!(parse_disk_grace_ms(Some("0")), 0);
+        assert_eq!(parse_disk_grace_ms(Some(" 250 ")), 250);
+        assert_eq!(parse_disk_grace_ms(Some("600000")), 600000);
+    }
+
+    #[test]
+    fn classify_disk_drift_none_for_no_reference() {
+        assert!(classify_disk_drift(None, None, (Some(1), Some(2)), 1_000_000_000, 2000).is_none());
+        assert!(
+            classify_disk_drift(None, Some(7), (Some(1), Some(2)), 1_000_000_000, 2000).is_none(),
+            "ref_size alone is not enough — ref_mtime is the gate"
+        );
+    }
+
+    #[test]
+    fn classify_disk_drift_none_when_stats_match() {
+        let now = 10_000_000_000_i64;
+        assert_eq!(
+            classify_disk_drift(Some(7), Some(42), (Some(7), Some(42)), now, 2000),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_disk_drift_deleted_ignores_grace() {
+        let now = 10_000_000_000_i64;
+        // File vanished — Deleted even with a 1-hour grace.
+        assert_eq!(
+            classify_disk_drift(Some(7), Some(42), (None, None), now, 3_600_000),
+            Some(DiskDrift::Deleted)
+        );
+        assert_eq!(
+            classify_disk_drift(Some(7), Some(42), (None, None), now, 0),
+            Some(DiskDrift::Deleted)
+        );
+    }
+
+    #[test]
+    fn classify_disk_drift_size_change_past_grace_is_changed() {
+        let now = 10_000_000_000_i64;
+        assert_eq!(
+            classify_disk_drift(Some(7), Some(42), (Some(8), Some(43)), now, 2000),
+            Some(DiskDrift::Changed)
+        );
+    }
+
+    #[test]
+    fn classify_disk_drift_suppresses_within_window_in_both_directions() {
+        let now = 10_000_000_000_i64;
+        // Grace 0 — any tiny diff reports.
+        assert_eq!(
+            classify_disk_drift(Some(7), Some(42), (Some(now), Some(42)), now, 0),
+            Some(DiskDrift::Changed)
+        );
+        // Grace 2000ms — an mtime 1ms in the past is within the window.
+        assert_eq!(
+            classify_disk_drift(
+                Some(7),
+                Some(42),
+                (Some(now - 1_000_000), Some(42)),
+                now,
+                2000
+            ),
+            None
+        );
+        // Future 10s — way past grace 0.
+        assert_eq!(
+            classify_disk_drift(
+                Some(7),
+                Some(42),
+                (Some(now + 10 * 1_000_000_000), Some(42)),
+                now,
+                0
+            ),
+            Some(DiskDrift::Changed)
+        );
+        // Future 10s — past grace 2000ms too.
+        assert_eq!(
+            classify_disk_drift(
+                Some(7),
+                Some(42),
+                (Some(now + 10 * 1_000_000_000), Some(42)),
+                now,
+                2000
+            ),
+            Some(DiskDrift::Changed)
+        );
+        // Future 1s — within grace 2000ms.
+        assert_eq!(
+            classify_disk_drift(
+                Some(7),
+                Some(42),
+                (Some(now + 1_000_000_000), Some(42)),
+                now,
+                2000
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn render_unrecorded_context_changed_uses_present_tense() {
+        let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Changed, ts);
+        assert!(out.contains("[concord]"));
+        assert!(out.contains("`/work/f.txt`"));
+        assert!(out.contains("changed on disk"));
+        assert!(out.contains("2026-10-03T12:34:56Z"));
+        assert!(out.contains("Re-read it before editing."));
+        assert!(!out.contains("was deleted on disk"));
+    }
+
+    #[test]
+    fn render_unrecorded_context_deleted_uses_past_tense() {
+        let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Deleted, ts);
+        assert!(out.contains("[concord]"));
+        assert!(out.contains("`/work/f.txt`"));
+        assert!(out.contains("was deleted on disk"));
+        assert!(!out.contains("changed on disk"));
+        assert!(out.contains("Re-read it before editing."));
     }
 }

@@ -206,6 +206,14 @@ pub struct CoordMetrics {
     /// (Concord P2d). Bumped once per precheck that returned an owns
     /// hit, regardless of `owns_mode()` (audit/ask/deny).
     pub coord_owns_violations_total: u64,
+    /// Cumulative count of precheck responses that reported an
+    /// unrecorded on-disk change — the caller's premise matched the
+    /// newest footprint on the path, the recorded-state-vs-disk-state
+    /// check fired, and the renderer emitted the disk-truth advisory
+    /// paragraph (Concord P1b). Bumped once per precheck that
+    /// returned an unrecorded change. Advisory only — never feeds
+    /// `permissionDecision`.
+    pub coord_precheck_unrecorded_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the
