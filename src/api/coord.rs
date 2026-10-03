@@ -196,6 +196,10 @@ pub struct CoordMetrics {
     /// reported a hot conflict (a live claim on a hot path held by a
     /// principal outside the caller's lineage).
     pub coord_hot_conflicts_total: u64,
+    /// Cumulative count of per-path lines emitted in the
+    /// UserPromptSubmit turn digest (Concord P2c); excludes the
+    /// header line and the `(+(N) more)` summary line.
+    pub coord_digest_lines_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the

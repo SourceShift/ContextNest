@@ -55,9 +55,14 @@ use std::path::Path;
 use tracing::{error, warn};
 
 use crate::services::coord_store::{
-    validate_principal_id, CoordStore, CoordStoreResult, Message, PrincipalUpsert,
+    validate_principal_id, CoordStore, CoordStoreResult, Message, PrincipalUpsert, TurnDigest,
 };
 use crate::services::ContextNestServices;
+
+/// Maximum number of distinct paths surfaced in one turn digest. The
+/// brief caps per-path lines at 5; when more qualify, the renderer
+/// appends a `(+(N) more)` summary line.
+pub const DIGEST_MAX_PATHS: usize = 5;
 
 // ───────────────────────── pure resolution helpers ─────────────────────────
 
@@ -224,6 +229,74 @@ pub fn render_context(principal_id: &str, messages: &[Message]) -> String {
     out
 }
 
+/// Pure parser behind [`digest_enabled`]. `0`/`false`/`off` (trimmed,
+/// case-insensitive) disable the digest; `None` and every other value
+/// enable it. Mirrors the `parse_hot_mode`/`hot_mode` split in
+/// `coord_footprints.rs:113-140`.
+pub fn parse_digest_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        Some(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !matches!(t.as_str(), "0" | "false" | "off")
+        }
+        None => true,
+    }
+}
+
+/// Read `CONTEXTNEST_CONCORD_DIGEST` fresh on every call. Defaults to
+/// enabled when unset.
+pub fn digest_enabled() -> bool {
+    parse_digest_enabled(std::env::var("CONTEXTNEST_CONCORD_DIGEST").ok().as_deref())
+}
+
+/// Pure renderer for the turn digest. Returns `(text, path_lines)`:
+/// `text` is the body to splice after the mailbox (empty when there
+/// are no changes), and `path_lines` is the number of per-path lines
+/// emitted — the metric counter excludes the header and the
+/// `(+(N) more)` line.
+///
+/// Exact wire format (byte-for-byte):
+///   header: `[concord] changed by other agents since your last turn \
+///            (judge whether it affects your plan):`
+///   line:   `\n- <path> — <principal_id> (<harness|unknown>, \
+///            <cwd basename|unknown>) at <RFC3339 Z>` (U+2014 EM DASH)
+///   suffix: ` (+K other writer)` or ` (+K other writers)` when K >= 1
+///   tail:   `\n(+N more)` when total_paths > changes.len()
+pub fn render_digest(d: &TurnDigest) -> (String, usize) {
+    if d.changes.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut out = String::from(
+        "[concord] changed by other agents since your last turn (judge whether it affects your plan):",
+    );
+    for change in &d.changes {
+        let harness = change.harness.as_deref().unwrap_or("unknown");
+        let cwd = change
+            .cwd
+            .as_deref()
+            .and_then(|c| {
+                let p = Path::new(c);
+                p.file_name().and_then(|n| n.to_str())
+            })
+            .unwrap_or("unknown");
+        let ts = change.ts.to_rfc3339_opts(SecondsFormat::Secs, true);
+        out.push_str(&format!(
+            "\n- {} — {} ({}, {}) at {}",
+            change.path, change.principal_id, harness, cwd, ts
+        ));
+        if change.writer_count > 1 {
+            let k = change.writer_count - 1;
+            let noun = if k == 1 { "writer" } else { "writers" };
+            out.push_str(&format!(" (+{k} other {noun})"));
+        }
+    }
+    if d.total_paths > d.changes.len() {
+        let more = d.total_paths - d.changes.len();
+        out.push_str(&format!("\n(+{more} more)"));
+    }
+    (out, d.changes.len())
+}
+
 // ───────────────────────── turn pipeline ─────────────────────────
 
 /// Parsed hook body. All optional so malformed bodies don't error —
@@ -249,6 +322,13 @@ pub struct TurnOutcome {
     pub delivered: Vec<String>,
     pub hook_event_name: String,
     pub additional_context: String,
+    /// Number of per-path digest lines emitted by `run_turn`. The
+    /// async handler bumps `coord_digest_lines_total` by this value
+    /// after `run_turn` returns (the metric lives behind a tokio
+    /// RwLock that `run_turn` — sync — can't acquire). Zero when the
+    /// digest is disabled, empty, or this turn isn't a
+    /// UserPromptSubmit.
+    pub digest_lines: usize,
 }
 
 /// Run one turn pipeline synchronously against `store`.
@@ -258,10 +338,19 @@ pub struct TurnOutcome {
 ///   2. Upsert + bind.
 ///   3. Claim undelivered messages.
 ///   4. Render context.
+///   5. On UserPromptSubmit only: take + render the turn digest, and
+///      append it after the mailbox block when non-empty and the
+///      `CONTEXTNEST_CONCORD_DIGEST` env var isn't disabled. The
+///      cursor ALWAYS advances, even when disabled or empty, so once-only
+///      semantics survive a turn that opts out.
 ///
 /// Errors from the store bubble up so the handler can choose its
 /// fallback path. `Err(_)` here is mapped to `bound=false`,
-/// `delivered=[]`, empty context by `coord_turn`.
+/// `delivered=[]`, empty context by `coord_turn`. A digest error
+/// (logged at `warn`) degrades to mailbox-only — it does NOT
+/// propagate, because `claim_undelivered` has already stamped the
+/// messages delivered and a propagated Err would discard them through
+/// the handler's `Err → empty context` path.
 pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreResult<TurnOutcome> {
     let cwd_path = Path::new(input.inner.cwd.as_deref().unwrap_or(""));
     let (principal_id, explicit) = match resolve_principal(
@@ -279,6 +368,7 @@ pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreR
                 delivered: Vec::new(),
                 hook_event_name: input.inner.hook_event_name.clone().unwrap_or_default(),
                 additional_context: String::new(),
+                digest_lines: 0,
             });
         }
     };
@@ -329,7 +419,37 @@ pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreR
     // brief's "deliver at most once through hookSpecificOutput".
     let messages = store.claim_undelivered(&principal_id, &input.inner.session_id, 10)?;
     let delivered: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
-    let additional_context = render_context(&principal_id, &messages);
+    let mut additional_context = render_context(&principal_id, &messages);
+
+    let mut digest_lines: usize = 0;
+    if input.inner.hook_event_name.as_deref() == Some("UserPromptSubmit") {
+        // Always advance the cursor (once-only), even when disabled
+        // or empty. Take the digest first; if it fails, log and
+        // degrade to mailbox-only — do NOT propagate.
+        let principal_id_for_digest = principal_id.clone();
+        match store.take_turn_digest(&principal_id_for_digest, DIGEST_MAX_PATHS) {
+            Ok(digest) => {
+                if digest_enabled() {
+                    let (text, lines) = render_digest(&digest);
+                    if !text.is_empty() {
+                        if additional_context.is_empty() {
+                            additional_context = text;
+                        } else {
+                            additional_context = format!("{additional_context}\n\n{text}");
+                        }
+                        digest_lines = lines;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    principal_id = %principal_id_for_digest,
+                    "coord_turn: digest failed"
+                );
+            }
+        }
+    }
 
     Ok(TurnOutcome {
         principal_id: Some(principal_id),
@@ -337,6 +457,7 @@ pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreR
         delivered,
         hook_event_name: input.inner.hook_event_name.clone().unwrap_or_default(),
         additional_context,
+        digest_lines,
     })
 }
 
@@ -396,9 +517,22 @@ pub async fn coord_turn(
                 delivered: Vec::new(),
                 hook_event_name: input.inner.hook_event_name.clone().unwrap_or_default(),
                 additional_context: String::new(),
+                digest_lines: 0,
             }
         }
     };
+
+    // Bump the metric AFTER the store call returns and the lock is
+    // released. run_turn is sync (it holds std::sync::Mutex, not the
+    // tokio RwLock the metric lives behind); doing the bump here
+    // matches coord_footprints' "bump metrics only after the store
+    // call returns" convention.
+    if outcome.digest_lines > 0 {
+        let mut m = services.coord_metrics.write().await;
+        m.coord_digest_lines_total = m
+            .coord_digest_lines_total
+            .saturating_add(outcome.digest_lines as u64);
+    }
 
     let hook_event = if outcome.hook_event_name.is_empty() {
         "Unknown".to_string()
@@ -464,7 +598,7 @@ pub fn parse_input(headers: &HeaderMap, body: &[u8]) -> TurnInputWithHeaders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::coord_store::{CoordStore, PrincipalUpsert};
+    use crate::services::coord_store::{CoordStore, DigestChange, PrincipalUpsert};
     use chrono::Utc;
 
     #[test]
@@ -639,6 +773,126 @@ mod tests {
         assert!(!out.bound);
         assert!(out.delivered.is_empty());
         assert!(out.additional_context.is_empty());
+        assert_eq!(out.digest_lines, 0);
+    }
+
+    #[test]
+    fn parse_digest_enabled_handles_disabling_values() {
+        assert!(parse_digest_enabled(None));
+        assert!(parse_digest_enabled(Some("")));
+        assert!(parse_digest_enabled(Some("anything")));
+        assert!(!parse_digest_enabled(Some("0")));
+        assert!(!parse_digest_enabled(Some("false")));
+        assert!(!parse_digest_enabled(Some("off")));
+        assert!(!parse_digest_enabled(Some("  FALSE  ")));
+        assert!(!parse_digest_enabled(Some("Off")));
+    }
+
+    fn mk_change(path: &str, pid: &str, harness: Option<&str>, cwd: Option<&str>) -> DigestChange {
+        DigestChange {
+            path: path.into(),
+            principal_id: pid.into(),
+            seq: 1,
+            ts: chrono::DateTime::parse_from_rfc3339("2026-10-02T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            harness: harness.map(str::to_string),
+            cwd: cwd.map(str::to_string),
+            writer_count: 1,
+        }
+    }
+
+    #[test]
+    fn render_digest_empty_for_no_changes() {
+        let d = TurnDigest {
+            changes: Vec::new(),
+            total_paths: 0,
+            cursor_initialized: false,
+        };
+        let (text, lines) = render_digest(&d);
+        assert_eq!(text, "");
+        assert_eq!(lines, 0);
+    }
+
+    #[test]
+    fn render_digest_single_line_exact_format() {
+        let mut c = mk_change("/r/f.rs", "loop:b", Some("codex"), Some("/w/repo-b"));
+        c.writer_count = 1;
+        let d = TurnDigest {
+            changes: vec![c],
+            total_paths: 1,
+            cursor_initialized: false,
+        };
+        let (text, lines) = render_digest(&d);
+        assert_eq!(lines, 1);
+        assert!(
+            text.starts_with(
+                "[concord] changed by other agents since your last turn \
+                 (judge whether it affects your plan):"
+            ),
+            "header must be byte-exact; got {text:?}"
+        );
+        assert!(
+            text.contains("- /r/f.rs — loop:b (codex, repo-b) at 2026-10-02T12:00:00Z"),
+            "exact line format; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_digest_appends_more_when_total_exceeds_limit() {
+        let mut changes = Vec::new();
+        for i in 0..3 {
+            let mut c = mk_change(
+                &format!("/r/f{i}.rs"),
+                "loop:b",
+                Some("codex"),
+                Some("/w/repo-b"),
+            );
+            c.writer_count = 1;
+            changes.push(c);
+        }
+        let d = TurnDigest {
+            changes,
+            total_paths: 7,
+            cursor_initialized: false,
+        };
+        let (text, lines) = render_digest(&d);
+        assert_eq!(lines, 3);
+        assert!(text.contains("\n(+4 more)"), "more line; got {text:?}");
+        // No 'other writer' suffix when count==1.
+        assert!(!text.contains("other writer"));
+    }
+
+    #[test]
+    fn render_digest_other_writer_suffix_uses_singular_for_k_equals_1() {
+        let mut c = mk_change("/r/f.rs", "loop:b", Some("codex"), Some("/w/repo-b"));
+        c.writer_count = 2;
+        let d = TurnDigest {
+            changes: vec![c],
+            total_paths: 1,
+            cursor_initialized: false,
+        };
+        let (text, _) = render_digest(&d);
+        assert!(
+            text.contains("(+1 other writer)"),
+            "K=1 must use singular; got {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_digest_other_writer_suffix_uses_plural_for_k_greater_than_1() {
+        let mut c = mk_change("/r/f.rs", "loop:b", Some("codex"), Some("/w/repo-b"));
+        c.writer_count = 5;
+        let d = TurnDigest {
+            changes: vec![c],
+            total_paths: 1,
+            cursor_initialized: false,
+        };
+        let (text, _) = render_digest(&d);
+        assert!(
+            text.contains("(+4 other writers)"),
+            "K=4 must use plural; got {text:?}"
+        );
     }
 
     #[test]

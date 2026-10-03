@@ -198,6 +198,41 @@ pub struct OtherWriter {
     pub cwd: Option<String>,
 }
 
+/// One row in the UserPromptSubmit turn digest (Concord P2c).
+/// Distinct from `OtherWriter` in two ways: it's grouped per-path (one
+/// row per touched path, not per writer), it carries the path itself
+/// (the precheck already has it injected), and it counts distinct
+/// non-lineage writers so the renderer can append a "+(K other
+/// writers)" suffix when K >= 1.
+#[derive(Debug, Clone, Serialize)]
+pub struct DigestChange {
+    pub path: String,
+    pub principal_id: String,
+    pub seq: i64,
+    pub ts: DateTime<Utc>,
+    pub harness: Option<String>,
+    pub cwd: Option<String>,
+    /// Number of distinct non-lineage writer principals that touched
+    /// `path` in the examined window. `1` means only `principal_id`
+    /// wrote it; the renderer omits the suffix in that case.
+    pub writer_count: usize,
+}
+
+/// Result of [`CoordStore::take_turn_digest`]. `changes` is already
+/// newest-first and already truncated to the caller-supplied `limit`.
+/// `total_paths` is the un-truncated grouped-row count, so the
+/// renderer can append a `(+(total-changes) more)` line when needed.
+/// `cursor_initialized` is `true` when this call promoted a NULL
+/// `digest_seq` to the current MAX(seq) — the caller renders nothing
+/// for that first call (the brief scopes all digest behaviour to
+/// UserPromptSubmit, not SessionStart).
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnDigest {
+    pub changes: Vec<DigestChange>,
+    pub total_paths: usize,
+    pub cursor_initialized: bool,
+}
+
 /// A live TTL-bound claim on a hot shared-config path (Concord P2).
 /// One row per path in `hot_claims`; `last_write_ts` is hydrated from
 /// the `footprints` row whose `seq == last_write_seq` (rendered as
@@ -348,6 +383,27 @@ fn prune_old_footprints(conn: &Connection, days: i64) -> rusqlite::Result<usize>
     conn.execute("DELETE FROM footprints WHERE ts < ?1", params![cutoff])
 }
 
+/// Idempotent migration for the `principals.digest_seq` column
+/// (Concord P2c). Reads `PRAGMA table_info(principals)` and runs the
+/// `ALTER TABLE … ADD COLUMN` only when the column is absent, so a
+/// fresh DB and an upgraded DB share one code path and a second
+/// `open()` is a no-op instead of "duplicate column name".
+///
+/// The column is intentionally nullable: pre-existing principal rows
+/// from before the upgrade have no digest cursor, and `take_turn_digest`
+/// treats a NULL cursor as "initialize on first turn".
+fn ensure_digest_seq_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(principals)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !cols.iter().any(|c| c == "digest_seq") {
+        conn.execute("ALTER TABLE principals ADD COLUMN digest_seq INTEGER", [])?;
+    }
+    Ok(())
+}
+
 /// Compute status from a stored principal at `now`.
 pub fn status_at(p: &Principal, now: DateTime<Utc>) -> PrincipalStatus {
     if p.ended_at.is_some() {
@@ -483,6 +539,7 @@ impl CoordStore {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        ensure_digest_seq_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -494,6 +551,7 @@ impl CoordStore {
     pub fn open_in_memory() -> CoordStoreResult<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        ensure_digest_seq_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -1209,6 +1267,207 @@ impl CoordStore {
             });
         }
         Ok(out)
+    }
+
+    // ────────────── turn digest (Concord P2c) ──────────────
+
+    /// Current `digest_seq` for `principal_id`. `None` when the
+    /// principal row is missing OR when the cursor was never
+    /// initialised (pre-upgrade row or fresh principal). Tests use
+    /// this to assert cursor advancement after a turn.
+    pub fn digest_cursor(&self, principal_id: &str) -> CoordStoreResult<Option<i64>> {
+        if validate_principal_id(principal_id).is_err() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let cursor: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT digest_seq FROM principals WHERE principal_id = ?1",
+                params![principal_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(cursor.flatten())
+    }
+
+    /// Compute the once-only turn digest for `principal_id`: writes
+    /// on paths the caller has any footprint on, by non-lineage
+    /// principals, with `seq` strictly greater than the caller's
+    /// `digest_seq` cursor and at most `limit` paths returned
+    /// (newest first). Always advances the cursor to MAX(footprints.seq)
+    /// before returning, even when the digest is empty — that's what
+    /// makes subsequent calls skip already-digested writes.
+    ///
+    /// The whole method runs under one `self.lock()` acquisition
+    /// (`std::sync::Mutex` is non-reentrant, so the inner lineage
+    /// walk uses the free `lineage_in(&conn, …)` helper, not
+    /// `self.lineage()`).
+    pub fn take_turn_digest(
+        &self,
+        principal_id: &str,
+        limit: usize,
+    ) -> CoordStoreResult<TurnDigest> {
+        if validate_principal_id(principal_id).is_err() {
+            return Ok(TurnDigest {
+                changes: Vec::new(),
+                total_paths: 0,
+                cursor_initialized: false,
+            });
+        }
+        let conn = self.lock();
+
+        // Missing principal → empty digest (matches claim_undelivered's
+        // "unknown principal returns Ok(vec![])" contract for a
+        // first-turn session that hasn't yet propagated its row).
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM principals WHERE principal_id = ?1",
+            params![principal_id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(TurnDigest {
+                changes: Vec::new(),
+                total_paths: 0,
+                cursor_initialized: false,
+            });
+        }
+
+        let cursor: Option<i64> = conn.query_row(
+            "SELECT digest_seq FROM principals WHERE principal_id = ?1",
+            params![principal_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?;
+
+        // MAX() over an empty footprints table is NULL → COALESCE to 0
+        // so the bounded query `(cursor, hi]` stays a valid range even
+        // when no writes exist yet.
+        let hi: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM footprints", [], |r| {
+            r.get(0)
+        })?;
+
+        if cursor.is_none() {
+            // Lazy-init cursor on first turn; nothing to render.
+            conn.execute(
+                "UPDATE principals SET digest_seq = ?1 WHERE principal_id = ?2",
+                params![hi, principal_id],
+            )?;
+            return Ok(TurnDigest {
+                changes: Vec::new(),
+                total_paths: 0,
+                cursor_initialized: true,
+            });
+        }
+        let cursor = cursor.expect("checked Some above");
+
+        // Lineage exclude set. Free fn, not `self.lineage()` —
+        // re-entering the std Mutex would deadlock.
+        let lineage = lineage_in(&conn, principal_id, LINEAGE_MAX_HOPS)?;
+        let exclude_json = serde_json::to_string(&lineage.iter().cloned().collect::<Vec<_>>())?;
+
+        // Per-path aggregation: pick the newest qualifying seq, count
+        // distinct non-lineage writers on that path, and join the
+        // writer's harness + cwd back from principals.
+        //
+        // CTE shape so the WHERE in the outer scan can reference the
+        // precomputed MAX(seq) without a self-join:
+        //   eligible: every write in (cursor, hi] by a non-lineage
+        //   principal that the caller has touched at any earlier seq
+        //   top:     per-path MAX(seq) from eligible
+        let mut stmt = conn.prepare(
+            "WITH eligible AS (
+                 SELECT f.seq, f.principal_id, f.path, f.ts
+                 FROM footprints f
+                 WHERE f.op = 'write'
+                   AND f.seq > ?1 AND f.seq <= ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?3) AS ex
+                       WHERE ex.value = f.principal_id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM footprints m
+                       WHERE m.principal_id = ?4
+                         AND m.path      = f.path
+                         AND m.seq       < f.seq
+                   )
+             ),
+             top AS (
+                 SELECT path, MAX(seq) AS max_seq, COUNT(DISTINCT principal_id) AS writers
+                 FROM eligible
+                 GROUP BY path
+             )
+             SELECT t.path, t.max_seq, t.writers, e.principal_id, e.ts,
+                    p.harness, p.cwd
+             FROM top t
+             JOIN eligible e ON e.path = t.path AND e.seq = t.max_seq
+             LEFT JOIN principals p ON p.principal_id = e.principal_id
+             ORDER BY t.max_seq DESC
+             LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![cursor, hi, exclude_json, principal_id, limit as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let total_paths = conn.query_row(
+            "WITH eligible AS (
+                 SELECT f.path
+                 FROM footprints f
+                 WHERE f.op = 'write'
+                   AND f.seq > ?1 AND f.seq <= ?2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?3) AS ex
+                       WHERE ex.value = f.principal_id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM footprints m
+                       WHERE m.principal_id = ?4
+                         AND m.path      = f.path
+                         AND m.seq       < f.seq
+                   )
+             )
+             SELECT COUNT(DISTINCT path) FROM eligible",
+            params![cursor, hi, exclude_json, principal_id],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
+
+        let mut changes = Vec::with_capacity(rows.len());
+        for (path, seq, writers, pid, ts, harness, cwd) in rows {
+            changes.push(DigestChange {
+                path,
+                principal_id: pid,
+                seq,
+                ts: parse_ts(&ts)?,
+                harness,
+                cwd,
+                writer_count: writers.max(0) as usize,
+            });
+        }
+
+        // Advance the cursor to MAX(seq), even when `changes` is
+        // empty — that's how once-only works across subsequent calls.
+        conn.execute(
+            "UPDATE principals SET digest_seq = ?1 WHERE principal_id = ?2",
+            params![hi, principal_id],
+        )?;
+
+        Ok(TurnDigest {
+            changes,
+            total_paths,
+            cursor_initialized: false,
+        })
     }
 
     // ────────────── hot claims (Concord P2) ──────────────
