@@ -140,6 +140,13 @@ CN_PROD_ARENA    ?= $(CN_PROD_DATA)/arena
 CN_PROD_CHECKPOINT ?= $(CN_PROD_DATA)/wal.canonical.sqlite
 CN_PROD_PORT     ?= $(lastword $(subst :, ,$(CN_PROD_BIND)))
 CN_PROD_CONFIG   ?= ./config.toml
+# Seconds to wait for /api/v1/substrate/health after starting prod. The listener
+# binds only after the canonical checkpoint restore finishes, and that phase is
+# I/O-bound on the data volume — 87-109 s on 330 k fragments when the machine is
+# idle, 726 s on 345 k while a VM and a cargo build shared the disk. A fixed
+# 180 s budget therefore reports "won't start" for what is a healthy slow start.
+# Raise it rather than treat a timeout as a crash: the log line names the phase.
+CN_PROD_HEALTH_TIMEOUT ?= 900
 SINCE         ?= 7d
 PROJECT       ?=
 
@@ -332,14 +339,21 @@ cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substr
 	  nohup nice -n 10 $(CN_BIN) serve --bind $(CN_PROD_BIND) > "$$LOG" 2>&1 & \
 	  echo $$! > $(CN_PROD_DATA)/serve.pid; \
 	  echo "  pid:  $$(cat $(CN_PROD_DATA)/serve.pid)"
-	@echo "waiting for /api/v1/substrate/health…"
-	@for i in $$(seq 1 90); do \
+	@echo "waiting for /api/v1/substrate/health (budget $(CN_PROD_HEALTH_TIMEOUT)s, override with CN_PROD_HEALTH_TIMEOUT)…"
+	@LOG=$$(ls -t $(CN_PROD_DATA)/serve-*.log 2>/dev/null | head -1); \
+	for i in $$(seq 1 $$(( $(CN_PROD_HEALTH_TIMEOUT) / 2 ))); do \
 	  if curl -sf -m 3 http://$(CN_PROD_BIND)/api/v1/substrate/health >/dev/null 2>&1; then \
 	    echo "✓ healthy after ~$$((i * 2))s"; exit 0; \
 	  fi; \
+	  if [ $$((i % 5)) -eq 0 ]; then echo "  … still booting ($$((i * 2))s)"; fi; \
 	  sleep 2; \
 	done; \
-	echo "ERROR: not healthy after 180s — tail the log above"; exit 1
+	echo "ERROR: not healthy after $(CN_PROD_HEALTH_TIMEOUT)s"; \
+	echo "--- boot phases so far ($$LOG) ---"; \
+	grep -a -E 'Starting ContextNest|WAL replay|vector arena|checkpoint restore|restored canonical|server listening' "$$LOG" | tail -12; \
+	echo "--- if the last phase is 'checkpoint restore' the boot is merely slow:"; \
+	echo "    re-run with a larger CN_PROD_HEALTH_TIMEOUT, do not treat it as a crash."; \
+	exit 1
 	@curl -s -m 5 http://$(CN_PROD_BIND)/api/v1/substrate/health \
 	  | jq '{fragments: .fragments.total, basins: .basins.count, edges: .connections.edges}'
 	@echo "the process is detached; 'make cn-prod-stop' stops it, 'make cn-prod-logs' follows it"

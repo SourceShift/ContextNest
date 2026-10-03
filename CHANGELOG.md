@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before; `CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT=1` adopts an old file in place.
 - **`/api/v1/metrics` memory readout** no longer returns a null stub: it
   reports real process RSS via the same platform sampler as the ceiling.
+- **`make cn-prod` no longer reports a slow boot as a crash.** The health poll
+  was a fixed 90 × 2 s (180 s) sized for the "~100 s on 330 k fragments" boot
+  the Makefile comment recorded. That budget is a property of the *machine*,
+  not the code: measured checkpoint restores on the same substrate were 87–109 s
+  while the host was idle and **726 s** on 345 k fragments while a VM and a
+  cargo build shared the data volume. Timeouts are now bounded by
+  `CN_PROD_HEALTH_TIMEOUT` (default 900 s), the wait prints elapsed progress,
+  and a timeout prints the boot phases from the log instead of the request
+  spam a raw `tail` showed — so "checkpoint restore is still running" is
+  distinguishable from "started and died".
+- **Checkpoint restore now reports progress.** It ran for minutes with no log
+  output between `vector arena is file-backed` and `restored canonical operator
+  checkpoint without embedding`, making a slow boot indistinguishable from a
+  hang. It now logs basin load, a throttled fragment-progress line
+  (`scanned`/`kept`/`elapsed_s`), and reader completion.
 
 ## [0.2.1] — 2026-09-30
 

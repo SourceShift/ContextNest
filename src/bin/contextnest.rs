@@ -1114,7 +1114,7 @@ fn report_summary(
     if !by_kind.is_empty() {
         println!("  Breakdown by kind:");
         let mut entries: Vec<_> = by_kind.iter().collect();
-        entries.sort_by_key(|(k, _)| k.clone());
+        entries.sort_by(|a, b| a.0.cmp(b.0));
         for (kind, count) in entries {
             println!("    {:<22} {}", kind, count);
         }
