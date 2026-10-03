@@ -43,7 +43,7 @@
 //! before the handler returns.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::HeaderMap,
     response::Json,
     routing::{get, post},
@@ -125,6 +125,68 @@ pub fn parse_hot_mode(raw: Option<&str>) -> HotMode {
         Some("deny") => HotMode::Deny,
         _ => HotMode::Warn,
     }
+}
+
+/// How an owns-violation should be surfaced on the precheck (Concord P2d).
+/// `Ask` and `Deny` contribute to `permissionDecision` (composed
+/// strictest-wins with the hot claim); anything else (including unset)
+/// is the audit-only default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnsMode {
+    Audit,
+    Ask,
+    Deny,
+}
+
+/// Read `CONTEXTNEST_CONCORD_OWNS_MODE` fresh on every call: trim +
+/// ascii-lowercase, `ask`/`deny` map to their modes, anything else
+/// (bogus or unset) is [`OwnsMode::Audit`].
+pub fn owns_mode() -> OwnsMode {
+    parse_owns_mode(
+        std::env::var("CONTEXTNEST_CONCORD_OWNS_MODE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`owns_mode`]; anything but `ask`/`deny` is
+/// `Audit`.
+pub fn parse_owns_mode(raw: Option<&str>) -> OwnsMode {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("ask") => OwnsMode::Ask,
+        Some("deny") => OwnsMode::Deny,
+        _ => OwnsMode::Audit,
+    }
+}
+
+/// True iff `entry` covers `rel` — either they are equal, `rel` is a
+/// file/descendant of `entry` (next char in `rel` after `entry` is
+/// `/`), or `entry` is a glob (re-uses the P2a [`glob_match`]).
+/// A trailing `/` on `entry` is stripped so `"docs"` and `"docs/"`
+/// behave identically.
+pub fn owns_covers(entry: &str, rel: &str) -> bool {
+    let entry = entry.trim_end_matches('/');
+    let rel = rel.trim_end_matches('/');
+    if entry == rel {
+        return true;
+    }
+    if rel.len() > entry.len() && rel.starts_with(entry) && rel.as_bytes()[entry.len()] == b'/' {
+        return true;
+    }
+    glob_match(entry, rel)
+}
+
+/// Render the audit/ask/deny text for an owns violation. Exact shape
+/// the brief specifies: `[concord]` ascii header, the ✋ `\u{270B}`
+/// hand, the worktree-relative path, the comma-joined claimed scope,
+/// and the operator-facing instruction to re-scope the worktree
+/// before editing.
+pub fn render_owns_context(rel: &str, owns: &[String]) -> String {
+    format!(
+        "[concord] \u{270B} {} is outside this worktree's claimed scope ({}). Stay inside the claim, or re-scope the worktree before editing.",
+        rel,
+        owns.join(", "),
+    )
 }
 
 /// Claim TTL in seconds from `CONTEXTNEST_CONCORD_HOT_TTL_SECS`,
@@ -536,6 +598,9 @@ pub async fn coord_precheck(
         if outcome.hot.is_some() {
             m.coord_hot_conflicts_total = m.coord_hot_conflicts_total.saturating_add(1);
         }
+        if outcome.owns.is_some() {
+            m.coord_owns_violations_total = m.coord_owns_violations_total.saturating_add(1);
+        }
     }
     let p1_text = match (&outcome.path, outcome.warn) {
         (Some(p), true) => render_precheck_context(p, &outcome.others),
@@ -545,12 +610,15 @@ pub async fn coord_precheck(
         (Some(p), Some(claim)) => render_hot_context(p, claim),
         _ => String::new(),
     };
-    let additional_context = match (p1_text.is_empty(), hot_text.is_empty()) {
-        (false, false) => format!("{p1_text}\n\n{hot_text}"),
-        (false, true) => p1_text,
-        (true, false) => hot_text.clone(),
-        (true, true) => String::new(),
+    let owns_text = match &outcome.owns {
+        Some(hit) => render_owns_context(&hit.rel, &hit.owns),
+        None => String::new(),
     };
+    // Compose the three advisory strings in [p1, hot, owns] order so
+    // existing hot/p1 reasons (and tests that read them) stay
+    // byte-identical when only one branch fires.
+    let additional_context = join_context(&[&p1_text, &hot_text, &owns_text]);
+
     let others_json: Vec<Value> = outcome
         .others
         .iter()
@@ -565,45 +633,120 @@ pub async fn coord_precheck(
         })
         .collect();
 
+    // Compose the hot + owns decisions strictest-wins. Both contribute
+    // ONLY when their check fired; Audit / Warn map to None.
+    #[derive(PartialOrd, Ord, Eq, PartialEq, Clone, Copy)]
+    enum Decision {
+        None,
+        Ask,
+        Deny,
+    }
+    let hot_decision = if outcome.hot.is_some() {
+        match hot_mode() {
+            HotMode::Ask => Decision::Ask,
+            HotMode::Deny => Decision::Deny,
+            HotMode::Warn => Decision::None,
+        }
+    } else {
+        Decision::None
+    };
+    let owns_decision = if outcome.owns.is_some() {
+        match owns_mode() {
+            OwnsMode::Ask => Decision::Ask,
+            OwnsMode::Deny => Decision::Deny,
+            OwnsMode::Audit => Decision::None,
+        }
+    } else {
+        Decision::None
+    };
+    let decision = std::cmp::max(hot_decision, owns_decision);
+
     // Build hookSpecificOutput as a Map so `permissionDecision` can be
-    // inserted conditionally — absent (not null, not "allow") everywhere
-    // except the hot-conflict + ask/deny branch.
+    // inserted conditionally — absent (not null, not "allow") for
+    // audit/warn or when neither signal fired. There is NO Allow path.
     let mut hook = serde_json::Map::new();
     hook.insert("hookEventName".to_string(), json!("PreToolUse"));
     hook.insert("additionalContext".to_string(), json!(additional_context));
-    if outcome.hot.is_some() {
-        match hot_mode() {
-            HotMode::Ask => {
-                hook.insert("permissionDecision".to_string(), json!("ask"));
-                hook.insert("permissionDecisionReason".to_string(), json!(hot_text));
-            }
-            HotMode::Deny => {
-                hook.insert("permissionDecision".to_string(), json!("deny"));
-                hook.insert("permissionDecisionReason".to_string(), json!(hot_text));
-            }
-            HotMode::Warn => {}
+    if decision != Decision::None {
+        let value = match decision {
+            Decision::Ask => "ask",
+            Decision::Deny => "deny",
+            Decision::None => unreachable!(),
+        };
+        let mut reason_parts: Vec<String> = Vec::new();
+        if hot_decision != Decision::None && !hot_text.is_empty() {
+            reason_parts.push(hot_text.clone());
         }
+        if owns_decision != Decision::None && !owns_text.is_empty() {
+            reason_parts.push(owns_text.clone());
+        }
+        hook.insert("permissionDecision".to_string(), json!(value));
+        hook.insert(
+            "permissionDecisionReason".to_string(),
+            json!(reason_parts.join("\n\n")),
+        );
     }
 
     Json(json!({
         "warn": outcome.warn,
         "others": others_json,
         "hot_conflict": outcome.hot.is_some(),
+        "owns_violation": outcome.owns.is_some(),
         "hookSpecificOutput": hook,
     }))
 }
 
+/// Join non-empty strings in `parts` with two newlines between them.
+/// Empty parts are dropped so callers can pass `&[&str; 3]` (or any
+/// slice of `&str`) directly without a 4-arm match.
+fn join_context(parts: &[&str]) -> String {
+    let mut out = String::new();
+    for p in parts.iter() {
+        if p.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(p);
+    }
+    out
+}
+
 /// The pure decision behind `coord_precheck`. `warn`/`others` carry the
-/// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim.
-/// The hot check runs right after principal resolution and BEFORE the
-/// P1 no-prior-footprint early return, so a caller who has never touched
-/// the path still sees a live claim held by an outsider. Store errors are
-/// logged and treated as no-ops so the hook can never block Claude Code.
+/// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim;
+/// `owns` carries the P2d owns-scope audit hit (some when the target
+/// is outside the worktree's claim, none otherwise).
+///
+/// The hot and owns checks both run BEFORE the P1 no-prior-footprint
+/// early return so a caller that has never touched the path still sees
+/// live claims / owns violations held by an outsider. The owns check
+/// runs even when the caller is unresolvable — the audit row records
+/// the unbound caller as `NULL`. Store errors are logged and treated
+/// as no-ops so the hook can never block Claude Code.
 struct PrecheckOutcome {
     warn: bool,
     others: Vec<OtherWriter>,
     path: Option<PathBuf>,
     hot: Option<HotClaim>,
+    owns: Option<OwnsHit>,
+}
+
+/// One owns-scope audit hit (Concord P2d). `worktree_principal` is the
+/// resolved root; `rel` is the target stripped of that root with
+/// forward-slash separators; `owns` is the normalized Vec the
+/// principal claimed.
+///
+/// `worktree_principal` is already passed to
+/// `CoordStore::record_owns_violation` during the decision, so the
+/// field on `OwnsHit` is not read by the handler — kept for parity
+/// with the audit row and to make log/debug output self-describing.
+#[derive(Debug, Clone)]
+struct OwnsHit {
+    #[allow(dead_code)]
+    worktree_principal: String,
+    rel: String,
+    owns: Vec<String>,
 }
 
 fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> PrecheckOutcome {
@@ -612,6 +755,7 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         others: Vec::new(),
         path: None,
         hot: None,
+        owns: None,
     };
     let tool_name = input
         .inner
@@ -627,14 +771,61 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         Some(p) => p,
         None => return noop,
     };
-    let principal_id = match resolve_hook_principal(store, input) {
-        Ok(Some(p)) => p,
-        _ => {
+
+    // Resolve caller as Option<String> (Some on success, None on
+    // Ok(None) or Err) so the owns check still runs when the principal
+    // resolution fails. An audit row with `caller_principal = NULL` is
+    // the documented shape for an unbound session.
+    let caller_principal: Option<String> = match resolve_hook_principal(store, input) {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
+        Err(e) => {
+            error!(error = %e, "coord_precheck: principal resolution failed");
+            None
+        }
+    };
+
+    // Owns-scope check (Concord P2d). Runs BEFORE the caller-unresolved
+    // early return so an unbound session still gets the audit row.
+    let owns: Option<OwnsHit> = match store.owning_worktree_principal(&path) {
+        Ok(Some(wt)) if !wt.owns.is_empty() => {
+            // The store computed `rel` from the canonicalized target it
+            // matched against; re-deriving it from the raw path broke for
+            // new files under a symlinked root (macOS /var → /private/var).
+            let rel_str = wt.rel.clone();
+            if !wt.owns.iter().any(|e| owns_covers(e, &rel_str)) {
+                if let Err(e) = store.record_owns_violation(
+                    &wt.principal_id,
+                    &rel_str,
+                    caller_principal.as_deref(),
+                ) {
+                    error!(error = %e, worktree_principal = %wt.principal_id, "coord_precheck: record_owns_violation failed");
+                }
+                Some(OwnsHit {
+                    worktree_principal: wt.principal_id,
+                    rel: rel_str,
+                    owns: wt.owns,
+                })
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
+        Err(e) => {
+            error!(error = %e, "coord_precheck: owning_worktree_principal failed");
+            None
+        }
+    };
+
+    let principal_id = match caller_principal {
+        Some(p) => p,
+        None => {
             return PrecheckOutcome {
                 warn: false,
                 others: Vec::new(),
                 path: Some(path),
                 hot: None,
+                owns,
             }
         }
     };
@@ -684,6 +875,7 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         others,
         path: Some(path),
         hot,
+        owns,
     }
 }
 
@@ -715,12 +907,59 @@ pub async fn coord_hot_claims(State(services): State<ContextNestServices>) -> Js
     }
 }
 
+/// `GET /api/v1/coord/owns-violations?since=<seq>` — Concord P2d
+/// observability endpoint. Returns rows with `seq > since` (default 0)
+/// in ascending order (newest last), capped at 200. `next_seq` is the
+/// last returned row's seq, or `since` when the result is empty — a
+/// forward cursor. A missing, unparseable, or negative `since` clamps
+/// to 0. Always responds 200 even on store errors (logged via `error!`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OwnsViolationsQuery {
+    #[serde(default)]
+    since: Option<String>,
+}
+
+pub async fn coord_owns_violations(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<OwnsViolationsQuery>,
+) -> Json<Value> {
+    let since: i64 = q
+        .since
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| n.max(0))
+        .unwrap_or(0);
+    match services.coord_store.list_owns_violations(since, 200) {
+        Ok(rows) => {
+            let next_seq = rows.last().map(|r| r.seq).unwrap_or(since);
+            let arr: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "seq": r.seq,
+                        "worktree_principal": r.worktree_principal,
+                        "path": r.path,
+                        "caller_principal": r.caller_principal,
+                        "ts": r.ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    })
+                })
+                .collect();
+            Json(json!({ "violations": arr, "next_seq": next_seq }))
+        }
+        Err(e) => {
+            error!(error = %e, "coord_owns_violations: list_owns_violations failed");
+            Json(json!({ "violations": [], "next_seq": since }))
+        }
+    }
+}
+
 /// Mount the P1 + P2 endpoints. Merged into `base_router` by `simple.rs`.
 pub fn create_coord_footprints_router() -> Router<ContextNestServices> {
     Router::new()
         .route("/api/v1/coord/footprints", post(coord_footprints))
         .route("/api/v1/coord/precheck", post(coord_precheck))
         .route("/api/v1/coord/hot-claims", get(coord_hot_claims))
+        .route("/api/v1/coord/owns-violations", get(coord_owns_violations))
 }
 
 // ───────────────────────── tests ─────────────────────────
@@ -963,5 +1202,42 @@ mod tests {
         assert!(out.contains("last write unknown"));
         assert!(out.contains("claim until 2026-10-02T12:34:56Z"));
         assert!(out.contains("mini-ork concord send loop:a"));
+    }
+
+    // ────────────── owns-scope helpers (Concord P2d) ──────────────
+
+    #[test]
+    fn parse_owns_mode_falls_back_to_audit() {
+        assert_eq!(parse_owns_mode(Some("ASK")), OwnsMode::Ask);
+        assert_eq!(parse_owns_mode(Some("deny")), OwnsMode::Deny);
+        assert_eq!(parse_owns_mode(Some("  ask  ")), OwnsMode::Ask);
+        assert_eq!(parse_owns_mode(Some("bogus")), OwnsMode::Audit);
+        assert_eq!(parse_owns_mode(None), OwnsMode::Audit);
+    }
+
+    #[test]
+    fn owns_covers_supports_equality_dir_prefix_and_glob() {
+        // Equality.
+        assert!(owns_covers("src/a.rs", "src/a.rs"));
+        // Dir-prefix: `docs` covers `docs/x/y.md` because the next
+        // char after "docs" is '/'. Trailing slash is also OK — the
+        // matcher strips it before comparing.
+        assert!(owns_covers("docs", "docs/x/y.md"));
+        assert!(owns_covers("docs/", "docs/x/y.md"));
+        // Boundary near-miss: `docs` must NOT cover `docsx/y.md`.
+        assert!(!owns_covers("docs", "docsx/y.md"));
+        // Glob (re-uses glob_match from P2a).
+        assert!(owns_covers("tests/coord_*.rs", "tests/coord_owns_test.rs"));
+        assert!(!owns_covers("tests/coord_*.rs", "tests/foo.rs"));
+    }
+
+    #[test]
+    fn render_owns_context_lists_scope_and_instructs() {
+        let out = render_owns_context("src/b.rs", &["src/a.rs".to_string(), "docs".to_string()]);
+        assert!(out.contains("\u{270B}"));
+        assert!(out.contains("src/b.rs"));
+        assert!(out.contains("src/a.rs, docs"));
+        assert!(out.contains("Stay inside the claim"));
+        assert!(out.contains("re-scope the worktree"));
     }
 }

@@ -258,6 +258,38 @@ pub enum HotClaimOutcome {
     Contended { holder: String },
 }
 
+/// One audit row recorded when a write-class PreToolUse precheck landed
+/// outside its worktree principal's claimed `labels.owns` scope
+/// (Concord P2d). `worktree_principal` identifies the root; `path` is
+/// stored worktree-relative (matches the owns vocabulary and the ✋
+/// advisory). `caller_principal` is the hook caller's resolved principal
+/// id, or NULL for an unbound / hard-to-resolve session.
+#[derive(Debug, Clone, Serialize)]
+pub struct OwnsViolation {
+    pub seq: i64,
+    pub worktree_principal: String,
+    pub path: String,
+    pub caller_principal: Option<String>,
+    pub ts: DateTime<Utc>,
+}
+
+/// One active worktree principal surfaced by [`CoordStore::owning_worktree_principal`].
+/// `worktree` is canonicalized; `owns` is normalized (trimmed, leading
+/// `./` stripped, trailing `/` stripped, empties dropped). An empty Vec
+/// means "no claim" — callers should treat that as no check.
+#[derive(Debug, Clone)]
+pub struct WorktreePrincipal {
+    pub principal_id: String,
+    pub worktree: std::path::PathBuf,
+    pub owns: Vec<String>,
+    /// The target's path relative to `worktree`, '/'-separated, computed
+    /// from the SAME canonicalized target used for the prefix match — so a
+    /// brand-new file under a symlinked root (macOS /var → /private/var)
+    /// yields the right relative path. Callers must use this, never
+    /// re-derive it from the raw path.
+    pub rel: String,
+}
+
 /// Computed status. Persisted as lowercase text per the wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalStatus {
@@ -508,6 +540,14 @@ const SCHEMA: &str = "
         last_write_seq INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_hot_claims_expires ON hot_claims(expires_at);
+    CREATE TABLE IF NOT EXISTS owns_violations (
+        seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+        worktree_principal TEXT NOT NULL,
+        path              TEXT NOT NULL,
+        caller_principal  TEXT,
+        ts                TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_owns_violations_wt ON owns_violations(worktree_principal, seq);
 ";
 
 pub struct CoordStore {
@@ -1610,6 +1650,230 @@ impl CoordStore {
         }
         Ok(out)
     }
+
+    // ────────────── owns audit (Concord P2d) ──────────────
+
+    /// Look up the active worktree principal whose `worktree` dir is
+    /// the longest component-aligned prefix of `target`. `ended_at IS
+    /// NULL` is the only liveness filter — `status_at` and
+    /// `list_principals(false)` drop 'stale' rows, and worktree
+    /// principals have no pids so they always go stale after the TTL.
+    /// Filtering on `ended_at` keeps enforcement in place across the
+    /// staleness cliff (DoD 5).
+    ///
+    /// Selects only `labels.kind='worktree'` so an `agent:` row
+    /// without the worktree label doesn't shadow a real worktree
+    /// principal. Owns is parsed from `labels.owns`; a missing or
+    /// non-array field returns an empty Vec (treated as "no claim").
+    pub fn owning_worktree_principal(
+        &self,
+        target: &std::path::Path,
+    ) -> CoordStoreResult<Option<WorktreePrincipal>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT principal_id, worktree, labels FROM principals
+             WHERE ended_at IS NULL
+               AND worktree IS NOT NULL AND worktree <> ''
+               AND json_valid(labels) = 1
+               AND json_extract(labels, '$.kind') = 'worktree'",
+        )?;
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        // canonicalize_lossy makes filesystem syscalls per row: never hold
+        // the connection lock across them.
+        drop(conn);
+
+        let canonical_target = canonicalize_lossy(target);
+
+        let mut best: Option<WorktreePrincipal> = None;
+        for (pid, worktree_raw, labels_raw) in rows {
+            let wt = canonicalize_lossy(std::path::Path::new(&worktree_raw));
+            if !canonical_target.starts_with(&wt) {
+                continue;
+            }
+            // Component-aligned prefix: strip the worktree root and
+            // require a non-empty relative path. `Path::strip_prefix`
+            // returns Err when the prefix isn't component-aligned, so
+            // `/wt/a` cannot match `/wt/ab`.
+            let rel = match canonical_target.strip_prefix(&wt) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let owns = parse_owns_field(labels_raw.as_deref());
+            let candidate_components = wt.components().count();
+            let best_components = best
+                .as_ref()
+                .map(|b| b.worktree.components().count())
+                .unwrap_or(0);
+            if candidate_components > best_components {
+                best = Some(WorktreePrincipal {
+                    principal_id: pid,
+                    worktree: wt,
+                    owns,
+                    rel: rel.to_string_lossy().replace('\\', "/"),
+                });
+            }
+        }
+        Ok(best)
+    }
+
+    /// Insert one audit row recording that the precheck saw a write
+    /// to `path` (worktree-relative) that fell outside the worktree
+    /// principal's claimed `owns` scope. Returns the new autoincrement
+    /// `seq` so the caller can echo it back in the response.
+    pub fn record_owns_violation(
+        &self,
+        worktree_principal: &str,
+        path: &str,
+        caller_principal: Option<&str>,
+    ) -> CoordStoreResult<i64> {
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO owns_violations
+                (worktree_principal, path, caller_principal, ts)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![worktree_principal, path, caller_principal, now_str],
+        )?;
+        let seq: i64 = conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
+        Ok(seq)
+    }
+
+    /// List audit rows with `seq > since` in ascending order
+    /// (newest-last), capped at `limit`. `since <= 0` returns from the
+    /// start. The endpoint surfaces the result under `{"violations":
+    /// [...], "next_seq": <last seq or since>}`.
+    pub fn list_owns_violations(
+        &self,
+        since: i64,
+        limit: usize,
+    ) -> CoordStoreResult<Vec<OwnsViolation>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, worktree_principal, path, caller_principal, ts
+             FROM owns_violations
+             WHERE seq > ?1
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )?;
+        let rows: Vec<(i64, String, String, Option<String>, String)> = stmt
+            .query_map(params![since, limit as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(rows.len());
+        for (seq, worktree_principal, path, caller_principal, ts) in rows {
+            out.push(OwnsViolation {
+                seq,
+                worktree_principal,
+                path,
+                caller_principal,
+                ts: parse_ts(&ts)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Canonicalize a path with the deepest-existing-ancestor strategy
+/// used by [`CoordStore::owning_worktree_principal`]. Walks toward the
+/// root until `std::fs::canonicalize` succeeds, then re-appends the
+/// missing tail. Falls back to the raw path when nothing on the way
+/// up canonicalizes.
+///
+/// On macOS `/var/folders/...` resolves to `/private/var/folders/...`
+/// via `canonicalize`; without this helper a brand-new target file
+/// would not canonicalize at all and the prefix match against the
+/// stored worktree would silently fail (every DoD test passes
+/// vacuously as "no violation").
+fn canonicalize_lossy(path: &std::path::Path) -> std::path::PathBuf {
+    let mut cursor = path.to_path_buf();
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(canon) => {
+                // Re-append the missing tail.
+                let mut out = canon;
+                for piece in missing.iter().rev() {
+                    out.push(piece);
+                }
+                return out;
+            }
+            Err(_) => {
+                let Some(parent) = cursor.parent() else {
+                    return path.to_path_buf();
+                };
+                let name = cursor
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return path.to_path_buf();
+                }
+                missing.push(std::path::PathBuf::from(name));
+                cursor = parent.to_path_buf();
+                if cursor.as_os_str().is_empty() {
+                    return path.to_path_buf();
+                }
+            }
+        }
+    }
+}
+
+/// Parse `labels.owns` into a normalized Vec. Trim each element, strip
+/// a leading `./`, strip a trailing `/`, drop empties. A missing
+/// field, a non-string element, a non-array, or invalid JSON returns
+/// an empty Vec (treated as "no claim"). Errors are swallowed because
+/// the helper runs in a hot path; corrupt JSON is reported by the
+/// row-reader path elsewhere.
+fn parse_owns_field(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(arr) = v.get("owns").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            continue;
+        };
+        let trimmed = s.trim();
+        let stripped = trimmed
+            .strip_prefix("./")
+            .unwrap_or(trimmed)
+            .trim_end_matches('/');
+        if stripped.is_empty() {
+            continue;
+        }
+        out.push(stripped.to_string());
+    }
+    out
 }
 
 /// Lineage traversal on an already-locked `Connection`. Split out of
