@@ -142,11 +142,23 @@ CN_PROD_PORT     ?= $(lastword $(subst :, ,$(CN_PROD_BIND)))
 CN_PROD_CONFIG   ?= ./config.toml
 # Seconds to wait for /api/v1/substrate/health after starting prod. The listener
 # binds only after the canonical checkpoint restore finishes, and that phase is
-# I/O-bound on the data volume — 87-109 s on 330 k fragments when the machine is
-# idle, 726 s on 345 k while a VM and a cargo build shared the disk. A fixed
-# 180 s budget therefore reports "won't start" for what is a healthy slow start.
-# Raise it rather than treat a timeout as a crash: the log line names the phase.
-CN_PROD_HEALTH_TIMEOUT ?= 900
+# I/O-bound on the data volume. Measured boots on ~330-380 k fragments:
+#   87-109 s   machine idle
+#   726 s      345 k, VM + a cargo build sharing the disk
+#   824 s      346 k retained of 380 k, VM + `cargo build --release` on the disk
+#               (serve-20261003-110233.log: 09:02:34 start → 09:16:18 listening)
+# A fixed 180 s budget therefore reports "won't start" for a healthy slow start,
+# and the contended case is the norm on this host, not the exception. The
+# asymmetry decides the default: waiting too long only delays bad news, whereas
+# giving up early turns a healthy substrate into a false alarm. The recipe prints
+# progress every 10 s, and the failure path names the boot phase it reached.
+CN_PROD_HEALTH_TIMEOUT ?= 1800
+# Per-probe curl timeout for the health poll. The endpoint is not cheap once the
+# substrate is live: it walks the fragment/basin/edge tables, and while the boot
+# backlog drains it measured 2.1-5.4 s across six consecutive probes (2 of 6 over
+# 3 s). A 3 s budget therefore reported a healthy server as down — keep this well
+# above the observed worst case.
+CN_PROD_HEALTH_PROBE_TIMEOUT ?= 15
 SINCE         ?= 7d
 PROJECT       ?=
 
@@ -342,7 +354,7 @@ cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substr
 	@echo "waiting for /api/v1/substrate/health (budget $(CN_PROD_HEALTH_TIMEOUT)s, override with CN_PROD_HEALTH_TIMEOUT)…"
 	@LOG=$$(ls -t $(CN_PROD_DATA)/serve-*.log 2>/dev/null | head -1); \
 	for i in $$(seq 1 $$(( $(CN_PROD_HEALTH_TIMEOUT) / 2 ))); do \
-	  if curl -sf -m 3 http://$(CN_PROD_BIND)/api/v1/substrate/health >/dev/null 2>&1; then \
+	  if curl -sf -m $(CN_PROD_HEALTH_PROBE_TIMEOUT) http://$(CN_PROD_BIND)/api/v1/substrate/health >/dev/null 2>&1; then \
 	    echo "✓ healthy after ~$$((i * 2))s"; exit 0; \
 	  fi; \
 	  if [ $$((i % 5)) -eq 0 ]; then echo "  … still booting ($$((i * 2))s)"; fi; \
@@ -354,7 +366,7 @@ cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substr
 	echo "--- if the last phase is 'checkpoint restore' the boot is merely slow:"; \
 	echo "    re-run with a larger CN_PROD_HEALTH_TIMEOUT, do not treat it as a crash."; \
 	exit 1
-	@curl -s -m 5 http://$(CN_PROD_BIND)/api/v1/substrate/health \
+	@curl -s -m $(CN_PROD_HEALTH_PROBE_TIMEOUT) http://$(CN_PROD_BIND)/api/v1/substrate/health \
 	  | jq '{fragments: .fragments.total, basins: .basins.count, edges: .connections.edges}'
 	@echo "the process is detached; 'make cn-prod-stop' stops it, 'make cn-prod-logs' follows it"
 
@@ -372,7 +384,7 @@ cn-prod-status: ## Show what is serving prod: pid, footprint, health.
 	fi
 	@if [ -f "$(CN_PROD_DATA)/serve.pid" ]; then echo "serve.pid: $$(cat $(CN_PROD_DATA)/serve.pid)"; fi
 	@echo "checkpoint: $$(du -h $(CN_PROD_CHECKPOINT) 2>/dev/null | cut -f1)"
-	@curl -s -m 5 http://$(CN_PROD_BIND)/api/v1/substrate/health \
+	@curl -s -m $(CN_PROD_HEALTH_PROBE_TIMEOUT) http://$(CN_PROD_BIND)/api/v1/substrate/health \
 	  | jq '{fragments: .fragments.total, basins: .basins.count, edges: .connections.edges}' \
 	  || echo "(health endpoint not answering)"
 

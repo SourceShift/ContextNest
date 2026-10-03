@@ -44,12 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was a fixed 90 × 2 s (180 s) sized for the "~100 s on 330 k fragments" boot
   the Makefile comment recorded. That budget is a property of the *machine*,
   not the code: measured checkpoint restores on the same substrate were 87–109 s
-  while the host was idle and **726 s** on 345 k fragments while a VM and a
-  cargo build shared the data volume. Timeouts are now bounded by
-  `CN_PROD_HEALTH_TIMEOUT` (default 900 s), the wait prints elapsed progress,
+  while the host was idle, **726 s** on 345 k fragments while a VM and a
+  cargo build shared the data volume, and **824 s** on 346 k retained while a
+  `cargo build --release` shared it. Timeouts are now bounded by
+  `CN_PROD_HEALTH_TIMEOUT` (default 1800 s), the wait prints elapsed progress,
   and a timeout prints the boot phases from the log instead of the request
   spam a raw `tail` showed — so "checkpoint restore is still running" is
   distinguishable from "started and died".
+- **The `cn-prod` health probe no longer reads a busy endpoint as down.** The
+  poll used `curl -m 3`, but `/api/v1/substrate/health` walks the
+  fragment/basin/edge tables and is slowest exactly when the server has just
+  come up and the boot backlog is draining: six consecutive probes on a live
+  substrate measured 2.1–5.4 s, two of them over 3 s. Those probes failed, so a
+  healthy server could still be reported as never having started. The per-probe
+  budget is now `CN_PROD_HEALTH_PROBE_TIMEOUT` (default 15 s).
 - **Checkpoint restore now reports progress.** It ran for minutes with no log
   output between `vector arena is file-backed` and `restored canonical operator
   checkpoint without embedding`, making a slow boot indistinguishable from a
