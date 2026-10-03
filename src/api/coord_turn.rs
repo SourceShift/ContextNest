@@ -48,12 +48,13 @@
 //! `agent_id` string to `lease_decision`.
 
 use axum::{extract::State, http::HeaderMap, response::Json, routing::post, Router};
-use chrono::SecondsFormat;
+use chrono::{SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 use tracing::{error, warn};
 
+use crate::api::coord_topics;
 use crate::services::coord_store::{
     validate_principal_id, CoordStore, CoordStoreResult, Message, PrincipalUpsert, TurnDigest,
 };
@@ -522,16 +523,134 @@ pub async fn coord_turn(
         }
     };
 
+    // Concord P3 — topic overlap. Proceed only on a bound
+    // UserPromptSubmit. Capture runs even when notices are off so
+    // `/api/v1/coord/topic-pairs` has data to calibrate against.
+    let mut topic_noticed = false;
+    let mut additional_context = outcome.additional_context.clone();
+    let mut captured: Option<String> = None;
+    let mut compare_pid: Option<String> = None;
+    if outcome.bound && outcome.hook_event_name == "UserPromptSubmit" {
+        captured =
+            coord_topics::capture_text(input.inner.extra.get("prompt").and_then(Value::as_str));
+        if coord_topics::topic_enabled() {
+            compare_pid = outcome.principal_id.clone();
+        }
+    }
+
+    if let Some(pid) = compare_pid.as_deref() {
+        let now = Utc::now();
+        let window = coord_topics::topic_window_secs();
+        let threshold = coord_topics::topic_threshold();
+        let dedup = coord_topics::topic_dedup_secs();
+        let sim_fn = |a: &[f32], b: &[f32]| services.embedding.calculate_similarity(a, b);
+        let match_out = services
+            .coord_store
+            .best_topic_match(pid, window, now, sim_fn);
+        match match_out {
+            Ok(Some(m)) if m.similarity >= threshold => {
+                match services
+                    .coord_store
+                    .claim_topic_notice(pid, &m.other, dedup, now)
+                {
+                    Ok(true) => {
+                        let line = coord_topics::render_topic_notice(
+                            &m.other,
+                            &m.other_text,
+                            m.similarity,
+                        );
+                        if additional_context.is_empty() {
+                            additional_context = line;
+                        } else {
+                            additional_context = format!("{additional_context}\n\n{line}");
+                        }
+                        topic_noticed = true;
+                    }
+                    Ok(false) => {
+                        // Suppressed by the dedup window — no line, no bump.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            principal_id = %pid,
+                            "coord_turn: claim_topic_notice failed"
+                        );
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                // Below threshold — no notice, no metric bump.
+            }
+            Ok(None) => {
+                // Caller has no stored intent yet — peer scan is empty.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    principal_id = %pid,
+                    "coord_turn: best_topic_match failed"
+                );
+            }
+        }
+    }
+
     // Bump the metric AFTER the store call returns and the lock is
     // released. run_turn is sync (it holds std::sync::Mutex, not the
     // tokio RwLock the metric lives behind); doing the bump here
     // matches coord_footprints' "bump metrics only after the store
-    // call returns" convention.
-    if outcome.digest_lines > 0 {
+    // call returns" convention. Topic-notices bump rides on the same
+    // write guard so the metric snapshot is one consistent view.
+    // Only take the write guard when there is something to count, so
+    // SessionStart and quiet turns stay off the metrics lock.
+    if outcome.digest_lines > 0 || topic_noticed {
         let mut m = services.coord_metrics.write().await;
-        m.coord_digest_lines_total = m
-            .coord_digest_lines_total
-            .saturating_add(outcome.digest_lines as u64);
+        if outcome.digest_lines > 0 {
+            m.coord_digest_lines_total = m
+                .coord_digest_lines_total
+                .saturating_add(outcome.digest_lines as u64);
+        }
+        if topic_noticed {
+            m.coord_topic_notices_total = m.coord_topic_notices_total.saturating_add(1);
+        }
+    }
+
+    // Spawn the async embedder + store write OFF the critical path so
+    // the hook stays well under the 50 ms budget. The JoinHandle is
+    // dropped — DoD-1's "does not wait" contract.
+    if let (Some(pid), Some(text)) = (outcome.principal_id.as_ref(), captured.as_ref()) {
+        if outcome.bound {
+            let embedding = services.embedding.clone();
+            let store = services.coord_store.clone();
+            let pid_owned = pid.clone();
+            let text_owned = text.clone();
+            tokio::spawn(async move {
+                match embedding.generate_embedding(&text_owned).await {
+                    Ok(v) if !v.is_empty() => {
+                        if let Err(e) = store.upsert_intent(&pid_owned, &text_owned, &v, Utc::now())
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                principal_id = %pid_owned,
+                                "coord_turn: upsert_intent failed"
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            principal_id = %pid_owned,
+                            "coord_turn: empty embedding returned"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            principal_id = %pid_owned,
+                            "coord_turn: generate_embedding failed"
+                        );
+                    }
+                }
+            });
+        }
     }
 
     let hook_event = if outcome.hook_event_name.is_empty() {
@@ -546,7 +665,7 @@ pub async fn coord_turn(
         "delivered": outcome.delivered,
         "hookSpecificOutput": {
             "hookEventName": hook_event,
-            "additionalContext": outcome.additional_context,
+            "additionalContext": additional_context,
         }
     }))
 }
