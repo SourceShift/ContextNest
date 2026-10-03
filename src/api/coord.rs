@@ -200,6 +200,12 @@ pub struct CoordMetrics {
     /// UserPromptSubmit turn digest (Concord P2c); excludes the
     /// header line and the `(+(N) more)` summary line.
     pub coord_digest_lines_total: u64,
+    /// Cumulative count of precheck responses that reported an owns
+    /// violation — a write-class PreToolUse whose target was outside
+    /// the resolved worktree principal's claimed `labels.owns` scope
+    /// (Concord P2d). Bumped once per precheck that returned an owns
+    /// hit, regardless of `owns_mode()` (audit/ask/deny).
+    pub coord_owns_violations_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the
