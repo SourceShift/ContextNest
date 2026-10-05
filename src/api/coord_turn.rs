@@ -54,6 +54,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tracing::{error, warn};
 
+use crate::api::coord_footprints::glob_match;
 use crate::api::coord_topics;
 use crate::services::coord_store::{
     validate_principal_id, CoordStore, CoordStoreResult, Message, PrincipalUpsert, TurnDigest,
@@ -250,6 +251,39 @@ pub fn digest_enabled() -> bool {
     parse_digest_enabled(std::env::var("CONTEXTNEST_CONCORD_DIGEST").ok().as_deref())
 }
 
+/// Default glob set for paths the per-turn digest drops before the
+/// cap and the count. Auto-memory writes (`MEMORY.md` and friends) are
+/// the loudest contributor in practice — they accumulate per principal
+/// and never affect another agent's plan. The cursor still advances
+/// past them, so dropping them is once-only behaviour.
+const DEFAULT_DIGEST_IGNORE_GLOBS: &str = "**/.claude/projects/*/memory/**";
+
+/// Pure parser behind [`digest_ignore_globs`]: `None` (unset) → the
+/// defaults; a set value is split on ',', trimmed, and stripped of
+/// empties (so "" disables ignores). Unit tests call this directly —
+/// mutating the process env from parallel test threads raced.
+pub fn parse_digest_ignore_globs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or(DEFAULT_DIGEST_IGNORE_GLOBS)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The per-turn digest ignore-glob list, read fresh from
+/// `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS` on every call so test
+/// suites can flip it without restarting the binary. Defaults to
+/// [`DEFAULT_DIGEST_IGNORE_GLOBS`] when unset; an explicit empty string
+/// disables ignores.
+pub fn digest_ignore_globs() -> Vec<String> {
+    parse_digest_ignore_globs(
+        std::env::var("CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Pure renderer for the turn digest. Returns `(text, path_lines)`:
 /// `text` is the body to splice after the mailbox (empty when there
 /// are no changes), and `path_lines` is the number of per-path lines
@@ -428,7 +462,10 @@ pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreR
         // or empty. Take the digest first; if it fails, log and
         // degrade to mailbox-only — do NOT propagate.
         let principal_id_for_digest = principal_id.clone();
-        match store.take_turn_digest(&principal_id_for_digest, DIGEST_MAX_PATHS) {
+        let ignore_globs = digest_ignore_globs();
+        match store.take_turn_digest(&principal_id_for_digest, DIGEST_MAX_PATHS, &|p: &str| {
+            ignore_globs.iter().any(|g| glob_match(g, p))
+        }) {
             Ok(digest) => {
                 if digest_enabled() {
                     let (text, lines) = render_digest(&digest);

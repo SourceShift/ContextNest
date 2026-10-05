@@ -220,7 +220,7 @@ pub struct DigestChange {
 
 /// Result of [`CoordStore::take_turn_digest`]. `changes` is already
 /// newest-first and already truncated to the caller-supplied `limit`.
-/// `total_paths` is the un-truncated grouped-row count, so the
+/// `total_paths` is the count of non-ignored grouped paths, so the
 /// renderer can append a `(+(total-changes) more)` line when needed.
 /// `cursor_initialized` is `true` when this call promoted a NULL
 /// `digest_seq` to the current MAX(seq) — the caller renders nothing
@@ -1443,6 +1443,7 @@ impl CoordStore {
         &self,
         principal_id: &str,
         limit: usize,
+        ignore: &dyn Fn(&str) -> bool,
     ) -> CoordStoreResult<TurnDigest> {
         if validate_principal_id(principal_id).is_err() {
             return Ok(TurnDigest {
@@ -1537,51 +1538,43 @@ impl CoordStore {
              FROM top t
              JOIN eligible e ON e.path = t.path AND e.seq = t.max_seq
              LEFT JOIN principals p ON p.principal_id = e.principal_id
-             ORDER BY t.max_seq DESC
-             LIMIT ?5",
+             ORDER BY t.max_seq DESC",
         )?;
         let rows = stmt
-            .query_map(
-                params![cursor, hi, exclude_json, principal_id, limit as i64],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )?
+            .query_map(params![cursor, hi, exclude_json, principal_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
-        let total_paths = conn.query_row(
-            "WITH eligible AS (
-                 SELECT f.path
-                 FROM footprints f
-                 WHERE f.op = 'write'
-                   AND f.seq > ?1 AND f.seq <= ?2
-                   AND NOT EXISTS (
-                       SELECT 1 FROM json_each(?3) AS ex
-                       WHERE ex.value = f.principal_id
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM footprints m
-                       WHERE m.principal_id = ?4
-                         AND m.path      = f.path
-                         AND m.seq       < f.seq
-                   )
-             )
-             SELECT COUNT(DISTINCT path) FROM eligible",
-            params![cursor, hi, exclude_json, principal_id],
-            |r| r.get::<_, i64>(0),
-        )? as usize;
+        // Filter ignored paths in Rust (after SQL has reduced to one
+        // row per path), then set the cap + total to reflect only the
+        // survivors. The candidate set is writes since the last turn
+        // per principal, so it's small; filtering here keeps the count
+        // and the cap consistent and lets the final `UPDATE` advance
+        // the cursor past ignored rows for once-only semantics.
+        type DigestRow = (
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let filtered: Vec<DigestRow> = rows.into_iter().filter(|row| !ignore(&row.0)).collect();
+        let total_paths = filtered.len();
 
-        let mut changes = Vec::with_capacity(rows.len());
-        for (path, seq, writers, pid, ts, harness, cwd) in rows {
+        let mut changes = Vec::with_capacity(limit.min(filtered.len()));
+        for (path, seq, writers, pid, ts, harness, cwd) in filtered.into_iter().take(limit) {
             changes.push(DigestChange {
                 path,
                 principal_id: pid,
