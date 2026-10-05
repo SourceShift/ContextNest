@@ -1033,6 +1033,13 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
     // window, this is an unrecorded write. Disabled by setting
     // CONTEXTNEST_CONCORD_DISK_CHECK=0. Errors log and degrade to
     // "no unrecorded change" so the hook can never block.
+    //
+    // A `Deleted` drift on a `Write` tool is silently dropped: a
+    // Write replaces the whole file, so a prior deletion (worktree
+    // rollback, then re-create) breaks no premise — there is no
+    // partial update to lose. `Changed` stays reportable for every
+    // tool (a real lost update), and `Deleted` still fires for Edit,
+    // MultiEdit, and NotebookEdit.
     let unrecorded: Option<(DiskDrift, DateTime<Utc>)> = if !others.is_empty()
         || last.is_none()
         || !disk_check_enabled()
@@ -1054,6 +1061,7 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 };
                 let current = stat_file(&path);
                 match classify_disk_drift(fp.mtime_ns, fp.size, current, now_ns, disk_grace_ms()) {
+                    Some(drift) if drift == DiskDrift::Deleted && tool_name == "Write" => None,
                     Some(drift) => Some((drift, fp.ts)),
                     None => None,
                 }
