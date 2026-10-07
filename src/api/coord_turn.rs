@@ -595,6 +595,7 @@ pub async fn coord_turn(
     // UserPromptSubmit. Capture runs even when notices are off so
     // `/api/v1/coord/topic-pairs` has data to calibrate against.
     let mut topic_noticed = false;
+    let mut topic_escalated = false;
     let mut additional_context = outcome.additional_context.clone();
     let mut captured: Option<String> = None;
     let mut compare_pid: Option<String> = None;
@@ -622,11 +623,38 @@ pub async fn coord_turn(
                     .claim_topic_notice(pid, &m.other, dedup, now)
                 {
                     Ok(true) => {
-                        let line = coord_topics::render_topic_notice(
+                        let mut line = coord_topics::render_topic_notice(
                             &m.other,
                             &m.other_text,
                             m.similarity,
                         );
+                        // Concord P4: a topic notice is also a tracked
+                        // overlap keyed by the same sorted `a|b` pair
+                        // convention `claim_topic_notice` already uses.
+                        let mut ids = [pid.to_string(), m.other.clone()];
+                        ids.sort();
+                        let pair_key = format!("{}|{}", ids[0], ids[1]);
+                        match services.coord_store.upsert_overlap(
+                            "topic",
+                            &pair_key,
+                            pid,
+                            Some(&m.other),
+                            now,
+                        ) {
+                            Ok(item) => {
+                                if item.just_escalated {
+                                    topic_escalated = true;
+                                }
+                                line.push_str(&format!(" (overlap O-{})", item.id));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    principal_id = %pid,
+                                    "coord_turn: upsert_overlap topic failed"
+                                );
+                            }
+                        }
                         if additional_context.is_empty() {
                             additional_context = line;
                         } else {
@@ -670,7 +698,7 @@ pub async fn coord_turn(
     // write guard so the metric snapshot is one consistent view.
     // Only take the write guard when there is something to count, so
     // SessionStart and quiet turns stay off the metrics lock.
-    if outcome.digest_lines > 0 || topic_noticed {
+    if outcome.digest_lines > 0 || topic_noticed || topic_escalated {
         let mut m = services.coord_metrics.write().await;
         if outcome.digest_lines > 0 {
             m.coord_digest_lines_total = m
@@ -679,6 +707,9 @@ pub async fn coord_turn(
         }
         if topic_noticed {
             m.coord_topic_notices_total = m.coord_topic_notices_total.saturating_add(1);
+        }
+        if topic_escalated {
+            m.coord_overlaps_escalated_total = m.coord_overlaps_escalated_total.saturating_add(1);
         }
     }
 

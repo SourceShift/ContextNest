@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use tracing::error;
 
 /// Default TTL for the live→idle transition. Read on every status
 /// computation from `CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS` so test
@@ -40,6 +41,13 @@ const MAX_MESSAGE_BODY_BYTES: usize = 8192;
 /// at `open()` time from `CONTEXTNEST_COORD_FOOTPRINT_DAYS` so
 /// parallel test threads don't race on the process env.
 const DEFAULT_FOOTPRINT_RETENTION_DAYS: i64 = 7;
+
+/// Concord P4 overlap defaults, read fresh on every call (see the
+/// `overlap_reack_secs`/`escalate_count`/`escalate_secs` helpers) so test
+/// suites can flip them without restarting the binary.
+const DEFAULT_OVERLAP_REACK_SECS: i64 = 3600;
+const DEFAULT_ESCALATE_COUNT: i64 = 3;
+const DEFAULT_ESCALATE_SECS: i64 = 1800;
 
 /// Per-direction hop cap used by [`CoordStore::lineage`]. "Direction"
 /// here means the labels.parent chain, walked either upward (towards
@@ -328,6 +336,49 @@ pub struct TopicPair {
     pub b_text: String,
 }
 
+/// Concord P4 — one tracked overlap between two principals (or between a
+/// principal and an unrecorded on-disk change). Rows are keyed by
+/// `(kind, subject, a, b)` and move through `open` → `acked` /
+/// `escalated`, re-opening when a fresh notice arrives past the re-ack
+/// window.
+///
+/// `just_escalated` is an internal flag (never serialized): true exactly
+/// when the call that produced this item transitioned the row to
+/// `escalated`, so the API layer can bump `coord_overlaps_escalated_total`
+/// once per request after the store call returns.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlapItem {
+    pub id: i64,
+    pub kind: String,
+    pub subject: String,
+    pub a: String,
+    pub b: Option<String>,
+    pub state: String,
+    pub count: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub ack_by: Option<String>,
+    pub ack_decision: Option<String>,
+    pub ack_note: Option<String>,
+    pub escalated_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub just_escalated: bool,
+}
+
+/// Concord P4 — an operator-placed freeze on a path glob. A live freeze
+/// (swept lazily on read) forces the precheck `permissionDecision` to
+/// `"deny"` for any caller outside the freezer's lineage; it is the only
+/// path that produces a blocking decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct Freeze {
+    pub id: i64,
+    pub glob: String,
+    pub by: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Encode an `f32` slice to little-endian bytes. The on-disk shape is
 /// `Vec<u8>` packed as `f32::to_le_bytes()` per element; the matching
 /// decoder [`decode_embedding`] round-trips every defined float bit-for-bit
@@ -561,6 +612,39 @@ fn footprint_retention_days() -> i64 {
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_FOOTPRINT_RETENTION_DAYS)
+}
+
+/// Re-ack window in seconds (Concord P4). An acked overlap re-opens to
+/// `open` when a fresh notice arrives more than this many seconds after
+/// the ack (measured off `last_seen`, which `ack_overlap` re-stamps).
+/// Read fresh per call; a value < 0 falls back to the default.
+fn overlap_reack_secs() -> i64 {
+    std::env::var("CONTEXTNEST_CONCORD_OVERLAP_REACK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_OVERLAP_REACK_SECS)
+}
+
+/// Escalation threshold on notice count (Concord P4). A row escalates
+/// once its `count` reaches this value. Read fresh per call.
+fn escalate_count() -> i64 {
+    std::env::var("CONTEXTNEST_CONCORD_ESCALATE_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_ESCALATE_COUNT)
+}
+
+/// Escalation threshold on age (Concord P4): an `open` row escalates once
+/// `now - first_seen` reaches this many seconds, independent of count.
+/// Read fresh per call.
+fn escalate_secs() -> i64 {
+    std::env::var("CONTEXTNEST_CONCORD_ESCALATE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_ESCALATE_SECS)
 }
 
 /// Prune every footprint row older than `days` days from `now`. The
@@ -812,6 +896,31 @@ const SCHEMA: &str = "
         pair_key    TEXT PRIMARY KEY,
         notified_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS overlaps (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind         TEXT NOT NULL,
+        subject      TEXT NOT NULL,
+        a            TEXT NOT NULL,
+        b            TEXT,
+        state        TEXT NOT NULL,
+        count        INTEGER NOT NULL DEFAULT 1,
+        first_seen   TEXT NOT NULL,
+        last_seen    TEXT NOT NULL,
+        ack_by       TEXT,
+        ack_decision TEXT,
+        ack_note     TEXT,
+        escalated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_overlaps_key ON overlaps(kind, subject, a, b, state);
+    CREATE TABLE IF NOT EXISTS freezes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        glob       TEXT NOT NULL,
+        by         TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_freezes_expires ON freezes(expires_at);
 ";
 
 pub struct CoordStore {
@@ -2553,6 +2662,313 @@ impl CoordStore {
         pairs.truncate(limit);
         Ok(pairs)
     }
+
+    // ────────────── overlaps (Concord P4) ──────────────
+
+    /// One row behind [`CoordStore::upsert_overlap`], re-selected by id so
+    /// callers get the canonical post-mutation state.
+    fn get_overlap(&self, id: i64) -> CoordStoreResult<Option<OverlapItem>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!("SELECT {OVERLAP_COLS} FROM overlaps WHERE id = ?1"),
+            params![id],
+            OverlapRow::from_row,
+        )
+        .optional()?
+        .map(OverlapRow::into_overlap)
+        .transpose()
+    }
+
+    /// Record one overlap notice keyed by `(kind, subject, a, b)`. An
+    /// existing row in `open`/`acked`/`escalated` bumps `count` and
+    /// `last_seen`; an `acked` row whose ack is older than the re-ack
+    /// window re-opens to `open`; an absent row inserts a fresh `open`
+    /// row with `count = 1`. When the resulting state is `open` and
+    /// either `count` reaches the escalation count or `now - first_seen`
+    /// reaches the escalation age, the row transitions to `escalated`
+    /// exactly once and a single message is posted to `human:operator`.
+    pub fn upsert_overlap(
+        &self,
+        kind: &str,
+        subject: &str,
+        a: &str,
+        b: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> CoordStoreResult<OverlapItem> {
+        let reack_secs = overlap_reack_secs();
+        let esc_count = escalate_count();
+        let esc_secs = escalate_secs();
+        let now_str = fmt_ts(now);
+
+        // One active row per (kind, subject, a, b). `b IS ?4` is NULL-safe:
+        // it matches NULL=NULL and 'x'='x' alike, so an absent side keys
+        // the same as a present one.
+        // SELECT and INSERT/UPDATE run under ONE lock acquisition: two
+        // concurrent prechecks for the same key must not both see "no row"
+        // (duplicate items) or both escalate (two operator messages).
+        let (id, just_escalated) = {
+            let conn = self.lock();
+            let existing: Option<(i64, String, i64, String, String)> = {
+                conn.query_row(
+                    "SELECT id, state, count, first_seen, last_seen FROM overlaps
+                 WHERE kind = ?1 AND subject = ?2 AND a = ?3 AND b IS ?4
+                   AND state IN ('open', 'acked', 'escalated')
+                 ORDER BY id DESC LIMIT 1",
+                    params![kind, subject, a, b],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?
+            };
+
+            let mut just_escalated = false;
+            let id = match existing {
+                None => {
+                    conn.execute(
+                    "INSERT INTO overlaps (kind, subject, a, b, state, count, first_seen, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, 'open', 1, ?5, ?5)",
+                    params![kind, subject, a, b, now_str],
+                )?;
+                    let new_id: i64 =
+                        conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
+                    // A fresh row escalates only at the threshold floors
+                    // (esc_count <= 1 or esc_secs <= 0).
+                    if 1 >= esc_count || esc_secs <= 0 {
+                        conn.execute(
+                        "UPDATE overlaps SET state = 'escalated', escalated_at = ?2 WHERE id = ?1",
+                        params![new_id, now_str],
+                    )?;
+                        just_escalated = true;
+                    }
+                    new_id
+                }
+                Some((existing_id, state, count, first_seen_str, last_seen_str)) => {
+                    let first_seen = parse_ts(&first_seen_str)?;
+                    let last_seen = parse_ts(&last_seen_str)?;
+                    // Re-open an acked row whose ack is older than the re-ack
+                    // window; otherwise the state carries over unchanged.
+                    let reopened =
+                        state == "acked" && (now - last_seen) > ChronoDuration::seconds(reack_secs);
+                    let new_state = if reopened {
+                        "open".to_string()
+                    } else {
+                        state.clone()
+                    };
+                    let new_count = count + 1;
+                    // Escalation is evaluated only while the row is open: an
+                    // already-escalated row must never post a second message.
+                    let escalate = new_state == "open"
+                        && (new_count >= esc_count
+                            || (now - first_seen) >= ChronoDuration::seconds(esc_secs));
+                    if escalate {
+                        conn.execute(
+                        "UPDATE overlaps SET state = 'escalated', count = ?2, last_seen = ?3, escalated_at = ?3 WHERE id = ?1",
+                        params![existing_id, new_count, now_str],
+                    )?;
+                        just_escalated = true;
+                    } else {
+                        conn.execute(
+                        "UPDATE overlaps SET state = ?2, count = ?3, last_seen = ?4 WHERE id = ?1",
+                        params![existing_id, new_state, new_count, now_str],
+                    )?;
+                    }
+                    existing_id
+                }
+            };
+            (id, just_escalated)
+        };
+
+        let mut item = self.get_overlap(id)?.ok_or(CoordStoreError::NotFound)?;
+        if just_escalated {
+            // `post_message` hard-requires the recipient to already exist
+            // in `principals`; nothing else registers `human:operator`.
+            if let Err(e) = self.upsert_principal("human:operator", PrincipalUpsert::default()) {
+                error!(error = %e, "coord_store: escalate upsert_principal(human:operator) failed");
+            }
+            let b_suffix = item
+                .b
+                .as_deref()
+                .map(|side| format!(" ↔ {side}"))
+                .unwrap_or_default();
+            let body = format!(
+                "[concord] overlap O-{id} ({}) escalated: {} — {}{} ({} notices)",
+                item.kind, item.subject, item.a, b_suffix, item.count
+            );
+            if let Err(e) = self.post_message("human:operator", "concord", &body) {
+                error!(error = %e, "coord_store: escalate post_message(human:operator) failed");
+            }
+        }
+        item.just_escalated = just_escalated;
+        Ok(item)
+    }
+
+    /// Ack (or re-ack) one overlap. `decision` must be `proceed` or
+    /// `yield` (anything else is an `InvalidBody`); an unknown id is
+    /// `NotFound`. Sets the row to `acked`, stamps the ack fields, and
+    /// re-stamps `last_seen = now` (the re-ack window is measured off it).
+    /// When the row has a `b` side, a notification is posted to it.
+    pub fn ack_overlap(
+        &self,
+        id: i64,
+        principal: &str,
+        decision: &str,
+        note: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> CoordStoreResult<OverlapItem> {
+        if !matches!(decision, "proceed" | "yield") {
+            return Err(CoordStoreError::InvalidBody(format!(
+                "decision must be 'proceed' or 'yield', got '{decision}'"
+            )));
+        }
+        let now_str = fmt_ts(now);
+        let b: Option<String> = {
+            let conn = self.lock();
+            let row: Option<Option<String>> = conn
+                .query_row("SELECT b FROM overlaps WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let b = match row {
+                Some(b) => b,
+                None => return Err(CoordStoreError::NotFound),
+            };
+            conn.execute(
+                "UPDATE overlaps SET state = 'acked', ack_by = ?2, ack_decision = ?3, ack_note = ?4, last_seen = ?5 WHERE id = ?1",
+                params![id, principal, decision, note, now_str],
+            )?;
+            b
+        };
+        if let Some(b) = b.as_deref() {
+            let body = match note {
+                Some(n) if !n.is_empty() => {
+                    format!("[concord] {principal} acked O-{id} ({decision}): {n}")
+                }
+                _ => format!("[concord] {principal} acked O-{id} ({decision})"),
+            };
+            if let Err(e) = self.post_message(b, "concord", &body) {
+                error!(error = %e, "coord_store: ack_overlap post_message failed");
+            }
+        }
+        self.get_overlap(id)?.ok_or(CoordStoreError::NotFound)
+    }
+
+    /// List overlaps, newest-first, filtered by `state`
+    /// (`open`/`acked`/`escalated`/`all`) and optionally `id > since`.
+    /// Capped at `limit` (the caller passes 200).
+    pub fn list_overlaps(
+        &self,
+        state: &str,
+        since: Option<i64>,
+        limit: usize,
+    ) -> CoordStoreResult<Vec<OverlapItem>> {
+        let state_filter = match state {
+            "open" | "acked" | "escalated" => "state = ?1",
+            "all" => "state IN ('open', 'acked', 'escalated')",
+            other => {
+                return Err(CoordStoreError::InvalidBody(format!(
+                    "unknown state '{other}': use open/acked/escalated/all"
+                )))
+            }
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let rows = match since {
+            Some(since) => {
+                let sql = format!(
+                    "SELECT {OVERLAP_COLS} FROM overlaps WHERE {state_filter} AND id > ?2 ORDER BY id DESC LIMIT ?3"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(params![state, since, limit], OverlapRow::from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+            None => {
+                let sql = format!(
+                    "SELECT {OVERLAP_COLS} FROM overlaps WHERE {state_filter} ORDER BY id DESC LIMIT ?2"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(params![state, limit], OverlapRow::from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+        };
+        rows.into_iter().map(OverlapRow::into_overlap).collect()
+    }
+
+    // ────────────── freezes (Concord P4) ──────────────
+
+    /// Create a freeze on a path glob, expiring after `ttl_secs`. This is
+    /// the operator-authored row that forces the precheck `deny`.
+    pub fn create_freeze(
+        &self,
+        glob: &str,
+        by: &str,
+        reason: &str,
+        ttl_secs: i64,
+        now: DateTime<Utc>,
+    ) -> CoordStoreResult<Freeze> {
+        if glob.is_empty() {
+            return Err(CoordStoreError::InvalidBody(
+                "glob must be non-empty".into(),
+            ));
+        }
+        if reason.is_empty() {
+            return Err(CoordStoreError::InvalidBody(
+                "reason must be non-empty".into(),
+            ));
+        }
+        let now_str = fmt_ts(now);
+        let expires = now + ChronoDuration::seconds(ttl_secs);
+        let expires_str = fmt_ts(expires);
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO freezes (glob, by, reason, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![glob, by, reason, now_str, expires_str],
+        )?;
+        let id: i64 = conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
+        Ok(Freeze {
+            id,
+            glob: glob.to_string(),
+            by: by.to_string(),
+            reason: reason.to_string(),
+            created_at: now,
+            expires_at: expires,
+        })
+    }
+
+    /// Delete a freeze by id; `NotFound` when absent.
+    pub fn delete_freeze(&self, id: i64) -> CoordStoreResult<()> {
+        let conn = self.lock();
+        let changes = conn.execute("DELETE FROM freezes WHERE id = ?1", params![id])?;
+        if changes == 0 {
+            return Err(CoordStoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// List live freezes, newest-first. Sweeps expired rows first — the
+    /// lazy expiry the DoD requires (no background thread): any row with
+    /// `expires_at <= now` is deleted on this read, then the remainder is
+    /// returned.
+    pub fn list_freezes(&self, now: DateTime<Utc>) -> CoordStoreResult<Vec<Freeze>> {
+        let cutoff = fmt_ts(now);
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM freezes WHERE expires_at <= ?1",
+            params![cutoff],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, glob, by, reason, created_at, expires_at FROM freezes ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], FreezeRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(FreezeRow::into_freeze).collect()
+    }
 }
 
 /// Free helper behind [`CoordStore::list_live_intents`] — same
@@ -2923,6 +3339,101 @@ impl FootprintRow {
             size: self.size,
             detail: self.detail,
             ts: parse_ts(&self.ts)?,
+        })
+    }
+}
+
+/// Column list for `overlaps` SELECTs. Order MUST match [`OverlapRow`].
+const OVERLAP_COLS: &str = "id, kind, subject, a, b, state, count, first_seen, last_seen, \
+     ack_by, ack_decision, ack_note, escalated_at";
+
+struct OverlapRow {
+    id: i64,
+    kind: String,
+    subject: String,
+    a: String,
+    b: Option<String>,
+    state: String,
+    count: i64,
+    first_seen: String,
+    last_seen: String,
+    ack_by: Option<String>,
+    ack_decision: Option<String>,
+    ack_note: Option<String>,
+    escalated_at: Option<String>,
+}
+
+impl OverlapRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            subject: r.get(2)?,
+            a: r.get(3)?,
+            b: r.get(4)?,
+            state: r.get(5)?,
+            count: r.get(6)?,
+            first_seen: r.get(7)?,
+            last_seen: r.get(8)?,
+            ack_by: r.get(9)?,
+            ack_decision: r.get(10)?,
+            ack_note: r.get(11)?,
+            escalated_at: r.get(12)?,
+        })
+    }
+
+    fn into_overlap(self) -> CoordStoreResult<OverlapItem> {
+        Ok(OverlapItem {
+            id: self.id,
+            kind: self.kind,
+            subject: self.subject,
+            a: self.a,
+            b: self.b,
+            state: self.state,
+            count: self.count,
+            first_seen: parse_ts(&self.first_seen)?,
+            last_seen: parse_ts(&self.last_seen)?,
+            ack_by: self.ack_by,
+            ack_decision: self.ack_decision,
+            ack_note: self.ack_note,
+            escalated_at: match self.escalated_at {
+                Some(s) => Some(parse_ts(&s)?),
+                None => None,
+            },
+            just_escalated: false,
+        })
+    }
+}
+
+struct FreezeRow {
+    id: i64,
+    glob: String,
+    by: String,
+    reason: String,
+    created_at: String,
+    expires_at: String,
+}
+
+impl FreezeRow {
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            glob: r.get(1)?,
+            by: r.get(2)?,
+            reason: r.get(3)?,
+            created_at: r.get(4)?,
+            expires_at: r.get(5)?,
+        })
+    }
+
+    fn into_freeze(self) -> CoordStoreResult<Freeze> {
+        Ok(Freeze {
+            id: self.id,
+            glob: self.glob,
+            by: self.by,
+            reason: self.reason,
+            created_at: parse_ts(&self.created_at)?,
+            expires_at: parse_ts(&self.expires_at)?,
         })
     }
 }
