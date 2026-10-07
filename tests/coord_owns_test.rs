@@ -25,6 +25,17 @@
 //! - dod10: recursive `permissionDecision` check on every precheck
 //!   response — no "allow" anywhere.
 //!
+//! Concord P2e — implicit-scope coverage (own kickoff + implicit globs):
+//!
+//! - p2e_dod1: own kickoff covered — no glyph, no row, no metric bump.
+//! - p2e_dod2: non-matching kickoff names still flag as violations.
+//! - p2e_dod3: implicit glob covers .mini-ork/runs/... by default;
+//!   `CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS=""` disables it.
+//! - p2e_dod4: `CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF=0` disables the
+//!   own-kickoff rule.
+//! - p2e_dod5: in `deny` mode, implicit-covered paths produce no
+//!   `permissionDecision`; uncovered paths still get `"deny"`.
+//!
 //! The handlers read `CONTEXTNEST_CONCORD_OWNS_MODE` and the
 //! already-existing `CONTEXTNEST_CONCORD_HOT_MODE`/`HOT_GLOBS`/
 //! `HOT_TTL_SECS` fresh per request, but all tests in one binary share
@@ -696,6 +707,10 @@ async fn dod8_hot_ask_plus_owns_deny_composes_to_deny() {
         ("CONTEXTNEST_CONCORD_HOT_GLOBS", None),
         ("CONTEXTNEST_CONCORD_HOT_TTL_SECS", None),
         ("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", None),
+        // Clear the P2e implicit-glob knob so the default `.mini-ork/**`
+        // does NOT short-circuit the owns arm — this test asserts the
+        // hot + owns composition, not implicit coverage.
+        ("CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS", Some("")),
     ]);
     let h = make_harness().await;
 
@@ -865,5 +880,252 @@ async fn new_files_are_judged_on_the_canonical_relative_path() {
     assert_eq!(
         rows[0].path, "lib/new.rs",
         "audit path must be worktree-relative"
+    );
+}
+
+// ─────────────────── P2e helpers ───────────────────
+
+/// Env var reset list for P2e tests — clears the 5 P2d vars plus the
+/// two new P2e knobs so a developer shell cannot skew results.
+fn p2e_clean_env() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
+        ("CONTEXTNEST_CONCORD_OWNS_MODE", None),
+        ("CONTEXTNEST_CONCORD_HOT_MODE", None),
+        ("CONTEXTNEST_CONCORD_HOT_GLOBS", None),
+        ("CONTEXTNEST_CONCORD_HOT_TTL_SECS", None),
+        ("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", None),
+        ("CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS", None),
+        ("CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF", None),
+    ]
+}
+
+/// Seed `<tmp>/wt/vt1` and the `agent:wt-vt1` worktree principal whose
+/// `labels.owns` is `["src/a.rs"]`. The worktree directory must exist
+/// on disk for the longest-prefix lookup to canonicalize.
+async fn seed_vt1(h: &Harness) -> PathBuf {
+    let wt = h.tmp.path().join("wt/vt1");
+    std::fs::create_dir_all(&wt).expect("mkdir vt1");
+    seed_worktree(&h.store, "agent:wt-vt1", &wt, Some(&["src/a.rs"])).await;
+    wt
+}
+
+/// Create the target file on disk (so canonicalize matches) and then
+/// POST /api/v1/coord/precheck as `Edit` from `principal`.
+async fn edit_as(h: &Harness, principal: &str, target: &std::path::Path) -> Value {
+    write_file(target, b"// touched\n");
+    let cwd = h.tmp.path().to_string_lossy().to_string();
+    post_precheck(
+        &h.server,
+        &PrecheckPost {
+            sid: "sP2E".to_string(),
+            principal_header: Some(principal.to_string()),
+            tool: "Edit".to_string(),
+            path: target.to_path_buf(),
+            cwd: Some(cwd),
+        },
+    )
+    .await
+}
+
+// ─────────────────── DoD 1 — own kickoff is covered ───────────────────
+
+#[tokio::test]
+async fn p2e_dod1_own_kickoff_is_covered() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&p2e_clean_env());
+    let h = make_harness().await;
+    let wt = seed_vt1(&h).await;
+
+    let target = wt.join("kickoffs/auto/vt1.md");
+    let before = metrics(&h.server).await;
+    let before_count = before["coord_owns_violations_total"].as_u64().unwrap_or(0);
+    let res = edit_as(&h, "agent:wt-vt1", &target).await;
+
+    assert_eq!(
+        res["owns_violation"],
+        json!(false),
+        "own kickoff must be covered: {res}"
+    );
+    let ctx = res["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !ctx.contains('\u{270B}'),
+        "additionalContext must not carry the hand glyph: {ctx}"
+    );
+
+    let after = metrics(&h.server).await;
+    let after_count = after["coord_owns_violations_total"].as_u64().unwrap_or(0);
+    assert_eq!(
+        after_count, before_count,
+        "metric must be unchanged: before={before_count} after={after_count}"
+    );
+
+    let rows = h
+        .store
+        .list_owns_violations(0, 200)
+        .expect("list owns violations");
+    assert!(rows.is_empty(), "no audit rows expected: {rows:?}");
+}
+
+// ─────────────────── DoD 2 — non-matching kickoff names still flag ───────────────────
+
+#[tokio::test]
+async fn p2e_dod2_other_kickoffs_still_flag() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&p2e_clean_env());
+    let h = make_harness().await;
+    let wt = seed_vt1(&h).await;
+
+    let before = metrics(&h.server).await;
+    let before_count = before["coord_owns_violations_total"].as_u64().unwrap_or(0);
+
+    let target_a = wt.join("kickoffs/auto/other.md");
+    let res_a = edit_as(&h, "agent:wt-vt1", &target_a).await;
+    assert_eq!(
+        res_a["owns_violation"],
+        json!(true),
+        "kickoffs/auto/other.md must be a violation: {res_a}"
+    );
+    let ctx_a = res_a["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(ctx_a.contains('\u{270B}'), "must carry the glyph: {ctx_a}");
+
+    let target_b = wt.join("kickoffs/auto/xvt1.md");
+    let res_b = edit_as(&h, "agent:wt-vt1", &target_b).await;
+    assert_eq!(
+        res_b["owns_violation"],
+        json!(true),
+        "xvt1.md (slug-prefix false positive) must be a violation: {res_b}"
+    );
+    let ctx_b = res_b["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(ctx_b.contains('\u{270B}'), "must carry the glyph: {ctx_b}");
+
+    let after = metrics(&h.server).await;
+    let after_count = after["coord_owns_violations_total"].as_u64().unwrap_or(0);
+    assert_eq!(
+        after_count - before_count,
+        2,
+        "two violations expected: before={before_count} after={after_count}"
+    );
+
+    let rows = h
+        .store
+        .list_owns_violations(0, 200)
+        .expect("list owns violations");
+    assert_eq!(rows.len(), 2, "two audit rows expected: {rows:?}");
+}
+
+// ─────────────────── DoD 3 — implicit globs cover run artifacts ───────────────────
+
+#[tokio::test]
+async fn p2e_dod3_implicit_glob_default_then_disabled() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&p2e_clean_env());
+    let h = make_harness().await;
+    let wt = seed_vt1(&h).await;
+
+    // Default `.mini-ork/**` covers the run-artifact path → no violation.
+    let target = wt.join(".mini-ork/runs/r1/impl.log");
+    let res = edit_as(&h, "agent:wt-vt1", &target).await;
+    assert_eq!(
+        res["owns_violation"],
+        json!(false),
+        "default implicit glob must cover .mini-ork/runs/...: {res}"
+    );
+    let rows = h
+        .store
+        .list_owns_violations(0, 200)
+        .expect("list owns violations");
+    assert!(rows.is_empty(), "no rows under default globs: {rows:?}");
+
+    // Same Edit under an empty implicit-glob set → violation + 1 row.
+    let _env2 = EnvGuard::set(&[("CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS", Some(""))]);
+    let res2 = edit_as(&h, "agent:wt-vt1", &target).await;
+    assert_eq!(
+        res2["owns_violation"],
+        json!(true),
+        "empty implicit globs must NOT cover .mini-ork/runs/...: {res2}"
+    );
+    let rows2 = h
+        .store
+        .list_owns_violations(0, 200)
+        .expect("list owns violations after disable");
+    assert_eq!(rows2.len(), 1, "exactly one row after disable: {rows2:?}");
+    assert_eq!(rows2[0].path, ".mini-ork/runs/r1/impl.log");
+}
+
+// ─────────────────── DoD 4 — own-kickoff knob off ───────────────────
+
+#[tokio::test]
+async fn p2e_dod4_own_kickoff_off_makes_edit_a_violation() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&p2e_clean_env());
+    let h = make_harness().await;
+    let wt = seed_vt1(&h).await;
+
+    let _env2 = EnvGuard::set(&[("CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF", Some("0"))]);
+    let target = wt.join("kickoffs/auto/vt1.md");
+    let res = edit_as(&h, "agent:wt-vt1", &target).await;
+    assert_eq!(
+        res["owns_violation"],
+        json!(true),
+        "with own_kickoff off, kickoffs/auto/vt1.md must be a violation: {res}"
+    );
+    let ctx = res["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        ctx.contains('\u{270B}'),
+        "must carry the hand glyph with the rule off: {ctx}"
+    );
+}
+
+// ─────────────────── DoD 5 — deny mode composes correctly with implicit scope ───────────────────
+
+#[tokio::test]
+async fn p2e_dod5_deny_mode_skips_implicit_but_denies_uncovered() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&p2e_clean_env());
+    // deny mode → every audit hit surfaces as permissionDecision="deny".
+    let _env_mode = EnvGuard::set(&[("CONTEXTNEST_CONCORD_OWNS_MODE", Some("deny"))]);
+    let h = make_harness().await;
+    let wt = seed_vt1(&h).await;
+
+    // Implicit-covered paths: no permissionDecision, no owns_violation.
+    let kickoff = wt.join("kickoffs/auto/vt1.md");
+    let res_k = edit_as(&h, "agent:wt-vt1", &kickoff).await;
+    assert_eq!(res_k["owns_violation"], json!(false));
+    assert!(
+        res_k["hookSpecificOutput"]["permissionDecision"].is_null(),
+        "implicit-covered path must not carry permissionDecision: {res_k}"
+    );
+
+    let run_log = wt.join(".mini-ork/runs/r1/impl.log");
+    let res_r = edit_as(&h, "agent:wt-vt1", &run_log).await;
+    assert_eq!(res_r["owns_violation"], json!(false));
+    assert!(
+        res_r["hookSpecificOutput"]["permissionDecision"].is_null(),
+        "default implicit glob must suppress permissionDecision: {res_r}"
+    );
+
+    // Uncovered path: still denied with a hand-glyph reason.
+    let uncovered = wt.join("src/b.rs");
+    let res_u = edit_as(&h, "agent:wt-vt1", &uncovered).await;
+    assert_eq!(res_u["owns_violation"], json!(true));
+    assert_eq!(
+        res_u["hookSpecificOutput"]["permissionDecision"],
+        json!("deny"),
+        "uncovered path must still deny in deny mode: {res_u}"
+    );
+    let reason = res_u["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("reason");
+    assert!(
+        reason.contains('\u{270B}'),
+        "reason must carry the hand glyph: {reason}"
     );
 }

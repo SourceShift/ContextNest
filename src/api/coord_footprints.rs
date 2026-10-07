@@ -173,6 +173,96 @@ pub fn parse_owns_mode(raw: Option<&str>) -> OwnsMode {
     }
 }
 
+/// Default implicit-scope globs used when
+/// `CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS` is unset. A worktree's
+/// edits to paths matching this list are treated as covered by the
+/// owns check, no audit row, no hand glyph, no metric bump, and no
+/// permissionDecision (Concord P2e).
+const DEFAULT_OWNS_IMPLICIT_GLOBS: &str = ".mini-ork/**";
+
+/// The implicit-scope globs, read fresh from env on every call so test
+/// suites can flip them without restarting the binary. An explicitly
+/// set value is split on ',', trimmed, and stripped of empty entries —
+/// so an empty string disables the implicit set. Unset →
+/// [`DEFAULT_OWNS_IMPLICIT_GLOBS`].
+pub fn owns_implicit_globs() -> Vec<String> {
+    parse_owns_implicit_globs(
+        std::env::var("CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`owns_implicit_globs`]: `None` (unset) → the
+/// default `.mini-ork/**`; a set value is split on ',', trimmed, and
+/// stripped of empties (so "" disables). Unit tests call this directly
+/// — mutating the process env from parallel test threads raced
+/// (`cargo test` runs tests concurrently).
+pub fn parse_owns_implicit_globs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or(DEFAULT_OWNS_IMPLICIT_GLOBS)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pure parser behind [`owns_own_kickoff_enabled`]. Only an exact `"0"`
+/// (trimmed) disables the rule; unset or any other value enables it.
+/// Mirrors [`parse_disk_check_enabled`].
+pub fn parse_owns_own_kickoff_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|s| s.trim()), Some("0"))
+}
+
+/// Read `CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF` fresh on every call.
+/// `=0` disables the own-kickoff implicit rule; anything else (or
+/// unset) enables it.
+pub fn owns_own_kickoff_enabled() -> bool {
+    parse_owns_own_kickoff_enabled(
+        std::env::var("CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure matcher for the own-kickoff implicit rule (Concord P2e).
+/// True iff `principal_id` starts with `agent:wt-<slug>` with a
+/// non-empty slug, `rel` is under `kickoffs/`, ends in `.md`, and its
+/// file name starts with `<slug>`. Matching only on the file name
+/// (a plain `starts_with`) lets slug `vt1-mr-relations` cover
+/// `kickoffs/vt1-mr-relations-r2.md` while rejecting
+/// `kickoffs/auto/xvt1-mr-relations.md`.
+pub fn own_kickoff_covers(principal_id: &str, rel: &str) -> bool {
+    let slug = match principal_id.strip_prefix("agent:wt-") {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    if !rel.starts_with("kickoffs/") || !rel.ends_with(".md") {
+        return false;
+    }
+    let file_name = match rel.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => return false,
+    };
+    file_name.starts_with(slug)
+}
+
+/// Pure combinator that decides whether a target is implicitly covered
+/// by the P2e implicit-scope rules. Reads `rel` against `implicit_globs`
+/// first via [`glob_match`], then falls back to the own-kickoff matcher
+/// when `own_kickoff` is enabled. Env I/O lives in the readers above;
+/// this function stays pure so unit tests can drive it without
+/// touching the process env.
+pub fn owns_implicitly_covered(
+    principal_id: &str,
+    rel: &str,
+    implicit_globs: &[String],
+    own_kickoff: bool,
+) -> bool {
+    implicit_globs.iter().any(|g| glob_match(g, rel))
+        || (own_kickoff && own_kickoff_covers(principal_id, rel))
+}
+
 /// True iff `entry` covers `rel` — either they are equal, `rel` is a
 /// file/descendant of `entry` (next char in `rel` after `entry` is
 /// `/`), or `entry` is a glob (re-uses the P2a [`glob_match`]).
@@ -865,7 +955,10 @@ fn join_context(parts: &[&str]) -> String {
 /// `owns` carries the P2d owns-scope audit hit (some when the target
 /// is outside the worktree's claim, none otherwise); `unrecorded`
 /// carries the P1b disk-truth drift (when the file on disk no longer
-/// matches the newest recorded footprint on the path).
+/// matches the newest recorded footprint on the path). The P2e
+/// implicit scope — a worktree's own kickoff and the implicit-glob set
+/// (default `.mini-ork/**`) — short-circuits the owns arm to `None`
+/// before the audit row is written.
 ///
 /// The hot and owns checks both run BEFORE the P1 no-prior-footprint
 /// early return so a caller that has never touched the path still sees
@@ -947,7 +1040,21 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
             // matched against; re-deriving it from the raw path broke for
             // new files under a symlinked root (macOS /var → /private/var).
             let rel_str = wt.rel.clone();
-            if !wt.owns.iter().any(|e| owns_covers(e, &rel_str)) {
+            // P2e implicit-scope: a worktree's own kickoff and the
+            // implicit-glob set (default `.mini-ork/**`) are covered,
+            // so the arm short-circuits to None BEFORE the audit row is
+            // written — that suppresses the glyph, the row, the metric
+            // bump, and the permissionDecision in one shot.
+            let implicit = owns_implicitly_covered(
+                &wt.principal_id,
+                &rel_str,
+                &owns_implicit_globs(),
+                owns_own_kickoff_enabled(),
+            );
+            let covered = wt.owns.iter().any(|e| owns_covers(e, &rel_str));
+            if implicit || covered {
+                None
+            } else {
                 if let Err(e) = store.record_owns_violation(
                     &wt.principal_id,
                     &rel_str,
@@ -960,8 +1067,6 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                     rel: rel_str,
                     owns: wt.owns,
                 })
-            } else {
-                None
             }
         }
         Ok(_) => None,
@@ -1444,6 +1549,105 @@ mod tests {
         assert!(out.contains("src/a.rs, docs"));
         assert!(out.contains("Stay inside the claim"));
         assert!(out.contains("re-scope the worktree"));
+    }
+
+    // ────────────── owns implicit scope (Concord P2e) ──────────────
+
+    #[test]
+    fn parse_owns_implicit_globs_none_default_empty_and_trim() {
+        // Unset → default.
+        assert_eq!(
+            parse_owns_implicit_globs(None),
+            vec![".mini-ork/**".to_string()]
+        );
+        // Empty string disables the implicit set.
+        assert!(parse_owns_implicit_globs(Some("")).is_empty());
+        // Trim + drop empties.
+        assert_eq!(
+            parse_owns_implicit_globs(Some(" a/** , , b/*.log ")),
+            vec!["a/**".to_string(), "b/*.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_owns_own_kickoff_enabled_only_exact_zero_disables() {
+        assert!(parse_owns_own_kickoff_enabled(None));
+        assert!(!parse_owns_own_kickoff_enabled(Some("0")));
+        assert!(!parse_owns_own_kickoff_enabled(Some(" 0 ")));
+        assert!(parse_owns_own_kickoff_enabled(Some("1")));
+        assert!(parse_owns_own_kickoff_enabled(Some("false")));
+    }
+
+    #[test]
+    fn own_kickoff_covers_positive_and_negative_cases() {
+        // Positives: file name starts with the slug.
+        assert!(own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.md"
+        ));
+        assert!(own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/vt1-mr-relations-r2.md"
+        ));
+
+        // Negatives: wrong dir / wrong slug / wrong extension / wrong id form.
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/other.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/xvt1-mr-relations.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "docs/vt1-mr-relations.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.txt"
+        ));
+        // Non-`agent:wt-` principal id → no own-kickoff coverage.
+        assert!(!own_kickoff_covers(
+            "loop:vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.md"
+        ));
+        // Empty slug (bare `agent:wt-`) → no own-kickoff coverage.
+        assert!(!own_kickoff_covers("agent:wt-", "kickoffs/auto/.md"));
+    }
+
+    #[test]
+    fn owns_implicitly_covered_matches_glob_or_own_kickoff() {
+        // Default implicit globs cover a run-artifact path.
+        let defaults = parse_owns_implicit_globs(None);
+        assert!(owns_implicitly_covered(
+            "agent:wt-vt1",
+            ".mini-ork/runs/r1/impl.log",
+            &defaults,
+            false
+        ));
+        // Empty globs + own_kickoff=false cover neither the run-artifact
+        // nor a same-named kickoff.
+        let empty: Vec<String> = vec![];
+        assert!(!owns_implicitly_covered(
+            "agent:wt-vt1",
+            ".mini-ork/runs/r1/impl.log",
+            &empty,
+            false
+        ));
+        assert!(!owns_implicitly_covered(
+            "agent:wt-vt1",
+            "kickoffs/auto/vt1.md",
+            &empty,
+            false
+        ));
+        // Empty globs + own_kickoff=true still covers the matching kickoff.
+        assert!(owns_implicitly_covered(
+            "agent:wt-vt1",
+            "kickoffs/auto/vt1.md",
+            &empty,
+            true
+        ));
     }
 
     // ────────────── disk-truth (P1b) ──────────────
