@@ -72,7 +72,7 @@ use tracing::error;
 
 use crate::api::coord_turn::{self, TurnInputWithHeaders};
 use crate::services::coord_store::{
-    CoordStore, CoordStoreResult, HotClaim, HotClaimOutcome, OtherWriter, PrincipalUpsert,
+    CoordStore, CoordStoreResult, Freeze, HotClaim, HotClaimOutcome, OtherWriter, PrincipalUpsert,
     LINEAGE_MAX_HOPS,
 };
 use crate::services::ContextNestServices;
@@ -911,28 +911,103 @@ pub async fn coord_precheck(
             m.coord_precheck_unrecorded_total = m.coord_precheck_unrecorded_total.saturating_add(1);
         }
     }
+    let now = Utc::now();
+    let path_str = outcome
+        .path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    let caller = outcome.principal_id.as_deref();
+    let mut any_escalated = false;
+
+    // Each fired signal records one overlap row (Concord P4) and carries
+    // its own ` (overlap O-<id>)` suffix on its rendered line — the
+    // suffix never lands on the joined blob, so every signal keeps its
+    // own id.
     let p1_text = match (&outcome.path, outcome.warn) {
-        (Some(p), true) => render_precheck_context(p, &outcome.others),
+        (Some(p), true) => {
+            let mut text = render_precheck_context(p, &outcome.others);
+            if let (Some(pid), Some(subject), Some(other)) =
+                (caller, path_str.as_deref(), outcome.others.first())
+            {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "stale",
+                    subject,
+                    pid,
+                    Some(&other.principal_id),
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         _ => String::new(),
     };
     let unrecorded_text = match (&outcome.path, &outcome.unrecorded) {
         (Some(p), Some((drift, ts, attr))) => {
-            render_unrecorded_context(p, *drift, *ts, attr.as_ref())
+            let mut text = render_unrecorded_context(p, *drift, *ts, attr.as_ref());
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "unrecorded",
+                    subject,
+                    pid,
+                    None,
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
         }
         _ => String::new(),
     };
     let hot_text = match (&outcome.path, &outcome.hot) {
-        (Some(p), Some(claim)) => render_hot_context(p, claim),
+        (Some(p), Some(claim)) => {
+            let mut text = render_hot_context(p, claim);
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "hot",
+                    subject,
+                    pid,
+                    Some(&claim.principal_id),
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         _ => String::new(),
     };
     let owns_text = match &outcome.owns {
-        Some(hit) => render_owns_context(&hit.rel, &hit.owns),
+        Some(hit) => {
+            let mut text = render_owns_context(&hit.rel, &hit.owns);
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "owns",
+                    subject,
+                    pid,
+                    None,
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         None => String::new(),
     };
     // Compose the four advisory strings in [p1, unrecorded, hot, owns]
     // order so existing hot/p1 reasons (and tests that read them) stay
     // byte-identical when only one branch fires.
     let additional_context = join_context(&[&p1_text, &unrecorded_text, &hot_text, &owns_text]);
+
+    // Escalation is counted once per request, after every store call has
+    // returned and the metrics lock is free to take.
+    if any_escalated {
+        let mut m = services.coord_metrics.write().await;
+        m.coord_overlaps_escalated_total = m.coord_overlaps_escalated_total.saturating_add(1);
+    }
 
     let others_json: Vec<Value> = outcome
         .others
@@ -948,9 +1023,11 @@ pub async fn coord_precheck(
         })
         .collect();
 
-    // Compose the hot + owns decisions strictest-wins. Both contribute
-    // ONLY when their check fired; Audit / Warn map to None. The
-    // unrecorded signal is advisory only — never participates in the
+    // Compose the hot + owns decisions strictest-wins, then overlay the
+    // freeze decision (Concord P4), which is unconditional — a matching
+    // freeze always Denies, regardless of hot/owns mode. Hot/owns
+    // contribute ONLY when their check fired; Audit / Warn map to None.
+    // The unrecorded signal is advisory only — never participates in the
     // permissionDecision composition.
     #[derive(PartialOrd, Ord, Eq, PartialEq, Clone, Copy)]
     enum Decision {
@@ -976,7 +1053,16 @@ pub async fn coord_precheck(
     } else {
         Decision::None
     };
-    let decision = std::cmp::max(hot_decision, owns_decision);
+    let freeze_decision = if outcome.freeze.is_some() {
+        Decision::Deny
+    } else {
+        Decision::None
+    };
+    let freeze_text = match (&outcome.freeze, path_str.as_deref()) {
+        (Some(f), Some(p)) => render_freeze_context(p, f),
+        _ => String::new(),
+    };
+    let decision = std::cmp::max(std::cmp::max(hot_decision, owns_decision), freeze_decision);
 
     // Build hookSpecificOutput as a Map so `permissionDecision` can be
     // inserted conditionally — absent (not null, not "allow") for
@@ -996,6 +1082,9 @@ pub async fn coord_precheck(
         }
         if owns_decision != Decision::None && !owns_text.is_empty() {
             reason_parts.push(owns_text.clone());
+        }
+        if freeze_decision != Decision::None && !freeze_text.is_empty() {
+            reason_parts.push(freeze_text.clone());
         }
         hook.insert("permissionDecision".to_string(), json!(value));
         hook.insert(
@@ -1031,6 +1120,44 @@ fn join_context(parts: &[&str]) -> String {
     out
 }
 
+/// Record one overlap notice and return the ` (overlap O-<id>)` suffix to
+/// append to the matching signal's rendered line. On a store error the
+/// suffix is empty (the signal still renders, just without a tracked id)
+/// and the error is logged — the hook must never block.
+fn overlap_suffix(
+    store: &CoordStore,
+    kind: &str,
+    subject: &str,
+    a: &str,
+    b: Option<&str>,
+    now: DateTime<Utc>,
+    any_escalated: &mut bool,
+) -> String {
+    match store.upsert_overlap(kind, subject, a, b, now) {
+        Ok(item) => {
+            if item.just_escalated {
+                *any_escalated = true;
+            }
+            format!(" (overlap O-{})", item.id)
+        }
+        Err(e) => {
+            error!(error = %e, kind = %kind, "coord_precheck: upsert_overlap failed");
+            String::new()
+        }
+    }
+}
+
+/// Render the P4 freeze deny reason: `⛔ <path> is frozen by <by>:
+/// <reason> (until <expires_at>)`.
+fn render_freeze_context(path: &str, f: &Freeze) -> String {
+    format!(
+        "⛔ {path} is frozen by {}: {} (until {})",
+        f.by,
+        f.reason,
+        f.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
 /// The pure decision behind `coord_precheck`. `warn`/`others` carry the
 /// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim;
 /// `owns` carries the P2d owns-scope audit hit (some when the target
@@ -1060,6 +1187,14 @@ struct PrecheckOutcome {
     /// the change (Concord P1d), `None` when no candidate matched.
     /// `None` otherwise (no drift).
     unrecorded: Option<(DiskDrift, DateTime<Utc>, Option<ExecAttribution>)>,
+    /// The resolved caller principal, `None` when unresolvable (an
+    /// unbound session). Carried so the handler can key each overlap
+    /// notice to its caller without re-resolving.
+    principal_id: Option<String>,
+    /// The live, non-exempt freeze that matched the target path (Concord
+    /// P4), `None` when no freeze applies. Its presence forces the
+    /// composed `permissionDecision` to `"deny"`.
+    freeze: Option<Freeze>,
 }
 
 /// The most plausible shell command (an exec footprint) that caused an
@@ -1163,6 +1298,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         hot: None,
         owns: None,
         unrecorded: None,
+        principal_id: None,
+        freeze: None,
     };
     let tool_name = input
         .inner
@@ -1236,6 +1373,32 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         }
     };
 
+    // Freeze check (Concord P4). A live, non-exempt freeze forces the
+    // precheck decision to Deny unconditionally. It runs BEFORE the
+    // unbound-caller early return: an unidentified session is an outsider
+    // (empty lineage), so a freeze must stop it too. The lookup stays
+    // fail-safe: a store error (list or lineage) logs and degrades to
+    // `None` — never to an empty-lineage default for a KNOWN caller, which
+    // would wrongly deny the freezer's own lineage.
+    let freeze_path = path.to_string_lossy().to_string();
+    let freeze: Option<Freeze> = (|| -> CoordStoreResult<Option<Freeze>> {
+        let freezes = store.list_freezes(Utc::now())?;
+        if freezes.is_empty() {
+            return Ok(None);
+        }
+        let lineage: HashSet<String> = match caller_principal.as_deref() {
+            Some(p) => store.lineage(p, LINEAGE_MAX_HOPS)?,
+            None => HashSet::new(),
+        };
+        Ok(freezes
+            .into_iter()
+            .find(|f| glob_match(&f.glob, &freeze_path) && !lineage.contains(&f.by)))
+    })()
+    .unwrap_or_else(|e| {
+        error!(error = %e, caller = ?caller_principal, "coord_precheck: freeze lookup failed");
+        None
+    });
+
     let principal_id = match caller_principal {
         Some(p) => p,
         None => {
@@ -1246,6 +1409,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 hot: None,
                 owns,
                 unrecorded: None,
+                principal_id: None,
+                freeze,
             }
         }
     };
@@ -1372,6 +1537,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         hot,
         owns,
         unrecorded,
+        principal_id: Some(principal_id),
+        freeze,
     }
 }
 

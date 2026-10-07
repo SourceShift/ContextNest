@@ -9,6 +9,7 @@ use crate::api::agent_outcome;
 use crate::api::cc_hooks::{self, SessionTracker};
 use crate::api::coord;
 use crate::api::coord_footprints;
+use crate::api::coord_overlaps;
 use crate::api::coord_principals;
 use crate::api::coord_topics;
 use crate::api::coord_turn;
@@ -62,6 +63,7 @@ pub async fn create_simple_app_with_tenants(
     let coord_turn_router = coord_turn::create_coord_turn_router();
     let coord_footprints_router = coord_footprints::create_coord_footprints_router();
     let coord_topics_router = coord_topics::create_coord_topics_router();
+    let coord_overlaps_router = coord_overlaps::create_coord_overlaps_router();
     // PR-6: agent outcome feedback endpoint
     let agent_outcome_router = agent_outcome::create_agent_outcome_router();
     let sessions_router = sessions::create_sessions_router();
@@ -98,6 +100,7 @@ pub async fn create_simple_app_with_tenants(
         .merge(coord_turn_router)
         .merge(coord_footprints_router)
         .merge(coord_topics_router)
+        .merge(coord_overlaps_router)
         .merge(agent_outcome_router)
         .merge(sessions_router)
         .merge(inbox_router)
