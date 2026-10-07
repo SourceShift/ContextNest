@@ -161,7 +161,9 @@ pub fn render_topic_notice(other: &str, other_text: &str, similarity: f32) -> St
 
 /// `GET /api/v1/coord/intents` — list every live intent for the
 /// calibration UI. Never includes the embedding blob; the operator
-/// needs the text + timestamp, not the vector.
+/// needs the text + timestamp, not the vector. `samples` (Concord
+/// P3b) is the count of blended prompts feeding the stored vector
+/// (1 on a replace-only row, >= 2 after a blend).
 async fn list_intents_handler(
     State(services): State<ContextNestServices>,
 ) -> (StatusCode, Json<Value>) {
@@ -182,6 +184,7 @@ async fn list_intents_handler(
             json!({
                 "principal_id": i.principal_id,
                 "text": i.text,
+                "samples": i.samples,
                 "updated_at": i.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
             })
         })

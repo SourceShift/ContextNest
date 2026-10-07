@@ -251,6 +251,37 @@ pub fn digest_enabled() -> bool {
     parse_digest_enabled(std::env::var("CONTEXTNEST_CONCORD_DIGEST").ok().as_deref())
 }
 
+/// Pure parser behind [`intent_alpha`]. Trims, parses as `f32`, and
+/// accepts only finite values in `(0, 1]` — anything else falls back
+/// to [`DEFAULT_INTENT_ALPHA`]. `0` and negatives fail the range
+/// check, `nan` fails `is_finite`, unparseable strings fail the
+/// parse, and `inf` / values above 1.0 fail the upper bound.
+pub fn parse_intent_alpha(raw: Option<&str>) -> f32 {
+    match raw.and_then(|s| s.trim().parse::<f32>().ok()) {
+        Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
+        _ => DEFAULT_INTENT_ALPHA,
+    }
+}
+
+/// Default blend weight for `upsert_intent_blended`. 0.3 mixes the
+/// new prompt at 30% and the stored prior at 70% — conservative
+/// enough that a single off-topic prompt can't drag an established
+/// intent off-topic, while still letting a tight stream of similar
+/// prompts slowly steer the stored vector.
+const DEFAULT_INTENT_ALPHA: f32 = 0.3;
+
+/// Read `CONTEXTNEST_CONCORD_INTENT_ALPHA` fresh on every call. The
+/// per-turn handler reads this once on the request path and moves the
+/// value into the spawned capture task so a test that mutates the
+/// env while a turn is in flight never feeds the task a stale value.
+pub fn intent_alpha() -> f32 {
+    parse_intent_alpha(
+        std::env::var("CONTEXTNEST_CONCORD_INTENT_ALPHA")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Default glob set for paths the per-turn digest drops before the
 /// cap and the count. Auto-memory writes (`MEMORY.md` and friends) are
 /// the loudest contributor in practice — they accumulate per principal
@@ -660,15 +691,27 @@ pub async fn coord_turn(
             let store = services.coord_store.clone();
             let pid_owned = pid.clone();
             let text_owned = text.clone();
+            // Read blend knobs on the request path so the spawned
+            // task stays deterministic under ENV_LOCK: tests that flip
+            // these between calls see the change on the next turn,
+            // never mid-flight.
+            let alpha = intent_alpha();
+            let window_secs = coord_topics::topic_window_secs();
             tokio::spawn(async move {
                 match embedding.generate_embedding(&text_owned).await {
                     Ok(v) if !v.is_empty() => {
-                        if let Err(e) = store.upsert_intent(&pid_owned, &text_owned, &v, Utc::now())
-                        {
+                        if let Err(e) = store.upsert_intent_blended(
+                            &pid_owned,
+                            &text_owned,
+                            &v,
+                            Utc::now(),
+                            alpha,
+                            window_secs,
+                        ) {
                             tracing::warn!(
                                 error = %e,
                                 principal_id = %pid_owned,
-                                "coord_turn: upsert_intent failed"
+                                "coord_turn: upsert_intent_blended failed"
                             );
                         }
                     }
