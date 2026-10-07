@@ -174,7 +174,9 @@ pub struct Message {
 /// One read or write footprint recorded by the PostToolUse Concord
 /// hook. `mtime_ns` and `size` come from `std::fs::metadata` and may be
 /// `None` when the file vanished between the tool call and our stat
-/// (common for ephemeral /tmp paths).
+/// (common for ephemeral /tmp paths). `detail` carries the shell
+/// command string for `op == "exec"` rows and is `None` for read/write
+/// rows.
 #[derive(Debug, Clone, Serialize)]
 pub struct Footprint {
     pub seq: i64,
@@ -184,7 +186,22 @@ pub struct Footprint {
     pub path: String,
     pub mtime_ns: Option<i64>,
     pub size: Option<i64>,
+    pub detail: Option<String>,
     pub ts: DateTime<Utc>,
+}
+
+/// One exec footprint (a Bash shell command recorded by the
+/// PostToolUse hook). `path` is the canonicalized cwd the command ran
+/// in; `detail` is the command string (truncated to 300 chars on
+/// write); `harness` rides along via LEFT JOIN for the advisory.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecFootprint {
+    pub principal_id: String,
+    pub seq: i64,
+    pub ts: DateTime<Utc>,
+    pub path: String,
+    pub detail: Option<String>,
+    pub harness: Option<String>,
 }
 
 /// Summarised view of "another principal wrote this path after seq N",
@@ -597,6 +614,67 @@ fn ensure_intents_samples_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Idempotent migration for the P1d footprints schema (Bash exec
+/// footprints): the `detail` column AND the widened `op` CHECK. A fresh
+/// DB builds both via SCHEMA; a pre-P1d DB has `CHECK(op IN
+/// ('read','write'))` and no `detail`, and because SQLite cannot ALTER a
+/// CHECK constraint, the table is rebuilt in one transaction — new table
+/// with the widened CHECK + `detail`, every row copied over (old rows
+/// read `detail` as NULL), old table dropped, renamed, indexes
+/// recreated. A second `open()` is a no-op.
+fn ensure_footprint_detail_column(conn: &Connection) -> rusqlite::Result<()> {
+    let create_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'footprints'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    // The widened CHECK and the `detail` column ship together in SCHEMA,
+    // so a table whose CREATE SQL already names 'exec' has the new
+    // schema. Keep the ADD COLUMN path as a defensive no-op for any
+    // intermediate build that widened the CHECK without the column.
+    if create_sql.contains("'exec'") {
+        let mut stmt = conn.prepare("PRAGMA table_info(footprints)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if !cols.iter().any(|c| c == "detail") {
+            conn.execute("ALTER TABLE footprints ADD COLUMN detail TEXT", [])?;
+        }
+        return Ok(());
+    }
+
+    // Pre-P1d schema. Rebuild with the widened CHECK and `detail`. The
+    // `unchecked_transaction` rolls back on drop if any statement fails,
+    // so a half-migrated table can never be committed.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE footprints_new (
+            seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal_id TEXT NOT NULL,
+            worker_id    TEXT NOT NULL,
+            op           TEXT NOT NULL CHECK(op IN ('read','write','exec')),
+            path         TEXT NOT NULL,
+            mtime_ns     INTEGER,
+            size         INTEGER,
+            detail       TEXT,
+            ts           TEXT NOT NULL
+         );
+         INSERT INTO footprints_new
+            (seq, principal_id, worker_id, op, path, mtime_ns, size, detail, ts)
+         SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, NULL, ts
+         FROM footprints;
+         DROP TABLE footprints;
+         ALTER TABLE footprints_new RENAME TO footprints;
+         CREATE INDEX IF NOT EXISTS idx_footprints_path ON footprints(path, seq);
+         CREATE INDEX IF NOT EXISTS idx_footprints_principal_path
+             ON footprints(principal_id, path, seq);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Compute status from a stored principal at `now`.
 pub fn status_at(p: &Principal, now: DateTime<Utc>) -> PrincipalStatus {
     if p.ended_at.is_some() {
@@ -629,6 +707,17 @@ pub fn status_at(p: &Principal, now: DateTime<Utc>) -> PrincipalStatus {
 /// chronologically.
 fn fmt_ts(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Truncate `s` to at most `max` chars on a UTF-8 char boundary. Never
+/// slices a multibyte codepoint in half — `s.chars().take(max)` walks
+/// whole chars, not bytes.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
 }
 
 fn parse_ts(s: &str) -> CoordStoreResult<DateTime<Utc>> {
@@ -686,10 +775,11 @@ const SCHEMA: &str = "
         seq          INTEGER PRIMARY KEY AUTOINCREMENT,
         principal_id TEXT NOT NULL,
         worker_id    TEXT NOT NULL,
-        op           TEXT NOT NULL CHECK(op IN ('read','write')),
+        op           TEXT NOT NULL CHECK(op IN ('read','write','exec')),
         path         TEXT NOT NULL,
         mtime_ns     INTEGER,
         size         INTEGER,
+        detail       TEXT,
         ts           TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_footprints_path ON footprints(path, seq);
@@ -755,6 +845,7 @@ impl CoordStore {
         conn.execute_batch(SCHEMA)?;
         ensure_digest_seq_column(&conn)?;
         ensure_intents_samples_column(&conn)?;
+        ensure_footprint_detail_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -768,6 +859,7 @@ impl CoordStore {
         conn.execute_batch(SCHEMA)?;
         ensure_digest_seq_column(&conn)?;
         ensure_intents_samples_column(&conn)?;
+        ensure_footprint_detail_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -1375,13 +1467,38 @@ impl CoordStore {
         Ok(seq)
     }
 
+    /// Record one Bash exec footprint for `(principal_id, worker_id)`.
+    /// `path` is the canonicalized cwd the shell ran in; `detail` is
+    /// the command string, truncated to 300 chars on a char boundary.
+    /// No `mtime_ns`/`size` — exec rows are never stat'ed. Returns the
+    /// new autoincrement `seq`.
+    pub fn record_exec_footprint(
+        &self,
+        principal_id: &str,
+        worker_id: &str,
+        path: &str,
+        detail: &str,
+    ) -> CoordStoreResult<i64> {
+        let detail = truncate_chars(detail, 300);
+        let now_str = fmt_ts(Utc::now());
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO footprints
+                (principal_id, worker_id, op, path, mtime_ns, size, detail, ts)
+             VALUES (?1, ?2, 'exec', ?3, NULL, NULL, ?4, ?5)",
+            params![principal_id, worker_id, path, detail, now_str],
+        )?;
+        let seq: i64 = conn.query_row("SELECT last_insert_rowid()", [], |r| r.get(0))?;
+        Ok(seq)
+    }
+
     /// Look up a single footprint by its autoincrement seq. Returns
     /// `None` when the row was pruned out of the retention window.
     pub fn get_footprint(&self, seq: i64) -> CoordStoreResult<Option<Footprint>> {
         let conn = self.lock();
         let row: Option<FootprintRow> = conn
             .query_row(
-                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, ts
+                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, detail, ts
                  FROM footprints WHERE seq = ?1",
                 params![seq],
                 FootprintRow::from_row,
@@ -1410,18 +1527,21 @@ impl CoordStore {
         Ok(max)
     }
 
-    /// Newest footprint on `path` by ANY principal, either op. Used by
-    /// the precheck's disk-truth check (Concord P1b) to find the last
-    /// `(mtime_ns, size)` Concord knows about for the file — so the
-    /// handler can compare it with the current `stat_file` result and
-    /// warn when a writer outside the footprinter changed the file.
+    /// Newest footprint on `path` by ANY principal, either read or
+    /// write op. Used by the precheck's disk-truth check (Concord P1b)
+    /// to find the last `(mtime_ns, size)` Concord knows about for the
+    /// file — so the handler can compare it with the current
+    /// `stat_file` result and warn when a writer outside the
+    /// footprinter changed the file. Exec rows are excluded: they are
+    /// keyed on a directory cwd and carry no stat, so they must never
+    /// be the P1b reference (Concord P1d).
     /// The existing `idx_footprints_path(path, seq)` covers the query.
     pub fn latest_footprint(&self, path: &str) -> CoordStoreResult<Option<Footprint>> {
         let conn = self.lock();
         let row: Option<FootprintRow> = conn
             .query_row(
-                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, ts
-                 FROM footprints WHERE path = ?1 ORDER BY seq DESC LIMIT 1",
+                "SELECT seq, principal_id, worker_id, op, path, mtime_ns, size, detail, ts
+                 FROM footprints WHERE path = ?1 AND op != 'exec' ORDER BY seq DESC LIMIT 1",
                 params![path],
                 FootprintRow::from_row,
             )
@@ -1499,6 +1619,56 @@ impl CoordStore {
                 ts: parse_ts(&ts)?,
                 harness,
                 cwd,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Exec footprints (Bash commands, Concord P1d) with
+    /// `seq > after_seq`, newest first, capped at `limit`. Each row
+    /// carries the command's cwd (`path`), the command string
+    /// (`detail`), and the principal's `harness` via LEFT JOIN — the
+    /// precheck's disk-drift attribution scans this for the most
+    /// plausible shell command that caused an unrecorded change.
+    pub fn exec_footprints_after(
+        &self,
+        after_seq: i64,
+        limit: usize,
+    ) -> CoordStoreResult<Vec<ExecFootprint>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.principal_id, f.seq, f.ts, f.path, f.detail, p.harness
+             FROM footprints f
+             LEFT JOIN principals p ON p.principal_id = f.principal_id
+             WHERE f.op = 'exec' AND f.seq > ?1
+             ORDER BY f.seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after_seq, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(rows.len());
+        for (pid, seq, ts, path, detail, harness) in rows {
+            out.push(ExecFootprint {
+                principal_id: pid,
+                seq,
+                ts: parse_ts(&ts)?,
+                path,
+                detail,
+                harness,
             });
         }
         Ok(out)
@@ -2723,6 +2893,7 @@ struct FootprintRow {
     path: String,
     mtime_ns: Option<i64>,
     size: Option<i64>,
+    detail: Option<String>,
     ts: String,
 }
 
@@ -2736,7 +2907,8 @@ impl FootprintRow {
             path: r.get(4)?,
             mtime_ns: r.get(5)?,
             size: r.get(6)?,
-            ts: r.get(7)?,
+            detail: r.get(7)?,
+            ts: r.get(8)?,
         })
     }
 
@@ -2749,6 +2921,7 @@ impl FootprintRow {
             path: self.path,
             mtime_ns: self.mtime_ns,
             size: self.size,
+            detail: self.detail,
             ts: parse_ts(&self.ts)?,
         })
     }

@@ -412,18 +412,50 @@ pub fn classify_disk_drift(
 /// editing." For `Deleted`, "changed on disk" becomes "was deleted on
 /// disk" — the rest of the sentence is identical so the model has the
 /// same instruction regardless of variant.
-pub fn render_unrecorded_context(path: &Path, drift: DiskDrift, last_ts: DateTime<Utc>) -> String {
+///
+/// When `attr` is `Some` (Concord P1d), one attribution sentence is
+/// appended: `Probably <principal> (<harness>, <cwd basename>) ran
+/// \`<command, first 120 chars>\` at <ts>.` — with "your own shell
+/// command" substituted for the `<principal> (<harness>, <cwd
+/// basename>) ran` part when the exec principal is in the caller's
+/// lineage.
+fn render_unrecorded_context(
+    path: &Path,
+    drift: DiskDrift,
+    last_ts: DateTime<Utc>,
+    attr: Option<&ExecAttribution>,
+) -> String {
     let ts = last_ts.to_rfc3339_opts(SecondsFormat::Secs, true);
     let verb = match drift {
         DiskDrift::Changed => "changed on disk",
         DiskDrift::Deleted => "was deleted on disk",
     };
-    format!(
+    let mut out = format!(
         "[concord] `{}` {} after the last change any agent recorded ({}), and no agent recorded this write \u{2014} a shell command (possibly your own), an editor, a formatter, or a git operation. Re-read it before editing.",
         path.display(),
         verb,
         ts,
-    )
+    );
+    if let Some(a) = attr {
+        let harness = a.harness.as_deref().unwrap_or("unknown");
+        let cwd_base = Path::new(&a.cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let detail: String = a.detail.chars().take(120).collect();
+        let ats = a.ts.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let sentence = if a.is_self {
+            format!("Probably your own shell command `{}` at {}.", detail, ats)
+        } else {
+            format!(
+                "Probably {} ({}, {}) ran `{}` at {}.",
+                a.principal_id, harness, cwd_base, detail, ats
+            )
+        };
+        out.push_str("\n\n");
+        out.push_str(&sentence);
+    }
+    out
 }
 
 /// Match `path` against a component glob `pattern`. Both are split on
@@ -531,6 +563,21 @@ pub fn resolve_tool_path(tool_name: &str, extra: &Value, cwd: &Path) -> Option<P
         Ok(c) => c,
         Err(_) => joined,
     })
+}
+
+/// Canonicalize a Bash cwd the same way [`resolve_tool_path`]
+/// canonicalizes file paths: `std::fs::canonicalize` when it succeeds
+/// (macOS `/var` → `/private/var`, symlink resolution), else the raw
+/// path. The exec-footprint branch stores this as the footprint `path`
+/// so the P1d ancestor check and the read/write file paths share one
+/// canonicalization rule — if they diverged, the ancestor match would
+/// silently never fire on macOS.
+pub fn canonicalize_cwd(cwd: &str) -> PathBuf {
+    let p = PathBuf::from(cwd);
+    match std::fs::canonicalize(&p) {
+        Ok(c) => c,
+        Err(_) => p,
+    }
 }
 
 /// Resolve a principal id for the hook call without mutating store
@@ -688,16 +735,39 @@ pub async fn coord_footprints(
         .get("tool_name")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let op = match file_tool_op(tool_name) {
-        Some(o) => o,
-        None => return Json(json!({ "recorded": false })),
-    };
     let cwd_str = input.inner.cwd.clone().unwrap_or_default();
     let cwd_path = Path::new(&cwd_str);
-    let path = match resolve_tool_path(tool_name, &input.inner.extra, cwd_path) {
-        Some(p) => p,
-        None => return Json(json!({ "recorded": false })),
+
+    // A Bash call records an exec footprint (command + cwd, never
+    // stat'ed, never a write). The file tools record read/write
+    // footprints on the resolved file path. Both share the
+    // resolve/upsert/bind/record tail below.
+    let (op, path, detail): (&'static str, PathBuf, Option<String>) = if tool_name == "Bash" {
+        let command = input
+            .inner
+            .extra
+            .get("tool_input")
+            .and_then(Value::as_object)
+            .and_then(|ti| ti.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let detail = match command {
+            Some(cmd) if !cmd.trim().is_empty() => cmd,
+            _ => return Json(json!({ "recorded": false })),
+        };
+        ("exec", canonicalize_cwd(&cwd_str), Some(detail))
+    } else {
+        let op = match file_tool_op(tool_name) {
+            Some(o) => o,
+            None => return Json(json!({ "recorded": false })),
+        };
+        let path = match resolve_tool_path(tool_name, &input.inner.extra, cwd_path) {
+            Some(p) => p,
+            None => return Json(json!({ "recorded": false })),
+        };
+        (op, path, None)
     };
+
     let principal_id = match resolve_hook_principal(&services.coord_store, &input) {
         Ok(Some(p)) => p,
         Ok(None) => return Json(json!({ "recorded": false })),
@@ -747,14 +817,23 @@ pub async fn coord_footprints(
         return Json(json!({ "recorded": false }));
     }
 
-    let (mtime_ns, size) = stat_file(&path);
+    // Exec rows skip stat_file entirely (there is no file to stat) —
+    // the (mtime_ns, size) tuple is forced to (None, None).
+    let (mtime_ns, size) = if op == "exec" {
+        (None, None)
+    } else {
+        stat_file(&path)
+    };
     let worker_id = if session_id.is_empty() {
         principal_id.clone()
     } else {
         session_id.clone()
     };
-    let seq = match store.record_footprint(&principal_id, &worker_id, op, &path_str, mtime_ns, size)
-    {
+    let seq = match &detail {
+        Some(d) => store.record_exec_footprint(&principal_id, &worker_id, &path_str, d),
+        None => store.record_footprint(&principal_id, &worker_id, op, &path_str, mtime_ns, size),
+    };
+    let seq = match seq {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_footprints: record_footprint failed");
@@ -837,7 +916,9 @@ pub async fn coord_precheck(
         _ => String::new(),
     };
     let unrecorded_text = match (&outcome.path, &outcome.unrecorded) {
-        (Some(p), Some((drift, ts))) => render_unrecorded_context(p, *drift, *ts),
+        (Some(p), Some((drift, ts, attr))) => {
+            render_unrecorded_context(p, *drift, *ts, attr.as_ref())
+        }
         _ => String::new(),
     };
     let hot_text = match (&outcome.path, &outcome.hot) {
@@ -972,10 +1053,38 @@ struct PrecheckOutcome {
     path: Option<PathBuf>,
     hot: Option<HotClaim>,
     owns: Option<OwnsHit>,
-    /// `(drift, ts)` when the P1b disk check fired: on-disk state
-    /// diverged from the latest recorded footprint on the path, past
-    /// the grace window (or the file is gone). `None` otherwise.
-    unrecorded: Option<(DiskDrift, DateTime<Utc>)>,
+    /// `(drift, ts, attribution)` when the P1b disk check fired:
+    /// on-disk state diverged from the latest recorded footprint on
+    /// the path, past the grace window (or the file is gone).
+    /// `attribution` is the most plausible exec footprint that caused
+    /// the change (Concord P1d), `None` when no candidate matched.
+    /// `None` otherwise (no drift).
+    unrecorded: Option<(DiskDrift, DateTime<Utc>, Option<ExecAttribution>)>,
+}
+
+/// The most plausible shell command (an exec footprint) that caused an
+/// unrecorded disk change (Concord P1d). `cwd` is the command's
+/// canonicalized working directory, `detail` the command string, `ts`
+/// the exec row's timestamp. `is_self` is true when the exec row's
+/// principal is in the caller's lineage (so the renderer can say "your
+/// own shell command" instead of naming a principal).
+struct ExecAttribution {
+    principal_id: String,
+    harness: Option<String>,
+    cwd: String,
+    detail: String,
+    ts: DateTime<Utc>,
+    is_self: bool,
+}
+
+/// The P1 stale-premise query result: whether a foreign writer exists,
+/// the deduped writers, the caller's last footprint seq on the path,
+/// and the caller's lineage (reused by the P1d attribution self-check).
+struct P1Lookup {
+    warn: bool,
+    others: Vec<OtherWriter>,
+    last: Option<i64>,
+    excl: HashSet<String>,
 }
 
 /// One owns-scope audit hit (Concord P2d). `worktree_principal` is the
@@ -993,6 +1102,57 @@ struct OwnsHit {
     worktree_principal: String,
     rel: String,
     owns: Vec<String>,
+}
+
+/// Scan exec footprints newer than `after_seq` for the most plausible
+/// shell command that changed `path` (Concord P1d). A candidate matches
+/// when its cwd is `path`'s parent (or an ancestor of it) AND its
+/// command mentions the file — either by bare file name or by the
+/// path's cwd-relative form. Newest match wins. Store errors log and
+/// degrade to `None` (advisory only). `is_self` is decided against the
+/// caller's already-computed lineage set.
+fn attribute_exec_footprint(
+    store: &CoordStore,
+    after_seq: i64,
+    path: &Path,
+    excl: &HashSet<String>,
+) -> Option<ExecAttribution> {
+    let candidates = match store.exec_footprints_after(after_seq, 32) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "coord_precheck: exec_footprints_after failed");
+            return None;
+        }
+    };
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(path);
+    for c in candidates {
+        let cwd = Path::new(&c.path);
+        if !parent.starts_with(cwd) {
+            continue;
+        }
+        let detail = c.detail.as_deref().unwrap_or("");
+        if detail.is_empty() {
+            continue;
+        }
+        // Mention the file: bare name, or the cwd-relative path form
+        // (for commands run in an ancestor directory).
+        let rel = path.strip_prefix(cwd).ok().and_then(|r| r.to_str());
+        let mentions = (!file_name.is_empty() && detail.contains(file_name))
+            || rel.is_some_and(|r| !r.is_empty() && detail.contains(r));
+        if !mentions {
+            continue;
+        }
+        return Some(ExecAttribution {
+            is_self: excl.contains(&c.principal_id),
+            principal_id: c.principal_id,
+            harness: c.harness,
+            cwd: c.path,
+            detail: c.detail.unwrap_or_default(),
+            ts: c.ts,
+        });
+    }
+    None
 }
 
 fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> PrecheckOutcome {
@@ -1114,20 +1274,42 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         None
     };
 
-    let outcome: CoordStoreResult<(bool, Vec<OtherWriter>, Option<i64>)> = (|| {
+    let outcome: CoordStoreResult<P1Lookup> = (|| {
         let last = match store.last_footprint_seq(&principal_id, &path_str)? {
             Some(s) => s,
-            None => return Ok((false, Vec::new(), None)),
+            None => {
+                return Ok(P1Lookup {
+                    warn: false,
+                    others: Vec::new(),
+                    last: None,
+                    excl: HashSet::new(),
+                })
+            }
         };
         let excl: HashSet<String> = store.lineage(&principal_id, LINEAGE_MAX_HOPS)?;
         let others = store.writes_after(&path_str, last, &excl, 3)?;
-        Ok((!others.is_empty(), others, Some(last)))
+        Ok(P1Lookup {
+            warn: !others.is_empty(),
+            others,
+            last: Some(last),
+            excl,
+        })
     })();
-    let (warn, others, last) = match outcome {
-        Ok((warn, others, last)) => (warn, others, last),
+    let P1Lookup {
+        warn,
+        others,
+        last,
+        excl,
+    } = match outcome {
+        Ok(l) => l,
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_precheck: store query failed");
-            (false, Vec::new(), None)
+            P1Lookup {
+                warn: false,
+                others: Vec::new(),
+                last: None,
+                excl: HashSet::new(),
+            }
         }
     };
 
@@ -1145,7 +1327,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
     // partial update to lose. `Changed` stays reportable for every
     // tool (a real lost update), and `Deleted` still fires for Edit,
     // MultiEdit, and NotebookEdit.
-    let unrecorded: Option<(DiskDrift, DateTime<Utc>)> = if !others.is_empty()
+    let unrecorded: Option<(DiskDrift, DateTime<Utc>, Option<ExecAttribution>)> = if !others
+        .is_empty()
         || last.is_none()
         || !disk_check_enabled()
     {
@@ -1167,7 +1350,10 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 let current = stat_file(&path);
                 match classify_disk_drift(fp.mtime_ns, fp.size, current, now_ns, disk_grace_ms()) {
                     Some(drift) if drift == DiskDrift::Deleted && tool_name == "Write" => None,
-                    Some(drift) => Some((drift, fp.ts)),
+                    Some(drift) => {
+                        let attribution = attribute_exec_footprint(store, fp.seq, &path, &excl);
+                        Some((drift, fp.ts, attribution))
+                    }
                     None => None,
                 }
             }
@@ -1771,7 +1957,7 @@ mod tests {
     #[test]
     fn render_unrecorded_context_changed_uses_present_tense() {
         let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
-        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Changed, ts);
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Changed, ts, None);
         assert!(out.contains("[concord]"));
         assert!(out.contains("`/work/f.txt`"));
         assert!(out.contains("changed on disk"));
@@ -1783,7 +1969,7 @@ mod tests {
     #[test]
     fn render_unrecorded_context_deleted_uses_past_tense() {
         let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
-        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Deleted, ts);
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Deleted, ts, None);
         assert!(out.contains("[concord]"));
         assert!(out.contains("`/work/f.txt`"));
         assert!(out.contains("was deleted on disk"));

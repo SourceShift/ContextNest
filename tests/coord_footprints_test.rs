@@ -571,7 +571,25 @@ async fn dod6_non_file_tools_are_no_ops() {
     let dir = h._tmp.path().to_path_buf();
     let cwd = dir.to_string_lossy().to_string();
 
-    // Bash footprint → recorded=false (not a file tool).
+    // A non-file tool footprint → recorded=false.
+    let res = h
+        .server
+        .post("/api/v1/coord/footprints")
+        .add_header("X-Concord-Principal", "loop:a")
+        .json(&json!({
+            "session_id": "s1",
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "x" },
+            "cwd": cwd.clone(),
+        }))
+        .await;
+    res.assert_status(axum::http::StatusCode::OK);
+    let body: Value = res.json();
+    assert_eq!(body["recorded"], json!(false));
+
+    // Bash is no longer a no-op for FOOTPRINTS (Concord P1d): it records an
+    // `exec` row so an unrecorded on-disk change can be attributed. It never
+    // counts as a write — covered by tests/coord_bash_attribution_test.rs.
     let res = h
         .server
         .post("/api/v1/coord/footprints")
@@ -585,7 +603,7 @@ async fn dod6_non_file_tools_are_no_ops() {
         .await;
     res.assert_status(axum::http::StatusCode::OK);
     let body: Value = res.json();
-    assert_eq!(body["recorded"], json!(false));
+    assert_eq!(body["recorded"], json!(true));
 
     // Bash precheck → warn=false, empty context, 'allow'.
     let body = post_precheck(

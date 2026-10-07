@@ -755,11 +755,16 @@ fn merge_cc_hook_entries_with(
         }
 
         // Async PostToolUse /api/v1/coord/footprints entry on
-        // Read + Edit-class tools. Same idempotency rule.
+        // Read + Edit-class tools plus Bash (P1d exec footprints).
+        // Same idempotency rule; a pre-P1d entry gets its matcher
+        // upgraded in place to add Bash exactly once.
         let footprints_url = format!("{}/api/v1/coord/footprints", substrate);
         let footprints_cmd = render_concord_footprints_command(&footprints_url);
+        if upgrade_footprints_matcher(hooks_obj, "/api/v1/coord/footprints") {
+            added.push("PostToolUse (concord footprints)".to_string());
+        }
         let footprints_entry = json!({
-            "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+            "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash",
             "hooks": [
                 {
                     "type": "command",
@@ -807,6 +812,50 @@ fn entry_already_present(
         }
     }
     false
+}
+
+/// Upgrade an existing PostToolUse `/api/v1/coord/footprints` entry's
+/// `matcher` in place to include `Bash` (Concord P1d exec footprints).
+/// Finds the entry whose hook command contains the footprints URL and,
+/// when its matcher string doesn't already contain `Bash`, appends
+/// `|Bash` exactly once. Returns true when an upgrade was applied (so
+/// the caller can report it), false otherwise — a second run is a
+/// no-op. Mirror of the async-hook command-rewrite loop, but targeted
+/// at the `matcher` field instead of `command`.
+fn upgrade_footprints_matcher(
+    hooks_obj: &mut serde_json::Map<String, Value>,
+    needle: &str,
+) -> bool {
+    let Some(arr) = hooks_obj
+        .get_mut("PostToolUse")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut upgraded = false;
+    for entry in arr.iter_mut() {
+        let targets_footprints =
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| c.contains(needle))
+                    })
+                });
+        if !targets_footprints {
+            continue;
+        }
+        if let Some(Value::String(m)) = entry.get_mut("matcher") {
+            if !m.contains("Bash") {
+                m.push_str("|Bash");
+                upgraded = true;
+            }
+        }
+    }
+    upgraded
 }
 
 /// Thin wrapper that reads `CONTEXTNEST_CONCORD_HOOKS` from the
@@ -1404,14 +1453,19 @@ mod render_hook_command_tests {
     #[test]
     fn generated_hooks_upgrade_in_place_and_then_remain_idempotent() {
         let original = serde_json::json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"F=$(mktemp /tmp/cnhk-XXXXXX); curl http://localhost:28080/api/v1/cc/hook/stop"}]}]}});
-        let (updated, changes) = super::merge_cc_hook_entries(&original, "http://localhost:28080");
+        // The pure variant, not the env wrapper: install_path_wrapper_honours_*
+        // flips CONTEXTNEST_CONCORD_HOOKS in parallel, and a flip between the two
+        // merges below made them disagree (flaky, 3/15 runs).
+        let (updated, changes) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
         assert!(changes.iter().any(|s| s == "Stop"));
         assert_eq!(updated["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(updated["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains("CONTEXTNEST_OPERATOR_HEADERS"));
-        let (same, changes) = super::merge_cc_hook_entries(&updated, "http://localhost:28080");
+        let (same, changes) =
+            super::merge_cc_hook_entries_with(&updated, "http://localhost:28080", true);
         assert_eq!(same, updated);
         assert!(changes.is_empty());
     }
@@ -1855,8 +1909,8 @@ mod render_hook_command_tests {
         );
         assert_eq!(
             post[0]["matcher"].as_str(),
-            Some("Read|Edit|Write|MultiEdit|NotebookEdit"),
-            "matcher is Read + Edit-class set",
+            Some("Read|Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            "matcher is Read + Edit-class set plus Bash (P1d)",
         );
         let post_cmd = post[0]["hooks"][0]["command"].as_str().expect("cmd");
         assert!(post_cmd.contains("/api/v1/coord/footprints"));
@@ -1880,6 +1934,69 @@ mod render_hook_command_tests {
                 .iter()
                 .any(|s| s == "PostToolUse (concord footprints)"),
             "footprints label present"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_fresh_footprints_matcher_includes_bash() {
+        // DoD 7: a fresh install's PostToolUse footprints matcher ends
+        // in |Bash so Bash PostToolUse calls reach the exec-footprint
+        // handler.
+        let (updated, _) = super::merge_cc_hook_entries_with(
+            &serde_json::json!({}),
+            "http://localhost:28080",
+            true,
+        );
+        let post = updated["hooks"]["PostToolUse"]
+            .as_array()
+            .expect("post array");
+        let matcher = post[0]["matcher"].as_str().expect("matcher");
+        assert_eq!(
+            matcher, "Read|Edit|Write|MultiEdit|NotebookEdit|Bash",
+            "fresh footprints matcher must end in |Bash; got: {matcher}"
+        );
+    }
+
+    #[test]
+    fn merge_cc_hook_p1d_upgrades_existing_footprints_matcher_in_place() {
+        // DoD 8: a pre-P1d footprints entry (matcher without Bash) is
+        // upgraded in place — same entry count, |Bash added exactly
+        // once, and a second merge changes nothing.
+        let old_cmd =
+            "F=$(mktemp /tmp/cnhk-XXXXXX); curl http://localhost:28080/api/v1/coord/footprints";
+        let original = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+                     "hooks":[{"type":"command","command": old_cmd}]}
+                ]
+            }
+        });
+        let (updated, added) =
+            super::merge_cc_hook_entries_with(&original, "http://localhost:28080", true);
+        let arr = updated["hooks"]["PostToolUse"].as_array().expect("array");
+        assert_eq!(arr.len(), 1, "upgraded in place, not duplicated");
+        assert_eq!(
+            arr[0]["matcher"].as_str(),
+            Some("Read|Edit|Write|MultiEdit|NotebookEdit|Bash"),
+            "matcher gains |Bash exactly once"
+        );
+        assert!(
+            added
+                .iter()
+                .any(|s| s == "PostToolUse (concord footprints)"),
+            "upgrade reported as a footprints label"
+        );
+
+        // Second merge changes nothing.
+        let (same, added2) =
+            super::merge_cc_hook_entries_with(&updated, "http://localhost:28080", true);
+        assert_eq!(same, updated, "second merge is a no-op");
+        assert!(
+            !added2
+                .iter()
+                .any(|s| s == "PostToolUse (concord footprints)"),
+            "no footprints label on a second run"
         );
     }
 
