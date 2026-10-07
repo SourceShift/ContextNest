@@ -98,6 +98,7 @@ struct Harness {
     _env_threshold: EnvGuard,
     _env_window: EnvGuard,
     _env_dedup: EnvGuard,
+    _env_alpha: EnvGuard,
     _env_lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -107,6 +108,7 @@ async fn make_harness() -> Harness {
     let threshold = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_THRESHOLD");
     let window = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_WINDOW_SECS");
     let dedup = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_DEDUP_SECS");
+    let alpha = EnvGuard::clear("CONTEXTNEST_CONCORD_INTENT_ALPHA");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("coord.db");
@@ -128,7 +130,33 @@ async fn make_harness() -> Harness {
         _env_threshold: threshold,
         _env_window: window,
         _env_dedup: dedup,
+        _env_alpha: alpha,
         _env_lock: env_lock,
+    }
+}
+
+/// Cosine of two equal-length vectors, accumulating in f64 for
+/// stability. Mirrors the unit-norm assumption the blended path
+/// encodes — both inputs are expected to already be normalized; this
+/// helper divides by their norms defensively so a caller that passes
+/// raw vectors still gets a comparable answer.
+fn cos(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "cos: dim mismatch");
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let xf = f64::from(*x);
+        let yf = f64::from(*y);
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+    }
+    let denom = (na.sqrt()) * (nb.sqrt());
+    if denom == 0.0 {
+        0.0
+    } else {
+        (dot / denom) as f32
     }
 }
 
@@ -703,4 +731,446 @@ async fn dod6_blob_roundtrip_and_invalid_body() {
         contextnest::services::coord_store::CoordStoreError::InvalidBody(_) => {}
         other => panic!("expected InvalidBody, got {other:?}"),
     }
+}
+
+// ─────────────────── DoD P3b — blended intent capture ───────────────────
+
+/// Plain cosine between two 4-d unit vectors with no embedder
+/// involved. Used to assert blend outputs match the spec math to
+/// 1e-3 without standing up an embedding service.
+fn cos_4(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for i in 0..4 {
+        let x = f64::from(a[i]);
+        let y = f64::from(b[i]);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    (dot / (na.sqrt() * nb.sqrt())) as f32
+}
+
+#[tokio::test]
+async fn p3b_blend_mixes_and_counts_samples() {
+    let _env_lock = lock_env();
+    let store = CoordStore::open_in_memory().expect("in-memory store");
+    upsert_principal(&store, "loop:a", None);
+    upsert_principal(&store, "loop:b", None);
+
+    let v1: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let v2: [f32; 4] = [0.0, 1.0, 0.0, 0.0];
+    let v3: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let text1 = "work prompt one — long enough to clear the capture_text filter";
+    let text2 = "update prompt — also long enough to clear the filter";
+    let text3 = "on-topic follow-up — yet another long enough prompt";
+
+    // Seed the first vector via the explicit replace path (raw).
+    store
+        .upsert_intent("loop:a", text1, &v1, Utc::now())
+        .expect("seed v1");
+
+    // First blend — orthogonal prompt, text must NOT change (cos < 0.65).
+    store
+        .upsert_intent_blended("loop:a", text2, &v2, Utc::now(), 0.3, 3600)
+        .expect("blend v2");
+
+    let after_v2 = store.get_intent("loop:a").expect("get").expect("present");
+    let stored_v2: [f32; 4] = [
+        after_v2.embedding[0],
+        after_v2.embedding[1],
+        after_v2.embedding[2],
+        after_v2.embedding[3],
+    ];
+    // Math: e_old = [1,0,0,0], e_new = [0,1,0,0], α=0.3.
+    // n_old = n_new = their unit selves (already unit).
+    // mixed = 0.7·[1,0,0,0] + 0.3·[0,1,0,0] = [0.7, 0.3, 0, 0].
+    // stored = normalize(mixed) ≈ [0.9191, 0.3939, 0, 0].
+    let expected_v2: [f32; 4] = [0.9191, 0.3939, 0.0, 0.0];
+    let c = cos_4(&stored_v2, &expected_v2);
+    assert!(
+        c > 0.999,
+        "blend must mix to [0.9191, 0.3939, 0, 0]; got stored={stored_v2:?} cos={c}"
+    );
+    assert!(
+        (stored_v2[0] - 0.9191).abs() < 1e-3 && (stored_v2[1] - 0.3939).abs() < 1e-3,
+        "per-component within 1e-3; got {stored_v2:?}"
+    );
+    assert_eq!(after_v2.samples, 2, "samples must be 2 after first blend");
+    assert_eq!(
+        after_v2.text, text1,
+        "off-topic (orthogonal) blend must keep the old text"
+    );
+
+    // Second blend — same direction as v1 (cos == 1.0 with the
+    // stored unit vector), text must update.
+    store
+        .upsert_intent_blended("loop:a", text3, &v3, Utc::now(), 0.3, 3600)
+        .expect("blend v3");
+
+    let after_v3 = store.get_intent("loop:a").expect("get").expect("present");
+    assert_eq!(after_v3.samples, 3, "samples must be 3 after second blend");
+    assert_eq!(
+        after_v3.text, text3,
+        "on-topic (cos=1.0) blend must adopt the new text"
+    );
+}
+
+#[tokio::test]
+async fn p3b_stale_replaces() {
+    let _env_lock = lock_env();
+    let store = CoordStore::open_in_memory().expect("in-memory store");
+    upsert_principal(&store, "loop:a", None);
+
+    let v1: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let v2: [f32; 4] = [0.0, 1.0, 0.0, 0.0];
+    let now = Utc::now();
+    let two_hours_ago = now - ChronoDuration::seconds(7200);
+    store
+        .upsert_intent(
+            "loop:a",
+            "old long prompt — set long ago",
+            &v1,
+            two_hours_ago,
+        )
+        .expect("seed v1 stale");
+
+    // Blend a fresh vector at `now` with window=3600 → row is stale.
+    store
+        .upsert_intent_blended("loop:a", "fresh long prompt", &v2, now, 0.3, 3600)
+        .expect("blend v2 now");
+
+    let got = store.get_intent("loop:a").expect("get").expect("present");
+    assert_eq!(
+        got.embedding,
+        v2.to_vec(),
+        "stale row must be replaced with raw v2"
+    );
+    assert_eq!(got.samples, 1, "replace resets samples to 1");
+    assert_eq!(got.text, "fresh long prompt");
+}
+
+#[tokio::test]
+async fn p3b_dim_change_replaces() {
+    let _env_lock = lock_env();
+    let store = CoordStore::open_in_memory().expect("in-memory store");
+    upsert_principal(&store, "loop:a", None);
+
+    let v4: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let v3: [f32; 3] = [1.0, 0.0, 0.0];
+    store
+        .upsert_intent("loop:a", "four-dim prompt", &v4, Utc::now())
+        .expect("seed v4");
+    store
+        .upsert_intent_blended("loop:a", "three-dim prompt", &v3, Utc::now(), 0.3, 3600)
+        .expect("blend v3");
+
+    let got = store.get_intent("loop:a").expect("get").expect("present");
+    assert_eq!(got.dim, 3, "dim must follow the new vector");
+    assert_eq!(got.embedding, v3.to_vec());
+    assert_eq!(got.samples, 1);
+}
+
+#[tokio::test]
+async fn p3b_alpha_one_is_exact_replace() {
+    let _env_lock = lock_env();
+    let store = CoordStore::open_in_memory().expect("in-memory store");
+    upsert_principal(&store, "loop:a", None);
+
+    let v1: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let v2: [f32; 4] = [0.0, 2.0, 0.0, 0.0]; // non-unit magnitude
+    store
+        .upsert_intent("loop:a", "first long prompt", &v1, Utc::now())
+        .expect("seed v1");
+    store
+        .upsert_intent_blended(
+            "loop:a",
+            "second long prompt — orthogonally off-topic",
+            &v2,
+            Utc::now(),
+            1.0,
+            3600,
+        )
+        .expect("blend v2 alpha=1.0");
+
+    let got = store.get_intent("loop:a").expect("get").expect("present");
+    assert_eq!(
+        got.embedding,
+        v2.to_vec(),
+        "alpha=1.0 must store the raw v2 (no normalization)"
+    );
+    assert_eq!(got.samples, 1, "alpha=1.0 takes the replace branch");
+    assert_eq!(
+        got.text, "second long prompt — orthogonally off-topic",
+        "alpha=1.0 always adopts the new text"
+    );
+}
+
+#[tokio::test]
+async fn p3b_parse_intent_alpha() {
+    // None → default.
+    assert_eq!(contextnest::api::coord_turn::parse_intent_alpha(None), 0.3);
+    assert_eq!(
+        contextnest::api::coord_turn::parse_intent_alpha(Some("0.5")),
+        0.5
+    );
+    // Whitespace is trimmed.
+    assert_eq!(
+        contextnest::api::coord_turn::parse_intent_alpha(Some(" 1 ")),
+        1.0
+    );
+    // Out-of-range / unparseable → default.
+    for bad in ["0", "-1", "nan", "abc", "inf", "1.5"] {
+        assert_eq!(
+            contextnest::api::coord_turn::parse_intent_alpha(Some(bad)),
+            0.3,
+            "bad input {bad:?} must fall back to default 0.3"
+        );
+    }
+}
+
+#[tokio::test]
+async fn p3b_status_turn_barely_moves_topic() {
+    let env_lock = lock_env();
+    let topic = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC");
+    let threshold = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_THRESHOLD");
+    let window = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_WINDOW_SECS");
+    let dedup = EnvGuard::clear("CONTEXTNEST_CONCORD_TOPIC_DEDUP_SECS");
+    let alpha = EnvGuard::clear("CONTEXTNEST_CONCORD_INTENT_ALPHA");
+    std::env::set_var("CONTEXTNEST_CONCORD_TOPIC", "1");
+    std::env::set_var("CONTEXTNEST_CONCORD_TOPIC_THRESHOLD", "0.85");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("coord.db");
+    let _ = CoordStore::open(&path).expect("pre-open");
+    let mut services = ContextNestServices::new_default()
+        .await
+        .expect("default services");
+    let store = Arc::new(CoordStore::open(&path).expect("reopen store"));
+    services.coord_store = store.clone();
+    let app = create_simple_app(services).await.expect("simple app");
+    let server = TestServer::new(app).expect("test server");
+
+    upsert_principal(&store, "loop:a", None);
+    upsert_principal(&store, "loop:b", None);
+    let text_a_old = "loop:a long work prompt — first capture long enough";
+    let text_b = "loop:b long work prompt — distinct other capture";
+    let t: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    let u: [f32; 4] = [0.0, 1.0, 0.0, 0.0];
+    // Seed both as raw unit vectors — distinct dims are 4, opposite axes.
+    store
+        .upsert_intent("loop:a", text_a_old, &t, Utc::now())
+        .expect("seed a");
+    store
+        .upsert_intent("loop:b", text_b, &t, Utc::now())
+        .expect("seed b");
+
+    // Blend an orthogonal vector into loop:a with α=0.3, window 3600.
+    // Stored vec becomes ≈ [0.9191, 0.3939, 0, 0]; cos with [1,0,0,0] is
+    // ≈ 0.9191 (on-topic with the original) but with loop:b=[1,0,0,0]
+    // also ≈ 0.9191, so a notice fires.
+    store
+        .upsert_intent_blended(
+            "loop:a",
+            "loop:a long status question — orthogonal to the work topic",
+            &u,
+            Utc::now(),
+            0.3,
+            3600,
+        )
+        .expect("blend a orthogonally");
+
+    // Now a status turn (no prompt) must NOT clobber the seeded vec.
+    let body = ups(&server, "loop:a", "s1", "UserPromptSubmit", None).await;
+    let ctx_text = ctx(&body);
+    assert!(
+        ctx_text.contains("↔ loop:b"),
+        "notice must fire against loop:b; got {ctx_text:?}"
+    );
+    assert!(
+        ctx_text.contains(text_b),
+        "notice must quote loop:b's text; got {ctx_text:?}"
+    );
+
+    // DoD-6: the status turn barely moved loop:a's topic — the direct
+    // store match against loop:b is still >= 0.9, not merely past the
+    // 0.85 notice threshold.
+    let m = store
+        .best_topic_match("loop:a", 3600, Utc::now(), cos)
+        .expect("best_topic_match")
+        .expect("loop:a has a match");
+    assert_eq!(m.other, "loop:b");
+    assert!(
+        m.similarity >= 0.9,
+        "status turn must barely move the topic; similarity {}",
+        m.similarity
+    );
+
+    // /intents shows loop:a with samples==2 (the blend) and its OLD text:
+    // the status prompt is off-topic, cos([1,0,0,0], [0,1,0,0]) == 0 < 0.5.
+    let intents = list_intents(&server).await;
+    let arr = intents["intents"].as_array().expect("intents array");
+    let mut a_samples = None;
+    let mut a_text = None;
+    let mut b_samples = None;
+    for entry in arr {
+        match entry["principal_id"].as_str().unwrap_or("") {
+            "loop:a" => {
+                a_samples = entry["samples"].as_i64();
+                a_text = entry["text"].as_str().map(str::to_string);
+            }
+            "loop:b" => {
+                b_samples = entry["samples"].as_i64();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(a_samples, Some(2), "loop:a must have samples=2 after blend");
+    assert_eq!(b_samples, Some(1), "loop:b must still have samples=1");
+    assert_eq!(
+        a_text.as_deref(),
+        Some(text_a_old),
+        "loop:a kept its old text (orthogonal blend kept text)"
+    );
+
+    drop(topic);
+    drop(threshold);
+    drop(window);
+    drop(dedup);
+    drop(alpha);
+    drop(env_lock);
+}
+
+#[tokio::test]
+async fn p3b_upgrade_adds_samples_column() {
+    let _env_lock = lock_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("coord-pre-p3b.db");
+    // Build a pre-P3b schema directly via rusqlite, exactly the shape
+    // the pre-upgrade CoordStore would have created.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open pre-p3b");
+        conn.execute_batch(
+            "CREATE TABLE intents (
+                principal_id TEXT PRIMARY KEY,
+                text         TEXT NOT NULL,
+                embedding    BLOB NOT NULL,
+                dim          INTEGER NOT NULL,
+                updated_at   TEXT NOT NULL
+             );",
+        )
+        .expect("create pre-p3b schema");
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let blob = encode_embedding(&v);
+        let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        conn.execute(
+            "INSERT INTO intents (principal_id, text, embedding, dim, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["loop:legacy", "legacy long prompt", blob, 4_i64, ts],
+        )
+        .expect("insert pre-p3b row");
+    }
+
+    // First open: migration must add the column without losing the row.
+    let store = CoordStore::open(&path).expect("open with migration");
+    let intent = store
+        .get_intent("loop:legacy")
+        .expect("get")
+        .expect("present");
+    assert_eq!(
+        intent.samples, 1,
+        "pre-P3b row must default to samples=1 after upgrade"
+    );
+    assert_eq!(intent.text, "legacy long prompt");
+
+    // Second open: idempotent — must NOT raise "duplicate column name".
+    let store2 = CoordStore::open(&path).expect("re-open is a no-op");
+    let again = store2
+        .get_intent("loop:legacy")
+        .expect("get")
+        .expect("present");
+    assert_eq!(again.samples, 1);
+
+    // Independent connection confirms the column is present.
+    let probe = rusqlite::Connection::open(&path).expect("probe");
+    let mut stmt = probe.prepare("PRAGMA table_info(intents)").expect("pragma");
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .expect("query")
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(
+        cols.iter().any(|c| c == "samples"),
+        "samples column must exist after migration; cols={cols:?}"
+    );
+}
+
+/// DoD-2 boundary: the stored text is replaced at cosine >= 0.5 to the
+/// old blend and kept below it. Vectors are hand-made so cos is exact.
+#[tokio::test]
+async fn p3b_text_replace_threshold_is_half() {
+    let env_lock = lock_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = CoordStore::open(&tmp.path().join("coord.db")).expect("store");
+    upsert_principal(&store, "loop:on", None);
+    upsert_principal(&store, "loop:off", None);
+    let base: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+    // cos(base, on) = 0.55 (on-topic, >= 0.5); cos(base, off) = 0.45.
+    let on: [f32; 4] = [0.55, (1.0_f32 - 0.55 * 0.55).sqrt(), 0.0, 0.0];
+    let off: [f32; 4] = [0.45, (1.0_f32 - 0.45 * 0.45).sqrt(), 0.0, 0.0];
+    assert!((cos(&base, &on) - 0.55).abs() < 1e-4);
+    assert!((cos(&base, &off) - 0.45).abs() < 1e-4);
+
+    store
+        .upsert_intent("loop:on", "original work prompt for on", &base, Utc::now())
+        .expect("seed on");
+    store
+        .upsert_intent(
+            "loop:off",
+            "original work prompt for off",
+            &base,
+            Utc::now(),
+        )
+        .expect("seed off");
+    store
+        .upsert_intent_blended(
+            "loop:on",
+            "rephrased work prompt, on topic",
+            &on,
+            Utc::now(),
+            0.3,
+            3600,
+        )
+        .expect("blend on");
+    store
+        .upsert_intent_blended(
+            "loop:off",
+            "unrelated status question here",
+            &off,
+            Utc::now(),
+            0.3,
+            3600,
+        )
+        .expect("blend off");
+
+    let on_row = store
+        .get_intent("loop:on")
+        .expect("get on")
+        .expect("on row");
+    let off_row = store
+        .get_intent("loop:off")
+        .expect("get off")
+        .expect("off row");
+    assert_eq!(
+        on_row.text, "rephrased work prompt, on topic",
+        "cos 0.55 >= 0.5 replaces the text"
+    );
+    assert_eq!(
+        off_row.text, "original work prompt for off",
+        "cos 0.45 < 0.5 keeps the old text"
+    );
+    assert_eq!(on_row.samples, 2);
+    assert_eq!(off_row.samples, 2);
+    drop(env_lock);
 }

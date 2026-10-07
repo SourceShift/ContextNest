@@ -276,7 +276,10 @@ pub struct OwnsViolation {
 /// Concord P3 — one captured UserPromptSubmit prompt + its intent
 /// embedding. `dim` is stored separately from the BLOB length so a
 /// malformed blob (caught by `decode_embedding`) doesn't poison
-/// similarity comparisons with zero-dim neighbours.
+/// similarity comparisons with zero-dim neighbours. `samples` (P3b)
+/// counts blended prompts feeding the stored vector: `1` on every
+/// replace-path write, `>= 2` after the blended path has mixed in
+/// prior rows.
 #[derive(Debug, Clone)]
 pub struct Intent {
     pub principal_id: String,
@@ -284,6 +287,7 @@ pub struct Intent {
     pub embedding: Vec<f32>,
     pub dim: usize,
     pub updated_at: DateTime<Utc>,
+    pub samples: i64,
 }
 
 /// Concord P3 — best match across non-lineage live intents (used by the
@@ -337,6 +341,76 @@ pub fn decode_embedding(b: &[u8]) -> CoordStoreResult<Vec<f32>> {
         out.push(f32::from_le_bytes(arr));
     }
     Ok(out)
+}
+
+/// Cosine floor below which the OLD text is kept on a blend (an
+/// off-topic turn such as a status question). At or above it the new
+/// prompt is on-topic and its text replaces the stored one, so the
+/// notice quotes the principal's current work. 0.5 is the P3b spec value.
+const INTENT_TEXT_KEEP_COS: f32 = 0.5;
+
+/// L2 norm of a vector, accumulated in f64 for stability. Returns 0
+/// when every component is zero; returns `f32::NAN` if any component
+/// is non-finite.
+fn l2_norm(v: &[f32]) -> f32 {
+    let mut sum = 0.0_f64;
+    for x in v {
+        if !x.is_finite() {
+            return f32::NAN;
+        }
+        sum += f64::from(*x) * f64::from(*x);
+    }
+    sum.sqrt() as f32
+}
+
+/// Return a unit vector in the direction of `v`. Empty input or any
+/// non-finite component returns an empty / non-finite vec so callers
+/// can branch on `norm > 0` and `result.is_finite()`. A zero vector
+/// returns an empty Vec to keep the `norm > 0` short-circuit honest
+/// (every component would be 0/0 = NaN otherwise).
+fn normalized(v: &[f32]) -> Vec<f32> {
+    let n = l2_norm(v);
+    if !n.is_finite() || n <= 0.0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(v.len());
+    let inv = 1.0_f64 / f64::from(n);
+    for x in v {
+        out.push((f64::from(*x) * inv) as f32);
+    }
+    out
+}
+
+/// Free helper behind [`CoordStore::upsert_intent`] and
+/// [`CoordStore::upsert_intent_blended`]. Writes one row through the
+/// canonical INSERT … ON CONFLICT SQL so the two write paths share
+/// one statement. `samples` is supplied by the caller — `1` on a
+/// replace, `old_samples + 1` on a blend. Takes `&Connection`
+/// directly so the caller can hold the store's `std::Mutex` and avoid
+/// re-entrancy.
+fn write_intent_row(
+    conn: &Connection,
+    principal_id: &str,
+    text: &str,
+    embedding: &[f32],
+    samples: i64,
+    at: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    let blob = encode_embedding(embedding);
+    let now_str = fmt_ts(at);
+    let dim = embedding.len() as i64;
+    conn.execute(
+        "INSERT INTO intents (principal_id, text, embedding, dim, updated_at, samples)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(principal_id) DO UPDATE SET
+            text       = excluded.text,
+            embedding  = excluded.embedding,
+            dim        = excluded.dim,
+            updated_at = excluded.updated_at,
+            samples    = excluded.samples",
+        params![principal_id, text, blob, dim, now_str, samples],
+    )?;
+    Ok(())
 }
 
 /// One active worktree principal surfaced by [`CoordStore::owning_worktree_principal`].
@@ -502,6 +576,27 @@ fn ensure_digest_seq_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Idempotent migration for the `intents.samples` column (Concord
+/// P3b). Same shape as `ensure_digest_seq_column`: a fresh DB builds
+/// the column via SCHEMA, an upgraded DB gets it from `ALTER TABLE …
+/// ADD COLUMN`, and a second `open()` is a no-op. `NOT NULL DEFAULT
+/// 1` is legal for `ALTER TABLE ADD COLUMN` in SQLite, so pre-P3b
+/// rows read as samples=1 once the upgrade has run.
+fn ensure_intents_samples_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(intents)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !cols.iter().any(|c| c == "samples") {
+        conn.execute(
+            "ALTER TABLE intents ADD COLUMN samples INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Compute status from a stored principal at `now`.
 pub fn status_at(p: &Principal, now: DateTime<Utc>) -> PrincipalStatus {
     if p.ended_at.is_some() {
@@ -619,7 +714,8 @@ const SCHEMA: &str = "
         text         TEXT NOT NULL,
         embedding    BLOB NOT NULL,
         dim          INTEGER NOT NULL,
-        updated_at   TEXT NOT NULL
+        updated_at   TEXT NOT NULL,
+        samples      INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_intents_updated ON intents(updated_at);
     CREATE TABLE IF NOT EXISTS topic_notices (
@@ -658,6 +754,7 @@ impl CoordStore {
         )?;
         conn.execute_batch(SCHEMA)?;
         ensure_digest_seq_column(&conn)?;
+        ensure_intents_samples_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -670,6 +767,7 @@ impl CoordStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         ensure_digest_seq_column(&conn)?;
+        ensure_intents_samples_column(&conn)?;
         let days = footprint_retention_days();
         prune_old_footprints(&conn, days)?;
         Ok(Self {
@@ -1888,12 +1986,19 @@ impl CoordStore {
     // ────────────── intents (Concord P3) ──────────────
 
     /// Upsert one captured prompt + its embedding for `principal_id`.
-    /// Embedding is encoded as little-endian bytes via [`encode_embedding`]
-    /// so a fixed-width round-trip survives schema dumps. `at` is the
-    /// `updated_at` timestamp so tests can plant stale rows without
-    /// sleeping. An empty embedding is rejected with `InvalidBody` —
-    /// the hook's spawned task would otherwise write a 0-vector that
-    /// matches every other 0-vector by definition.
+    /// This is the REPLACE path: it stores the raw embedder vector
+    /// verbatim (no normalization), overwrites the text, and resets
+    /// `samples` to 1. Concord P3b's blended path uses a different
+    /// method (`upsert_intent_blended`) that mixes the new vector into
+    /// the prior one and increments `samples` — both paths are
+    /// intentionally distinct so existing tests keep byte-identical
+    /// behaviour. Embedding is encoded as little-endian bytes via
+    /// [`encode_embedding`] so a fixed-width round-trip survives schema
+    /// dumps. `at` is the `updated_at` timestamp so tests can plant
+    /// stale rows without sleeping. An empty embedding is rejected
+    /// with `InvalidBody` — the hook's spawned task would otherwise
+    /// write a 0-vector that matches every other 0-vector by
+    /// definition.
     pub fn upsert_intent(
         &self,
         principal_id: &str,
@@ -1907,20 +2012,141 @@ impl CoordStore {
                 "intent embedding must be non-empty".into(),
             ));
         }
-        let blob = encode_embedding(embedding);
-        let now_str = fmt_ts(at);
-        let dim = embedding.len() as i64;
         let conn = self.lock();
-        conn.execute(
-            "INSERT INTO intents (principal_id, text, embedding, dim, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(principal_id) DO UPDATE SET
-                text       = excluded.text,
-                embedding  = excluded.embedding,
-                dim        = excluded.dim,
-                updated_at = excluded.updated_at",
-            params![principal_id, text, blob, dim, now_str],
-        )?;
+        write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+        Ok(())
+    }
+
+    /// Concord P3b — exponentially-weighted blend of a principal's
+    /// stored intent with a freshly-captured prompt embedding.
+    ///
+    /// On every call, the stored vector becomes
+    /// `normalize((1-α)·normalize(e_old) + α·normalize(e_new))`, the
+    /// stored text becomes `e_new`'s text when the new prompt is
+    /// on-topic with the old one (cosine ≥ [`INTENT_TEXT_KEEP_COS`])
+    /// and `e_old`'s text otherwise, and `samples` increments by 1.
+    ///
+    /// The blended path is short-circuited to the REPLACE path on any
+    /// of the following: no stored row, `alpha >= 1.0`, a dim mismatch,
+    /// `old.updated_at < at - window_secs` (the row is too old to be a
+    /// useful prior), or any of the three vectors (old / new / mixed)
+    /// failing the L2-norm gate (zero or non-finite). The replace
+    /// branch stores the RAW embedder vector verbatim — exactly what
+    /// the original `upsert_intent` does — so callers that always
+    /// pass `alpha = 1.0` reproduce today's behaviour byte-for-byte.
+    ///
+    /// The whole read-modify-write runs under one
+    /// `std::sync::Mutex` acquisition so two spawned capture tasks
+    /// targeting the same principal cannot lose a blended sample.
+    /// Re-entering `self.lock()` would deadlock the non-reentrant
+    /// mutex, so the inner SELECT and write go through free helpers
+    /// that take `&Connection`.
+    pub fn upsert_intent_blended(
+        &self,
+        principal_id: &str,
+        text: &str,
+        embedding: &[f32],
+        at: DateTime<Utc>,
+        alpha: f32,
+        window_secs: i64,
+    ) -> CoordStoreResult<()> {
+        validate_principal_id(principal_id)?;
+        if embedding.is_empty() {
+            return Err(CoordStoreError::InvalidBody(
+                "intent embedding must be non-empty".into(),
+            ));
+        }
+        if !alpha.is_finite() || alpha <= 0.0 || alpha > 1.0 {
+            return Err(CoordStoreError::InvalidBody(format!(
+                "intent alpha must be finite and in (0,1]; got {alpha}"
+            )));
+        }
+        let conn = self.lock();
+        let existing: Option<(String, Vec<u8>, i64, String, i64)> = conn
+            .query_row(
+                "SELECT text, embedding, dim, updated_at, samples
+                 FROM intents WHERE principal_id = ?1",
+                params![principal_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (existing_text, existing_blob, existing_dim, existing_ts, existing_samples) =
+            match existing {
+                Some(t) => t,
+                None => {
+                    write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+                    return Ok(());
+                }
+            };
+
+        let new_dim = embedding.len() as i64;
+        let replace_dim = existing_dim != new_dim;
+        let stale = match parse_ts(&existing_ts) {
+            Ok(t) => t < at - ChronoDuration::seconds(window_secs),
+            Err(_) => true,
+        };
+        let replace_alpha = alpha >= 1.0;
+        let new_norm = l2_norm(embedding);
+        let new_norm_ok = new_norm.is_finite() && new_norm > 0.0;
+        if replace_dim || stale || replace_alpha || !new_norm_ok {
+            write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+            return Ok(());
+        }
+
+        // Stored blob was written by either the replace path (raw) or
+        // a previous blend (unit-norm). Decode and gate on its L2
+        // norm; a degenerate old vector forces a replace.
+        let old_vec = decode_embedding(&existing_blob)?;
+        let old_norm = l2_norm(&old_vec);
+        if !old_norm.is_finite() || old_norm <= 0.0 {
+            write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+            return Ok(());
+        }
+
+        // Normalize both inputs, then mix.
+        let n_old = normalized(&old_vec);
+        let n_new = normalized(embedding);
+        if n_old.len() != n_new.len() {
+            // Length mismatch is already guarded by the dim check above,
+            // but defense-in-depth: replace if normalization collapsed a
+            // dim.
+            write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+            return Ok(());
+        }
+        let alpha_f = f64::from(alpha);
+        let mut mixed: Vec<f32> = Vec::with_capacity(n_new.len());
+        for (a, b) in n_old.iter().zip(n_new.iter()) {
+            mixed.push((((1.0 - alpha_f) * f64::from(*a)) + (alpha_f * f64::from(*b))) as f32);
+        }
+        let mixed_norm = l2_norm(&mixed);
+        if !mixed_norm.is_finite() || mixed_norm <= f32::EPSILON {
+            write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+            return Ok(());
+        }
+        let stored = normalized(&mixed);
+        if stored.is_empty() {
+            write_intent_row(&conn, principal_id, text, embedding, 1, at)?;
+            return Ok(());
+        }
+
+        // Cosine of the two unit vectors = their dot product.
+        let cos: f32 = n_old.iter().zip(n_new.iter()).map(|(a, b)| *a * *b).sum();
+        let stored_text = if cos.is_finite() && cos >= INTENT_TEXT_KEEP_COS {
+            text
+        } else {
+            existing_text.as_str()
+        };
+
+        let samples = existing_samples.saturating_add(1);
+        write_intent_row(&conn, principal_id, stored_text, &stored, samples, at)?;
         Ok(())
     }
 
@@ -1932,9 +2158,9 @@ impl CoordStore {
             return Ok(None);
         }
         let conn = self.lock();
-        let row: Option<(String, String, Vec<u8>, i64, String)> = conn
+        let row: Option<(String, String, Vec<u8>, i64, String, i64)> = conn
             .query_row(
-                "SELECT principal_id, text, embedding, dim, updated_at
+                "SELECT principal_id, text, embedding, dim, updated_at, samples
                  FROM intents WHERE principal_id = ?1",
                 params![principal_id],
                 |r| {
@@ -1944,13 +2170,14 @@ impl CoordStore {
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
             .optional()?;
         match row {
             None => Ok(None),
-            Some((pid, text, blob, dim, updated_at)) => {
+            Some((pid, text, blob, dim, updated_at, samples)) => {
                 let embedding = decode_embedding(&blob)?;
                 Ok(Some(Intent {
                     principal_id: pid,
@@ -1958,6 +2185,7 @@ impl CoordStore {
                     embedding,
                     dim: dim.max(0) as usize,
                     updated_at: parse_ts(&updated_at)?,
+                    samples,
                 }))
             }
         }
@@ -2168,13 +2396,13 @@ fn live_intents_in(
 ) -> CoordStoreResult<Vec<Intent>> {
     let cutoff = fmt_ts(now - ChronoDuration::seconds(window_secs));
     let mut stmt = conn.prepare(
-        "SELECT i.principal_id, i.text, i.embedding, i.dim, i.updated_at
+        "SELECT i.principal_id, i.text, i.embedding, i.dim, i.updated_at, i.samples
          FROM intents i
          INNER JOIN principals p ON p.principal_id = i.principal_id
          WHERE p.ended_at IS NULL AND i.updated_at >= ?1
          ORDER BY i.updated_at DESC",
     )?;
-    let rows: Vec<(String, String, Vec<u8>, i64, String)> = stmt
+    let rows: Vec<(String, String, Vec<u8>, i64, String, i64)> = stmt
         .query_map(params![cutoff], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2182,12 +2410,13 @@ fn live_intents_in(
                 r.get::<_, Vec<u8>>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut out = Vec::with_capacity(rows.len());
-    for (pid, text, blob, dim, updated_at) in rows {
+    for (pid, text, blob, dim, updated_at, samples) in rows {
         let embedding = decode_embedding(&blob)?;
         out.push(Intent {
             principal_id: pid,
@@ -2195,6 +2424,7 @@ fn live_intents_in(
             embedding,
             dim: dim.max(0) as usize,
             updated_at: parse_ts(&updated_at)?,
+            samples,
         });
     }
     Ok(out)
