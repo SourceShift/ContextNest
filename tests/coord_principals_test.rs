@@ -48,7 +48,7 @@ fn unique_id(tag: &str) -> String {
 
 #[tokio::test]
 async fn dod1_first_put_creates_with_kind_prefix_and_subsequent_keeps_absent() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let server = make_server().await;
     let pid = unique_id("dod1");
@@ -124,10 +124,13 @@ async fn dod1_first_put_creates_with_kind_prefix_and_subsequent_keeps_absent() {
 
 #[tokio::test]
 async fn dod2_live_then_idle_then_stale_then_ended_rebirth() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    // TTL=0 means every read past last_seen is "after the TTL" — the
-    // host+pid probe decides idle vs stale.
-    std::env::set_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", "0");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // (a) runs with a generous TTL: with TTL=0 a fresh PUT is already "past
+    // the TTL" by however many microseconds the response takes, so on a slow
+    // CI runner it read back `idle` instead of `live` (flaky, then poisoned
+    // ENV_LOCK for every later test). The TTL is read per call, so steps
+    // (b)-(c) flip it to 0 and the host+pid probe decides idle vs stale.
+    std::env::set_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", "60");
     let server = make_server().await;
     let pid = unique_id("dod2");
     let host = local_hostname().expect("hostname should resolve on the test host");
@@ -146,6 +149,7 @@ async fn dod2_live_then_idle_then_stale_then_ended_rebirth() {
     assert_eq!(body["principal"]["status"], "live");
 
     // (b) After > TTL with a live pid on the same host → idle.
+    std::env::set_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", "0");
     tokio::time::sleep(Duration::from_millis(60)).await;
     let res = server.get(&format!("/api/v1/coord/principals/{pid}")).await;
     res.assert_status(axum::http::StatusCode::OK);
@@ -217,7 +221,7 @@ async fn dod2_live_then_idle_then_stale_then_ended_rebirth() {
 
 #[tokio::test]
 async fn dod3_listing_filters_inactive_and_sorts_descriptively() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", "0");
     let server = make_server().await;
     let host = local_hostname().expect("hostname should resolve on the test host");
@@ -331,7 +335,7 @@ async fn dod3_listing_filters_inactive_and_sorts_descriptively() {
 
 #[tokio::test]
 async fn dod4_bind_get_rebind_and_bind_to_unknown_principal() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let server = make_server().await;
     let pid_a = unique_id("dod4-a");
@@ -402,7 +406,7 @@ async fn dod4_bind_get_rebind_and_bind_to_unknown_principal() {
 
 #[tokio::test]
 async fn dod5_mailbox_404_400_ack_idempotent_unacked_count() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let server = make_server().await;
     let pid = unique_id("dod5");
@@ -532,7 +536,7 @@ async fn dod5_mailbox_404_400_ack_idempotent_unacked_count() {
 
 #[tokio::test]
 async fn dod6_bad_ids_return_400_on_put() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let server = make_server().await;
 
@@ -562,7 +566,7 @@ async fn dod6_bad_ids_return_400_on_put() {
 
 #[tokio::test]
 async fn malformed_ids_are_404_off_the_put_route_and_bad_bodies_are_invalid_body() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let server = make_server().await;
 
@@ -618,7 +622,7 @@ async fn malformed_ids_are_404_off_the_put_route_and_bad_bodies_are_invalid_body
 
 #[tokio::test]
 async fn dod7_file_backed_store_persists_across_drop() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("coord.db");

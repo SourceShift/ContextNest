@@ -147,12 +147,15 @@ CN_PROD_CONFIG   ?= ./config.toml
 #   726 s      345 k, VM + a cargo build sharing the disk
 #   824 s      346 k retained of 380 k, VM + `cargo build --release` on the disk
 #               (serve-20261003-110233.log: 09:02:34 start → 09:16:18 listening)
+#   1560 s     400 k (2026-10-04), 1520 s at 412 k (2026-10-06): I/O-bound in
+#               CheckpointStore::restore (sqlite3_step over the 7.8 GB checkpoint)
+#               and growing ~12 k fragments/day, so 1800 s no longer leaves headroom.
 # A fixed 180 s budget therefore reports "won't start" for a healthy slow start,
 # and the contended case is the norm on this host, not the exception. The
 # asymmetry decides the default: waiting too long only delays bad news, whereas
 # giving up early turns a healthy substrate into a false alarm. The recipe prints
 # progress every 10 s, and the failure path names the boot phase it reached.
-CN_PROD_HEALTH_TIMEOUT ?= 1800
+CN_PROD_HEALTH_TIMEOUT ?= 3600
 # Per-probe curl timeout for the health poll. The endpoint is not cheap once the
 # substrate is live: it walks the fragment/basin/edge tables, and while the boot
 # backlog drains it measured 2.1-5.4 s across six consecutive probes (2 of 6 over
