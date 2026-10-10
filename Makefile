@@ -307,6 +307,37 @@ cn-prod-stop:
 	fi
 	@echo "✓ nothing listening on $(CN_PROD_PORT)"
 
+# Rewrite the prod checkpoint in (kind,id) order, in place.
+#
+# Why boot time depends on this: the canonical checkpoint is maintained by
+# incremental `INSERT ... ON CONFLICT DO UPDATE` upserts, so over days the
+# b-tree pages drift out of physical order. The restore's per-kind scans then
+# become random 4 KB reads — measured 52 MB/s against a 464 MB/s sequential
+# floor, which is what turns a 30 s boot into an hour. `compact` streams the
+# source in key order into a fresh file, so every scan is sequential again.
+#
+# Cost is proportional to how fragmented the file already is: a deep clean of
+# a badly drifted checkpoint is slow (the read is the expensive part), while
+# re-running on an already-ordered file is quick. Run it after heavy ingest
+# rather than on a schedule.
+cn-compact: cn-prod-stop ## Stop the substrate and rewrite CN_PROD_CHECKPOINT in key order.
+	@if [ ! -f "$(CN_PROD_CHECKPOINT)" ]; then \
+	  echo "ERROR: no checkpoint at $(CN_PROD_CHECKPOINT)"; exit 1; \
+	fi
+	@if [ ! -x "$(CN_BIN)" ]; then echo "ERROR: $(CN_BIN) missing — run make cn-build"; exit 1; fi
+	@STAMP=$$(date +%Y%m%d-%H%M%S); \
+	  OUT="$(CN_PROD_CHECKPOINT).compacted.$$STAMP"; \
+	  echo "compacting $(CN_PROD_CHECKPOINT) -> $$OUT (this reads the whole file; may take a while)"; \
+	  $(CN_BIN) checkpoint compact --from "$(CN_PROD_CHECKPOINT)" --into "$$OUT" || { \
+	    echo "ERROR: compact failed; $(CN_PROD_CHECKPOINT) untouched"; rm -f "$$OUT" "$$OUT-wal" "$$OUT-shm"; exit 1; }; \
+	  BAK="$(CN_PROD_CHECKPOINT).bak-pre-compact-$$STAMP"; \
+	  mv "$(CN_PROD_CHECKPOINT)" "$$BAK"; \
+	  mv "$$OUT" "$(CN_PROD_CHECKPOINT)"; \
+	  rm -f "$$OUT-wal" "$$OUT-shm"; \
+	  echo "✓ compacted"; \
+	  ls -lh "$$BAK" "$(CN_PROD_CHECKPOINT)"; \
+	  echo "  source kept as $$BAK — delete it once the next boot looks healthy."
+
 # Preflight the PROD paths, not the ~/.contextnest defaults.
 cn-prod-preflight:
 	@$(MAKE) --no-print-directory cn-preflight \

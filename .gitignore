@@ -149,3 +149,19 @@ web/.vite/
 .agentflow/mini-orch/scripts/cl_*.sh
 !.agentflow/mini-orch/scripts/cl_*.example.sh
 design/
+
+# mini-ork generated state (the engine pointer below is committed)
+
+.mini-ork/*
+
+!.mini-ork/engine
+
+.mini-ork/state.db
+
+.mini-ork/runs/
+
+.mini-ork/INBOX/
+
+.mini-ork/secrets/
+
+.mini-ork/locks/

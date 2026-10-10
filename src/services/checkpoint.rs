@@ -173,6 +173,58 @@ fn allow_legacy_checkpoint() -> bool {
     std::env::var(ALLOW_LEGACY_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Page-cache size for the checkpoint connection, in MiB.
+///
+/// [`CheckpointStore::restore`] walks ~12.6 M rows out of a multi-GB file.
+/// SQLite's default cache is 2000 pages (8 MB at a 4 KB page size), which
+/// cannot hold the interior levels of either b-tree — so nearly every row
+/// costs a fresh `pread` of the `objects` tree. 256 MiB keeps those
+/// interior levels resident and collapses most lookups to a single leaf read.
+const CACHE_MIB_ENV: &str = "CONTEXTNEST_CHECKPOINT_CACHE_MIB";
+const DEFAULT_CACHE_MIB: i64 = 256;
+
+fn checkpoint_cache_mib() -> i64 {
+    std::env::var(CACHE_MIB_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CACHE_MIB)
+}
+
+/// Page size for a *newly created* checkpoint, in bytes.
+///
+/// A full restore is bound by the number of page I/Os, not the byte count:
+/// the operator volume is USB-attached and bills roughly 36 µs per I/O
+/// whatever the transfer size, so a pass over the `objects` tree costs
+/// `bytes / page_size` I/Os. Page size also decides whether a 4096-byte
+/// vector fits inline — at 4096-byte pages every vector spills into its own
+/// overflow page and costs a second I/O on top of the leaf read.
+///
+/// Measured on the 9.6 GB operator checkpoint, one cold pass per query:
+///
+/// ```text
+/// page_size   basins JOIN   fragments JOIN   edges   vectors read   total
+///      4096        28.5 s          39.6 s   18.6 s        59.0 s   ~87 s
+///     65536         2.8 s           2.3 s   13.7 s         7.0 s   ~20 s
+/// ```
+///
+/// SQLite ignores the pragma once a database has tables, so this only shapes
+/// checkpoints that do not exist yet — an existing file keeps its page size
+/// until it is rewritten by [`compact`].
+const PAGE_SIZE_ENV: &str = "CONTEXTNEST_CHECKPOINT_PAGE_SIZE";
+const DEFAULT_PAGE_SIZE: i64 = 65536;
+/// SQLite requires a power of two in this range.
+const MIN_PAGE_SIZE: i64 = 512;
+const MAX_PAGE_SIZE: i64 = 65536;
+
+fn checkpoint_page_size() -> i64 {
+    std::env::var(PAGE_SIZE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0 && v.count_ones() == 1 && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(v))
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+}
+
 impl CheckpointStore {
     pub fn open(path: &Path, space: &str) -> Result<Self> {
         if is_legacy_checkpoint(path) && !allow_legacy_checkpoint() {
@@ -190,7 +242,18 @@ impl CheckpointStore {
         }
         let lock = super::tenants::lock_database(path)?;
         let mut connection = Connection::open(path)?;
+        // Must run before `SCHEMA` creates the first table: SQLite honours
+        // `page_size` only on a database that has none, and ignores it
+        // afterwards — which is the behaviour we want for an existing
+        // checkpoint. See `checkpoint_page_size`.
+        connection.execute_batch(&format!("PRAGMA page_size={};", checkpoint_page_size()))?;
         connection.execute_batch(SCHEMA)?;
+        // SCHEMA leaves the cache at SQLite's 2000-page default; the restore
+        // scan is the one place that matters. See `checkpoint_cache_mib`.
+        connection.execute_batch(&format!(
+            "PRAGMA cache_size=-{};PRAGMA temp_store=MEMORY;",
+            checkpoint_cache_mib() * 1024
+        ))?;
         let old: Option<String> = connection
             .query_row("SELECT space FROM identity LIMIT 1", [], |r| r.get(0))
             .optional()?;
@@ -393,7 +456,9 @@ impl CheckpointStore {
             let mut statement = db.prepare("SELECT id, payload FROM objects WHERE kind='node'")?;
             let mut rows = statement.query([])?;
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
+            let mut seen: usize = 0;
             while let Some(row) = rows.next()? {
+                seen += 1;
                 if !kept.contains(&row.get::<_, String>(0)?) {
                     continue;
                 }
@@ -401,18 +466,32 @@ impl CheckpointStore {
                 batch.push(MemoryNode::from(node));
                 if batch.len() == RESTORE_BATCH {
                     emit(RestoreBatch::Nodes(std::mem::take(&mut batch)))?;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                        tracing::info!(
+                            seen,
+                            elapsed_s = started.elapsed().as_secs(),
+                            "checkpoint restore: nodes"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
             }
             if !batch.is_empty() {
                 emit(RestoreBatch::Nodes(batch))?;
             }
         }
+        tracing::info!(
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: nodes done"
+        );
 
         {
             let mut statement = db.prepare("SELECT payload FROM objects WHERE kind='edge'")?;
             let mut rows = statement.query([])?;
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
+            let mut seen: usize = 0;
             while let Some(row) = rows.next()? {
+                seen += 1;
                 let edge: ConnectionEdge = serde_json::from_str(&row.get::<_, String>(0)?)?;
                 if !kept.contains(&edge.source) || !kept.contains(&edge.target) {
                     continue;
@@ -420,12 +499,26 @@ impl CheckpointStore {
                 batch.push(edge);
                 if batch.len() == RESTORE_BATCH {
                     emit(RestoreBatch::Edges(std::mem::take(&mut batch)))?;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                        let secs = started.elapsed().as_secs().max(1);
+                        tracing::info!(
+                            seen,
+                            rows_per_s = seen as u64 / secs,
+                            elapsed_s = secs,
+                            "checkpoint restore: edges"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
             }
             if !batch.is_empty() {
                 emit(RestoreBatch::Edges(batch))?;
             }
         }
+        tracing::info!(
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: edges done"
+        );
 
         let mut metadata = HashMap::new();
         for row in db
@@ -672,8 +765,18 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
     // growing (kind,id) index resident; together with key-ordered reads
     // below, inserts become appends instead of random B-tree rewrites
     // (a 15 GB checkpoint went I/O-bound at ~50 MB/min without this).
+    //
+    // `journal_mode=MEMORY` matters as much as the cache. The target is
+    // opened through `CheckpointStore::open`, which runs `SCHEMA` and so
+    // inherits WAL — every write then lands in a `-wal` sidecar that grows
+    // to roughly the size of the source and is checkpointed back into the
+    // main file afterwards, doubling write volume. On a 9.6 GB source that
+    // measured ~4 MB/s (240 MB main + 262 MB wal in two minutes). The
+    // rollback journal is kept in memory instead; a crash still just means
+    // deleting the partial output.
     out.execute_batch(
-        "PRAGMA synchronous=OFF;PRAGMA cache_size=-262144;PRAGMA temp_store=MEMORY;",
+        "PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;\
+         PRAGMA cache_size=-524288;PRAGMA temp_store=MEMORY;",
     )?;
     let mut report = CompactReport::default();
 
@@ -1043,6 +1146,66 @@ mod tests {
         let store = CheckpointStore::open(&fresh, "space").unwrap();
         store.save("a", snapshot(), &HashMap::new()).unwrap();
         assert!(!is_legacy_checkpoint(&fresh), "a v0.2 file is not legacy");
+    }
+
+    /// Serialises the tests that read or write [`PAGE_SIZE_ENV`]. Every
+    /// `CheckpointStore::open` consults it, so a concurrent override would
+    /// change the page size another test asserts on.
+    fn page_size_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_page_size(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_checkpoint_uses_the_large_page_size() {
+        // Restore is bound by page I/O count, not bytes: the operator volume
+        // bills ~36 µs per I/O whatever the transfer size, and a 4096-byte
+        // vector only fits inline on a page larger than 4096. A regression
+        // here silently multiplies every boot's I/O by 16.
+        let _guard = page_size_env_lock();
+        std::env::remove_var(PAGE_SIZE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.sqlite");
+        drop(CheckpointStore::open(&path, "space").unwrap());
+        assert_eq!(read_page_size(&path), DEFAULT_PAGE_SIZE);
+        assert_eq!(DEFAULT_PAGE_SIZE, 65536);
+    }
+
+    #[test]
+    fn page_size_override_is_validated_before_it_reaches_sqlite() {
+        let _guard = page_size_env_lock();
+        std::env::set_var(PAGE_SIZE_ENV, "8192");
+        assert_eq!(checkpoint_page_size(), 8192);
+        // Neither of these is a legal SQLite page size; both must fall back
+        // rather than produce a checkpoint that cannot be opened.
+        std::env::set_var(PAGE_SIZE_ENV, "6000"); // not a power of two
+        assert_eq!(checkpoint_page_size(), DEFAULT_PAGE_SIZE);
+        std::env::set_var(PAGE_SIZE_ENV, "131072"); // above the 64 KiB ceiling
+        assert_eq!(checkpoint_page_size(), DEFAULT_PAGE_SIZE);
+        std::env::remove_var(PAGE_SIZE_ENV);
+    }
+
+    #[test]
+    fn compact_writes_the_large_page_size() {
+        // `compact` is the only way an existing 4 KiB checkpoint becomes a
+        // 64 KiB one, since SQLite ignores the pragma on a populated database.
+        let _guard = page_size_env_lock();
+        std::env::remove_var(PAGE_SIZE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.sqlite");
+        let into = dir.path().join("into.sqlite");
+        let store = CheckpointStore::open(&from, "space").unwrap();
+        store.save("a", snapshot(), &HashMap::new()).unwrap();
+        drop(store);
+        compact(&from, &into).unwrap();
+        assert_eq!(read_page_size(&into), DEFAULT_PAGE_SIZE);
     }
 
     #[test]
