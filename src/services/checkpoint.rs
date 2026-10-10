@@ -191,6 +191,40 @@ fn checkpoint_cache_mib() -> i64 {
         .unwrap_or(DEFAULT_CACHE_MIB)
 }
 
+/// Page size for a *newly created* checkpoint, in bytes.
+///
+/// A full restore is bound by the number of page I/Os, not the byte count:
+/// the operator volume is USB-attached and bills roughly 36 µs per I/O
+/// whatever the transfer size, so a pass over the `objects` tree costs
+/// `bytes / page_size` I/Os. Page size also decides whether a 4096-byte
+/// vector fits inline — at 4096-byte pages every vector spills into its own
+/// overflow page and costs a second I/O on top of the leaf read.
+///
+/// Measured on the 9.6 GB operator checkpoint, one cold pass per query:
+///
+/// ```text
+/// page_size   basins JOIN   fragments JOIN   edges   vectors read   total
+///      4096        28.5 s          39.6 s   18.6 s        59.0 s   ~87 s
+///     65536         2.8 s           2.3 s   13.7 s         7.0 s   ~20 s
+/// ```
+///
+/// SQLite ignores the pragma once a database has tables, so this only shapes
+/// checkpoints that do not exist yet — an existing file keeps its page size
+/// until it is rewritten by [`compact`].
+const PAGE_SIZE_ENV: &str = "CONTEXTNEST_CHECKPOINT_PAGE_SIZE";
+const DEFAULT_PAGE_SIZE: i64 = 65536;
+/// SQLite requires a power of two in this range.
+const MIN_PAGE_SIZE: i64 = 512;
+const MAX_PAGE_SIZE: i64 = 65536;
+
+fn checkpoint_page_size() -> i64 {
+    std::env::var(PAGE_SIZE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0 && v.count_ones() == 1 && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(v))
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+}
+
 impl CheckpointStore {
     pub fn open(path: &Path, space: &str) -> Result<Self> {
         if is_legacy_checkpoint(path) && !allow_legacy_checkpoint() {
@@ -208,6 +242,11 @@ impl CheckpointStore {
         }
         let lock = super::tenants::lock_database(path)?;
         let mut connection = Connection::open(path)?;
+        // Must run before `SCHEMA` creates the first table: SQLite honours
+        // `page_size` only on a database that has none, and ignores it
+        // afterwards — which is the behaviour we want for an existing
+        // checkpoint. See `checkpoint_page_size`.
+        connection.execute_batch(&format!("PRAGMA page_size={};", checkpoint_page_size()))?;
         connection.execute_batch(SCHEMA)?;
         // SCHEMA leaves the cache at SQLite's 2000-page default; the restore
         // scan is the one place that matters. See `checkpoint_cache_mib`.
@@ -1107,6 +1146,66 @@ mod tests {
         let store = CheckpointStore::open(&fresh, "space").unwrap();
         store.save("a", snapshot(), &HashMap::new()).unwrap();
         assert!(!is_legacy_checkpoint(&fresh), "a v0.2 file is not legacy");
+    }
+
+    /// Serialises the tests that read or write [`PAGE_SIZE_ENV`]. Every
+    /// `CheckpointStore::open` consults it, so a concurrent override would
+    /// change the page size another test asserts on.
+    fn page_size_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_page_size(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_checkpoint_uses_the_large_page_size() {
+        // Restore is bound by page I/O count, not bytes: the operator volume
+        // bills ~36 µs per I/O whatever the transfer size, and a 4096-byte
+        // vector only fits inline on a page larger than 4096. A regression
+        // here silently multiplies every boot's I/O by 16.
+        let _guard = page_size_env_lock();
+        std::env::remove_var(PAGE_SIZE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.sqlite");
+        drop(CheckpointStore::open(&path, "space").unwrap());
+        assert_eq!(read_page_size(&path), DEFAULT_PAGE_SIZE);
+        assert_eq!(DEFAULT_PAGE_SIZE, 65536);
+    }
+
+    #[test]
+    fn page_size_override_is_validated_before_it_reaches_sqlite() {
+        let _guard = page_size_env_lock();
+        std::env::set_var(PAGE_SIZE_ENV, "8192");
+        assert_eq!(checkpoint_page_size(), 8192);
+        // Neither of these is a legal SQLite page size; both must fall back
+        // rather than produce a checkpoint that cannot be opened.
+        std::env::set_var(PAGE_SIZE_ENV, "6000"); // not a power of two
+        assert_eq!(checkpoint_page_size(), DEFAULT_PAGE_SIZE);
+        std::env::set_var(PAGE_SIZE_ENV, "131072"); // above the 64 KiB ceiling
+        assert_eq!(checkpoint_page_size(), DEFAULT_PAGE_SIZE);
+        std::env::remove_var(PAGE_SIZE_ENV);
+    }
+
+    #[test]
+    fn compact_writes_the_large_page_size() {
+        // `compact` is the only way an existing 4 KiB checkpoint becomes a
+        // 64 KiB one, since SQLite ignores the pragma on a populated database.
+        let _guard = page_size_env_lock();
+        std::env::remove_var(PAGE_SIZE_ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.sqlite");
+        let into = dir.path().join("into.sqlite");
+        let store = CheckpointStore::open(&from, "space").unwrap();
+        store.save("a", snapshot(), &HashMap::new()).unwrap();
+        drop(store);
+        compact(&from, &into).unwrap();
+        assert_eq!(read_page_size(&into), DEFAULT_PAGE_SIZE);
     }
 
     #[test]
