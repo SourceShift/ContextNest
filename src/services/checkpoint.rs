@@ -173,6 +173,24 @@ fn allow_legacy_checkpoint() -> bool {
     std::env::var(ALLOW_LEGACY_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Page-cache size for the checkpoint connection, in MiB.
+///
+/// [`CheckpointStore::restore`] walks ~12.6 M rows out of a multi-GB file.
+/// SQLite's default cache is 2000 pages (8 MB at a 4 KB page size), which
+/// cannot hold the interior levels of either b-tree — so nearly every row
+/// costs a fresh `pread` of the `objects` tree. 256 MiB keeps those
+/// interior levels resident and collapses most lookups to a single leaf read.
+const CACHE_MIB_ENV: &str = "CONTEXTNEST_CHECKPOINT_CACHE_MIB";
+const DEFAULT_CACHE_MIB: i64 = 256;
+
+fn checkpoint_cache_mib() -> i64 {
+    std::env::var(CACHE_MIB_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CACHE_MIB)
+}
+
 impl CheckpointStore {
     pub fn open(path: &Path, space: &str) -> Result<Self> {
         if is_legacy_checkpoint(path) && !allow_legacy_checkpoint() {
@@ -191,6 +209,12 @@ impl CheckpointStore {
         let lock = super::tenants::lock_database(path)?;
         let mut connection = Connection::open(path)?;
         connection.execute_batch(SCHEMA)?;
+        // SCHEMA leaves the cache at SQLite's 2000-page default; the restore
+        // scan is the one place that matters. See `checkpoint_cache_mib`.
+        connection.execute_batch(&format!(
+            "PRAGMA cache_size=-{};PRAGMA temp_store=MEMORY;",
+            checkpoint_cache_mib() * 1024
+        ))?;
         let old: Option<String> = connection
             .query_row("SELECT space FROM identity LIMIT 1", [], |r| r.get(0))
             .optional()?;
@@ -393,7 +417,9 @@ impl CheckpointStore {
             let mut statement = db.prepare("SELECT id, payload FROM objects WHERE kind='node'")?;
             let mut rows = statement.query([])?;
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
+            let mut seen: usize = 0;
             while let Some(row) = rows.next()? {
+                seen += 1;
                 if !kept.contains(&row.get::<_, String>(0)?) {
                     continue;
                 }
@@ -401,18 +427,32 @@ impl CheckpointStore {
                 batch.push(MemoryNode::from(node));
                 if batch.len() == RESTORE_BATCH {
                     emit(RestoreBatch::Nodes(std::mem::take(&mut batch)))?;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                        tracing::info!(
+                            seen,
+                            elapsed_s = started.elapsed().as_secs(),
+                            "checkpoint restore: nodes"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
             }
             if !batch.is_empty() {
                 emit(RestoreBatch::Nodes(batch))?;
             }
         }
+        tracing::info!(
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: nodes done"
+        );
 
         {
             let mut statement = db.prepare("SELECT payload FROM objects WHERE kind='edge'")?;
             let mut rows = statement.query([])?;
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
+            let mut seen: usize = 0;
             while let Some(row) = rows.next()? {
+                seen += 1;
                 let edge: ConnectionEdge = serde_json::from_str(&row.get::<_, String>(0)?)?;
                 if !kept.contains(&edge.source) || !kept.contains(&edge.target) {
                     continue;
@@ -420,12 +460,26 @@ impl CheckpointStore {
                 batch.push(edge);
                 if batch.len() == RESTORE_BATCH {
                     emit(RestoreBatch::Edges(std::mem::take(&mut batch)))?;
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                        let secs = started.elapsed().as_secs().max(1);
+                        tracing::info!(
+                            seen,
+                            rows_per_s = seen as u64 / secs,
+                            elapsed_s = secs,
+                            "checkpoint restore: edges"
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
                 }
             }
             if !batch.is_empty() {
                 emit(RestoreBatch::Edges(batch))?;
             }
         }
+        tracing::info!(
+            elapsed_s = started.elapsed().as_secs(),
+            "checkpoint restore: edges done"
+        );
 
         let mut metadata = HashMap::new();
         for row in db
@@ -672,8 +726,18 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
     // growing (kind,id) index resident; together with key-ordered reads
     // below, inserts become appends instead of random B-tree rewrites
     // (a 15 GB checkpoint went I/O-bound at ~50 MB/min without this).
+    //
+    // `journal_mode=MEMORY` matters as much as the cache. The target is
+    // opened through `CheckpointStore::open`, which runs `SCHEMA` and so
+    // inherits WAL — every write then lands in a `-wal` sidecar that grows
+    // to roughly the size of the source and is checkpointed back into the
+    // main file afterwards, doubling write volume. On a 9.6 GB source that
+    // measured ~4 MB/s (240 MB main + 262 MB wal in two minutes). The
+    // rollback journal is kept in memory instead; a crash still just means
+    // deleting the partial output.
     out.execute_batch(
-        "PRAGMA synchronous=OFF;PRAGMA cache_size=-262144;PRAGMA temp_store=MEMORY;",
+        "PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;\
+         PRAGMA cache_size=-524288;PRAGMA temp_store=MEMORY;",
     )?;
     let mut report = CompactReport::default();
 
