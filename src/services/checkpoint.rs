@@ -28,6 +28,270 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// Rows per restore batch handed to the attractor manager.
 const RESTORE_BATCH: usize = 2048;
 
+/// Rows of raw payloads read per parallel parse wave.
+///
+/// A wave costs `workers - 1` thread spawns, so bigger waves mean fewer of
+/// them; smaller waves hold less memory, since a wave keeps the raw JSON and
+/// the parsed structs alive side by side. 16 384 rows is ~5.5 MB of edge JSON
+/// at the measured 336 bytes per edge — small next to the 2.9 GB the restored
+/// substrate already occupies.
+const PARSE_WAVE: usize = 16384;
+
+/// How many edges share one `edge_packs` row.
+///
+/// A restore is bound by how many rows SQLite *steps*, not by bytes. Measured
+/// against the live checkpoint: stepping 11.4 M edge rows and fetching their
+/// payloads costs 42-51 s, while stepping the same rows through the
+/// index alone (no payload) costs 6.7 s and the payloads are only 3.9 GB —
+/// about 6 s of raw I/O. The cost is per row, at roughly 2.5 us, which is why
+/// packing 64 edges into each row cuts the edge pass by that factor. The
+/// consumed bytes do not change; only how often SQLite's per-row VM runs.
+///
+/// At ~336 bytes per edge, 64 edges is ~21 KB of JSON — comfortably inside the
+/// inline limit of a 64 KiB page, so a pack does not spill to an overflow page.
+const EDGES_PER_PACK: usize = 64;
+
+/// Flush a pack early once its JSON passes this. Individual edges are not size
+/// bounded, so a run of large ones must not push a pack past the inline limit.
+const EDGE_PACK_MAX_BYTES: usize = 48 * 1024;
+
+/// Widest fan-out a parse wave will use, whatever the core count.
+///
+/// A wave turns allocator- and memory-bandwidth-bound well before it turns
+/// core-bound, and the consumer runs on the same machine at the same time, so
+/// this stays clear of the core count on a large box.
+const PARSE_MAX_WORKERS: usize = 8;
+
+/// Overrides the parse fan-out. `1` restores single-threaded behaviour, which
+/// is the escape hatch if the fan-out ever regresses.
+const PARSE_WORKERS_ENV: &str = "CONTEXTNEST_RESTORE_PARSE_WORKERS";
+
+/// Threads to fan a parse wave across.
+fn parse_workers() -> usize {
+    std::env::var(PARSE_WORKERS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+        .clamp(1, PARSE_MAX_WORKERS)
+}
+
+/// Lift up to [`PARSE_WAVE`] rows out of `rows` with `take`.
+///
+/// `take` returns `Ok(None)` for a row the caller can reject before the parse
+/// — a cheap set lookup — so a rejected row never has its payload allocated.
+/// Returns the surviving rows and how many rows were stepped; the two differ
+/// when `take` rejects, and the progress log wants the raw row count.
+///
+/// Rows are owned because the parse runs on other threads and a borrowed
+/// `Row` cannot outlive the step that produced it.
+fn read_wave<R>(
+    rows: &mut rusqlite::Rows<'_>,
+    mut take: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Option<R>>,
+) -> Result<(Vec<R>, usize)> {
+    let mut wave = Vec::with_capacity(PARSE_WAVE);
+    let mut seen = 0usize;
+    while seen < PARSE_WAVE {
+        let Some(row) = rows.next()? else { break };
+        seen += 1;
+        if let Some(item) = take(row)? {
+            wave.push(item);
+        }
+    }
+    Ok((wave, seen))
+}
+
+/// Map `parse` over a wave of already-read rows on `workers` threads, in order.
+///
+/// The wave item is whatever the caller lifted out of the row — a payload
+/// string for edges, a payload plus a vector blob for basins and fragments —
+/// because rusqlite's `Rows` borrows the statement and cannot cross a thread
+/// boundary. The read therefore stays on the calling thread and only the parse
+/// fans out.
+///
+/// `parse` returns `Ok(None)` to drop an item, which is how the edge pass
+/// applies its `kept` filter without a second pass over the wave.
+///
+/// This is deliberately *not* sold as the fix for the edge pass. Probing the
+/// live checkpoint (`probe_edge_reader_without_apply`) showed the parse is
+/// nearly free next to the per-row SQLite step: reading 11.4 M edge rows
+/// without parsing at all takes 65 s against 62 s with it, and eight threads
+/// bought only 1.2x. The fan-out earns its keep where the parse is a real
+/// share of the work — a packed wave item is a 64-edge JSON array rather than
+/// a single edge, and the fragment and basin payloads are large — and it costs
+/// little where it is not.
+///
+/// Order is preserved: the wave is split into contiguous slices and the slices
+/// are collected in spawn order.
+fn map_wave_parallel<I, T, F>(raw: Vec<I>, workers: usize, parse: F) -> Result<Vec<T>>
+where
+    // `Sync`, not just `Send`: each worker borrows a slice of the wave, so
+    // `&[I]` has to cross the thread boundary.
+    I: Send + Sync,
+    T: Send,
+    F: Fn(&I) -> Result<Option<T>> + Sync,
+{
+    if workers <= 1 || raw.len() < 2 {
+        let mut out = Vec::with_capacity(raw.len());
+        for payload in &raw {
+            if let Some(item) = parse(payload)? {
+                out.push(item);
+            }
+        }
+        return Ok(out);
+    }
+
+    let parse = &parse;
+    let slice_len = raw.len().div_ceil(workers);
+    let mut parsed: Vec<Vec<T>> = Vec::with_capacity(workers);
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = raw
+            .chunks(slice_len)
+            .map(|slice| {
+                scope.spawn(move || -> Result<Vec<T>> {
+                    let mut out = Vec::with_capacity(slice.len());
+                    for payload in slice {
+                        if let Some(item) = parse(payload)? {
+                            out.push(item);
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        for handle in handles {
+            parsed.push(
+                handle
+                    .join()
+                    .map_err(|_| "parse worker panicked".to_string())??,
+            );
+        }
+        Ok(())
+    })?;
+    Ok(parsed.into_iter().flatten().collect())
+}
+
+/// Edges only, with the `kept` filter applied after the parse.
+fn parse_edges_across_cores(
+    raw: Vec<String>,
+    workers: usize,
+    kept: &HashSet<String>,
+) -> Result<Vec<ConnectionEdge>> {
+    map_wave_parallel(raw, workers, |payload| {
+        let edge: ConnectionEdge = serde_json::from_str(payload)?;
+        Ok((kept.contains(&edge.source) && kept.contains(&edge.target)).then_some(edge))
+    })
+}
+
+/// One [`EDGES_PER_PACK`]-sized array per row, filtered after the parse.
+fn parse_packs_across_cores(
+    raw: Vec<String>,
+    workers: usize,
+    kept: &HashSet<String>,
+) -> Result<Vec<ConnectionEdge>> {
+    let packs: Vec<Vec<ConnectionEdge>> = map_wave_parallel(raw, workers, |payload| {
+        let pack: Vec<ConnectionEdge> = serde_json::from_str(payload)?;
+        Ok(Some(
+            pack.into_iter()
+                .filter(|edge| kept.contains(&edge.source) && kept.contains(&edge.target))
+                .collect(),
+        ))
+    })?;
+    Ok(packs.into_iter().flatten().collect())
+}
+
+/// Drain raw edge payload rows into `emit` in [`RESTORE_BATCH`] chunks.
+///
+/// `parse` receives a whole wave, which is where the two edge sources differ:
+/// a packed row holds an array of edges, a leftover `objects` row holds one.
+fn stream_edge_rows<F>(
+    rows: &mut rusqlite::Rows<'_>,
+    workers: usize,
+    mut parse: F,
+    batch: &mut Vec<ConnectionEdge>,
+    emit: &mut impl FnMut(RestoreBatch) -> Result<()>,
+) -> Result<usize>
+where
+    F: FnMut(Vec<String>, usize) -> Result<Vec<ConnectionEdge>>,
+{
+    let mut wave: Vec<String> = Vec::with_capacity(PARSE_WAVE);
+    let mut seen = 0usize;
+    while let Some(row) = rows.next()? {
+        seen += 1;
+        wave.push(row.get(0)?);
+        if wave.len() == PARSE_WAVE {
+            push_edges(parse(std::mem::take(&mut wave), workers)?, batch, emit)?;
+            wave.reserve(PARSE_WAVE);
+        }
+    }
+    push_edges(parse(std::mem::take(&mut wave), workers)?, batch, emit)?;
+    Ok(seen)
+}
+
+fn push_edges(
+    edges: Vec<ConnectionEdge>,
+    batch: &mut Vec<ConnectionEdge>,
+    emit: &mut impl FnMut(RestoreBatch) -> Result<()>,
+) -> Result<()> {
+    for edge in edges {
+        batch.push(edge);
+        if batch.len() == RESTORE_BATCH {
+            emit(RestoreBatch::Edges(std::mem::take(batch)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Split a run of serialised edges into pack payloads.
+///
+/// The edges arrive as individual JSON objects and are joined into a JSON
+/// array, so nothing is parsed and re-serialised on the way in — the bytes
+/// written are exactly the bytes read. `None` ends a pack early at
+/// [`EDGES_PER_PACK`] *or* [`EDGE_PACK_MAX_BYTES`], whichever comes first.
+struct EdgePacker {
+    buf: Vec<String>,
+    bytes: usize,
+}
+
+impl EdgePacker {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(EDGES_PER_PACK),
+            bytes: 0,
+        }
+    }
+
+    /// Add one serialised edge; returns a finished pack when one fills up.
+    fn push(&mut self, payload: String) -> Option<String> {
+        if self.buf.is_empty() {
+            self.bytes = 2; // the surrounding []
+        }
+        self.bytes += payload.len() + 1; // + the joining comma
+        self.buf.push(payload);
+        if self.buf.len() >= EDGES_PER_PACK || self.bytes >= EDGE_PACK_MAX_BYTES {
+            self.take()
+        } else {
+            None
+        }
+    }
+
+    /// Finish the current pack, if any.
+    fn take(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        self.bytes = 0;
+        Some(format!(
+            "[{}]",
+            self.buf.drain(..).collect::<Vec<_>>().join(",")
+        ))
+    }
+}
+
 /// Set to `1` to let [`CheckpointStore::open`] adopt a pre-v0.2 checkpoint in
 /// place. Off by default — see [`is_legacy_checkpoint`].
 const ALLOW_LEGACY_ENV: &str = "CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT";
@@ -35,6 +299,7 @@ const ALLOW_LEGACY_ENV: &str = "CONTEXTNEST_ALLOW_LEGACY_CHECKPOINT";
 const SCHEMA: &str = "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;
     CREATE TABLE IF NOT EXISTS identity(space TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS objects(kind TEXT,id TEXT,payload TEXT NOT NULL,PRIMARY KEY(kind,id));
+    CREATE TABLE IF NOT EXISTS edge_packs(seq INTEGER PRIMARY KEY,payload TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS vectors(kind TEXT,id TEXT,data BLOB NOT NULL,PRIMARY KEY(kind,id));
     CREATE TABLE IF NOT EXISTS completed(id TEXT PRIMARY KEY,metadata TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY);
@@ -333,6 +598,10 @@ impl CheckpointStore {
         // throttled progress line instead.
         let started = std::time::Instant::now();
         let mut last_progress = started;
+        // One decision for the whole restore: the row read stays on this
+        // thread (rusqlite's `Rows` borrows the statement), only the parse
+        // fans out.
+        let workers = parse_workers();
         let db = self.connection.lock().unwrap();
         let mut deleted = HashSet::new();
         for row in db
@@ -357,21 +626,37 @@ impl CheckpointStore {
                  LEFT JOIN vectors v ON v.kind='basin' AND v.id=o.id WHERE o.kind='basin'",
             )?;
             let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                let mut basin: AttractorBasin = serde_json::from_str(&row.get::<_, String>(0)?)?;
-                if basin.center.is_empty() {
-                    let Some(center) = row
-                        .get::<_, Option<Vec<u8>>>(1)?
-                        .as_deref()
-                        .and_then(decode_vector)
-                    else {
-                        tracing::warn!(basin = %basin.id, "checkpoint basin has no vector; skipped");
-                        continue;
-                    };
-                    basin.center = center;
+            loop {
+                let (wave, seen) = read_wave(&mut rows, |row| {
+                    Ok(Some((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    )))
+                })?;
+                if seen == 0 {
+                    break;
                 }
-                member_ids.extend(basin.associated_fragments.iter().cloned());
-                basins.push(basin);
+                let parsed: Vec<AttractorBasin> = map_wave_parallel(
+                    wave,
+                    workers,
+                    |(payload, data)| {
+                        let mut basin: AttractorBasin = serde_json::from_str(payload)?;
+                        if basin.center.is_empty() {
+                            let Some(center) = data.as_deref().and_then(decode_vector) else {
+                                tracing::warn!(basin = %basin.id, "checkpoint basin has no vector; skipped");
+                                return Ok(None);
+                            };
+                            basin.center = center;
+                        }
+                        Ok(Some(basin))
+                    },
+                )?;
+                // Members are folded in on this thread so the `kept` filter
+                // downstream sees the same set regardless of worker count.
+                for basin in parsed {
+                    member_ids.extend(basin.associated_fragments.iter().cloned());
+                    basins.push(basin);
+                }
             }
         }
 
@@ -391,40 +676,61 @@ impl CheckpointStore {
             )?;
             let mut rows = statement.query([])?;
             let mut batch = Vec::with_capacity(RESTORE_BATCH);
-            while let Some(row) = rows.next()? {
-                let id: String = row.get(0)?;
-                scanned += 1;
-                if !allowed.contains(&id)
-                    || deleted.contains(&id)
-                    || !node_ids.contains(&id)
-                    || !member_ids.contains(&id)
-                {
-                    continue;
+            loop {
+                // The four id filters are set lookups, so they run inside the
+                // read: a fragment that fails them never has its payload
+                // allocated, let alone parsed.
+                let (wave, seen) = read_wave(&mut rows, |row| {
+                    let id: String = row.get(0)?;
+                    if !allowed.contains(&id)
+                        || deleted.contains(&id)
+                        || !node_ids.contains(&id)
+                        || !member_ids.contains(&id)
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        id,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    )))
+                })?;
+                if seen == 0 {
+                    break;
                 }
-                let mut fragment: MemoryFragment = serde_json::from_str(&row.get::<_, String>(1)?)?;
-                if fragment.content.is_empty() {
-                    let Some(vector) = row
-                        .get::<_, Option<Vec<u8>>>(2)?
-                        .as_deref()
-                        .and_then(decode_vector)
-                    else {
-                        tracing::warn!(fragment = %id, "checkpoint fragment has no vector; skipped");
-                        continue;
-                    };
-                    fragment.content = vector;
-                }
-                kept.insert(id);
-                batch.push(fragment);
-                if batch.len() == RESTORE_BATCH {
-                    emit(RestoreBatch::Fragments(std::mem::take(&mut batch)))?;
-                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
-                        tracing::info!(
-                            scanned,
-                            kept = kept.len(),
-                            elapsed_s = started.elapsed().as_secs(),
-                            "checkpoint restore: fragments"
-                        );
-                        last_progress = std::time::Instant::now();
+                scanned += seen;
+                let parsed: Vec<(String, MemoryFragment)> = map_wave_parallel(
+                    wave,
+                    workers,
+                    |(id, payload, data)| {
+                        let mut fragment: MemoryFragment = serde_json::from_str(payload)?;
+                        if fragment.content.is_empty() {
+                            let Some(vector) = data.as_deref().and_then(decode_vector) else {
+                                tracing::warn!(fragment = %id, "checkpoint fragment has no vector; skipped");
+                                return Ok(None);
+                            };
+                            fragment.content = vector;
+                        }
+                        Ok(Some((id.clone(), fragment)))
+                    },
+                )?;
+                // `kept` is what nodes, basin membership and edges are later
+                // filtered against, so it is filled here, in wave order, on
+                // the one thread that owns it.
+                for (id, fragment) in parsed {
+                    kept.insert(id);
+                    batch.push(fragment);
+                    if batch.len() == RESTORE_BATCH {
+                        emit(RestoreBatch::Fragments(std::mem::take(&mut batch)))?;
+                        if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
+                            tracing::info!(
+                                scanned,
+                                kept = kept.len(),
+                                elapsed_s = started.elapsed().as_secs(),
+                                "checkpoint restore: fragments"
+                            );
+                            last_progress = std::time::Instant::now();
+                        }
                     }
                 }
             }
@@ -486,30 +792,46 @@ impl CheckpointStore {
         );
 
         {
+            // Two sources, and the unpacked delta goes first: an edge that a
+            // later `save` rewrote must not be shadowed by its older packed
+            // copy. `restore_edge` drops a duplicate by id against the source
+            // node's incident list, so whichever is inserted first is kept.
+            let packed: bool =
+                db.query_row("SELECT EXISTS(SELECT 1 FROM edge_packs)", [], |r| r.get(0))?;
+            tracing::info!(workers, packed, "checkpoint restore: edges starting");
+            let mut batch: Vec<ConnectionEdge> = Vec::with_capacity(RESTORE_BATCH);
+
+            if packed {
+                let mut statement = db.prepare("SELECT payload FROM edge_packs ORDER BY seq")?;
+                let mut rows = statement.query([])?;
+                let packs = stream_edge_rows(
+                    &mut rows,
+                    workers,
+                    |wave, w| parse_packs_across_cores(wave, w, &kept),
+                    &mut batch,
+                    &mut emit,
+                )?;
+                tracing::info!(
+                    packs,
+                    elapsed_s = started.elapsed().as_secs(),
+                    "checkpoint restore: edge packs done"
+                );
+            }
+
+            // Edges written since the last compaction are still one row each in
+            // `objects`. Empty on a freshly compacted checkpoint, where the
+            // index seek that finds nothing costs nothing.
             let mut statement = db.prepare("SELECT payload FROM objects WHERE kind='edge'")?;
             let mut rows = statement.query([])?;
-            let mut batch = Vec::with_capacity(RESTORE_BATCH);
-            let mut seen: usize = 0;
-            while let Some(row) = rows.next()? {
-                seen += 1;
-                let edge: ConnectionEdge = serde_json::from_str(&row.get::<_, String>(0)?)?;
-                if !kept.contains(&edge.source) || !kept.contains(&edge.target) {
-                    continue;
-                }
-                batch.push(edge);
-                if batch.len() == RESTORE_BATCH {
-                    emit(RestoreBatch::Edges(std::mem::take(&mut batch)))?;
-                    if last_progress.elapsed() >= std::time::Duration::from_secs(10) {
-                        let secs = started.elapsed().as_secs().max(1);
-                        tracing::info!(
-                            seen,
-                            rows_per_s = seen as u64 / secs,
-                            elapsed_s = secs,
-                            "checkpoint restore: edges"
-                        );
-                        last_progress = std::time::Instant::now();
-                    }
-                }
+            let delta = stream_edge_rows(
+                &mut rows,
+                workers,
+                |wave, w| parse_edges_across_cores(wave, w, &kept),
+                &mut batch,
+                &mut emit,
+            )?;
+            if delta > 0 {
+                tracing::info!(delta, "checkpoint restore: unpacked edge delta");
             }
             if !batch.is_empty() {
                 emit(RestoreBatch::Edges(batch))?;
@@ -835,6 +1157,8 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
     let mut tx = out.transaction()?;
     let mut in_tx = 0usize;
     let mut done = 0u64;
+    let mut packer = EdgePacker::new();
+    let mut pack_seq: u64 = 0;
     while let Some(row) = rows.next()? {
         done += 1;
         if done % 250_000 == 0 {
@@ -843,6 +1167,29 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
         let kind: String = row.get(0)?;
         let id: String = row.get(1)?;
         let payload: String = row.get(2)?;
+
+        // Edges leave `objects` altogether. They are 90% of the rows and the
+        // whole of restore's per-row cost, and nothing reads an edge by id —
+        // `restore` only ever streams them — so they go into `edge_packs` 64
+        // to a row. See `EDGES_PER_PACK` for the measurements behind that.
+        if kind == "edge" {
+            report.edges += 1;
+            if let Some(pack) = packer.push(payload) {
+                tx.execute(
+                    "INSERT INTO edge_packs(seq,payload) VALUES(?1,?2)",
+                    params![pack_seq, pack],
+                )?;
+                pack_seq += 1;
+                in_tx += 1;
+                if in_tx == 10_000 {
+                    tx.commit()?;
+                    tx = out.transaction()?;
+                    in_tx = 0;
+                }
+            }
+            continue;
+        }
+
         let field = match kind.as_str() {
             "fragment" => {
                 report.fragments += 1;
@@ -856,10 +1203,7 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
                 report.basins += 1;
                 Some("center")
             }
-            _ => {
-                report.edges += usize::from(kind == "edge");
-                None
-            }
+            _ => None,
         };
         match field {
             Some(field) => {
@@ -886,6 +1230,12 @@ pub fn compact(from: &Path, into: &Path) -> Result<CompactReport> {
             tx = out.transaction()?;
             in_tx = 0;
         }
+    }
+    if let Some(pack) = packer.take() {
+        tx.execute(
+            "INSERT INTO edge_packs(seq,payload) VALUES(?1,?2)",
+            params![pack_seq, pack],
+        )?;
     }
     tx.commit()?;
     out.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -960,6 +1310,43 @@ mod tests {
             basins: vec![basin("basin-1", vec![0.5, 0.5], &["a", "b"])],
             nodes: vec![node("a", vec![1.0, 0.5]), node("b", vec![0.25, 2.0])],
             edges: vec![edge("e1", "a", "b")],
+            norms: HashMap::new(),
+        }
+    }
+
+    /// A snapshot with `nodes` nodes and `nodes * fan` edges among them, so a
+    /// compaction has more than one pack's worth of edges to move. No edge is a
+    /// self-loop: `i` and `i * 7 + 1` mod `nodes` are never equal, since
+    /// `6i = -1 (mod nodes)` has no solution.
+    ///
+    /// Every node also gets a fragment of the same id and membership in one
+    /// basin — `restore` derives its `kept` set from fragments that are both
+    /// node-backed and basin-attached, so a bare node/edge graph restores as
+    /// nothing.
+    fn wide_snapshot(nodes: usize, fan: usize) -> CanonicalSnapshot {
+        let (nodes_vec, fragments): (Vec<_>, Vec<_>) = (0..nodes)
+            .map(|i| {
+                let id = format!("n{i}");
+                let content = vec![i as f32, 1.0];
+                (node(&id, content.clone()), fragment(&id, content))
+            })
+            .unzip();
+        let members: Vec<String> = (0..nodes).map(|i| format!("n{i}")).collect();
+        let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
+        let edges = (0..nodes * fan)
+            .map(|i| {
+                edge(
+                    &format!("e{i}"),
+                    &format!("n{}", i % nodes),
+                    &format!("n{}", (i * 7 + 1) % nodes),
+                )
+            })
+            .collect();
+        CanonicalSnapshot {
+            fragments,
+            basins: vec![basin("basin-all", vec![0.0, 0.0], &member_refs)],
+            nodes: nodes_vec,
+            edges,
             norms: HashMap::new(),
         }
     }
@@ -1209,6 +1596,150 @@ mod tests {
     }
 
     #[test]
+    fn edge_packer_emits_json_arrays_of_at_most_one_pack() {
+        let mut packer = EdgePacker::new();
+        let mut packs = Vec::new();
+        // One short of a full pack: nothing is emitted yet.
+        for i in 0..EDGES_PER_PACK - 1 {
+            assert!(packer.push(format!("{{\"i\":{i}}}")).is_none());
+        }
+        // The pack-full edge flushes, and the next edge starts a fresh pack.
+        let full = packer
+            .push(format!("{{\"i\":{}}}", EDGES_PER_PACK - 1))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&full)
+                .unwrap()
+                .len(),
+            EDGES_PER_PACK
+        );
+        assert!(packer.push("{\"i\":\"tail\"}".to_string()).is_none());
+        packs.push(packer.take().unwrap());
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&packs[0])
+                .unwrap()
+                .len(),
+            1,
+            "a partial pack holds only what was pushed into it"
+        );
+        assert!(packer.take().is_none(), "an emptied packer yields nothing");
+    }
+
+    #[test]
+    fn edge_packer_flushes_early_when_a_pack_would_outgrow_the_page() {
+        // Individual edges are not size bounded, so one oversized payload must
+        // not be left to accumulate siblings past the inline page limit.
+        let mut packer = EdgePacker::new();
+        let big = "x".repeat(EDGE_PACK_MAX_BYTES);
+        assert!(packer.push(big).is_some(), "crossing the byte cap flushes");
+    }
+
+    #[test]
+    fn compact_moves_edges_into_packs_and_restore_reassembles_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.sqlite");
+        let into = dir.path().join("into.sqlite");
+        // 200 nodes * 5 = 1000 edges, i.e. 16 packs at 64 edges per pack.
+        let snapshot = wide_snapshot(200, 5);
+        let expected: HashSet<String> = snapshot.edges.iter().map(|e| e.id.clone()).collect();
+        let store = CheckpointStore::open(&from, "space").unwrap();
+        store.save("all", snapshot, &HashMap::new()).unwrap();
+        drop(store);
+
+        compact(&from, &into).unwrap();
+
+        let db = Connection::open(&into).unwrap();
+        let unpacked: i64 = db
+            .query_row("SELECT count(*) FROM objects WHERE kind='edge'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let packs: i64 = db
+            .query_row("SELECT count(*) FROM edge_packs", [], |r| r.get(0))
+            .unwrap();
+        let first: String = db
+            .query_row(
+                "SELECT payload FROM edge_packs ORDER BY seq LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+
+        assert_eq!(unpacked, 0, "every edge moved out of `objects` into a pack");
+        assert_eq!(packs, (expected.len()).div_ceil(EDGES_PER_PACK) as i64);
+        assert!(
+            first.starts_with('[') && first.ends_with(']'),
+            "a pack is a JSON array of edges"
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<ConnectionEdge>>(&first)
+                .unwrap()
+                .len(),
+            EDGES_PER_PACK
+        );
+
+        let allowed: Vec<String> = (0..200).map(|i| format!("n{i}")).collect();
+        let refs: Vec<&str> = allowed.iter().map(|s| s.as_str()).collect();
+        let restored = CheckpointStore::open(&into, "space").unwrap();
+        let (out, summary) = collect(&restored, &refs);
+
+        assert_eq!(
+            out.edges.len(),
+            expected.len(),
+            "no edge lost across the pack"
+        );
+        assert_eq!(summary.fragments, 200, "the node-backed fragments restore");
+        let got: HashSet<String> = out.edges.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn worker_count_does_not_change_what_restores() {
+        // Every wave source — fragments, basins, packed edges — must produce
+        // the same state whether the parse ran serially or fanned out. The
+        // filters (four id lookups for fragments, `kept` for edges) run on
+        // different sides of the fan-out, so this is the test that catches a
+        // filter that started depending on worker count.
+        let _guard = edge_parse_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.sqlite");
+        let store = CheckpointStore::open(&from, "space").unwrap();
+        store
+            .save("all", wide_snapshot(200, 5), &HashMap::new())
+            .unwrap();
+        drop(store);
+
+        let allowed: Vec<String> = (0..200).map(|i| format!("n{i}")).collect();
+        let refs: Vec<&str> = allowed.iter().map(|s| s.as_str()).collect();
+
+        let mut runs = Vec::new();
+        for workers in ["1", "8"] {
+            std::env::set_var(PARSE_WORKERS_ENV, workers);
+            assert_eq!(parse_workers(), workers.parse::<usize>().unwrap());
+            let store = CheckpointStore::open(&from, "space").unwrap();
+            let (out, summary) = collect(&store, &refs);
+            let mut fragment_ids: Vec<String> =
+                out.fragments.iter().map(|f| f.id.clone()).collect();
+            fragment_ids.sort();
+            runs.push((
+                summary.fragments,
+                fragment_ids,
+                out.basins.len(),
+                out.nodes.len(),
+                out.edges.len(),
+            ));
+        }
+        std::env::remove_var(PARSE_WORKERS_ENV);
+
+        assert_eq!(runs[0], runs[1], "worker count must not change the result");
+        assert_eq!(
+            runs[0].0, 200,
+            "the fixture's fragments must actually reach the restore"
+        );
+    }
+
+    #[test]
     fn restore_filters_unlisted_deleted_and_orphaned_rows() {
         let dir = tempfile::tempdir().unwrap();
         let store = CheckpointStore::open(&dir.path().join("c.sqlite"), "space").unwrap();
@@ -1226,5 +1757,220 @@ mod tests {
             restored.basins[0].associated_fragments,
             HashSet::from(["a".to_string()])
         );
+    }
+
+    /// Measures the edge pass of [`CheckpointStore::restore`] **without** the
+    /// consumer — single-threaded against fanned-out — to size the fix.
+    ///
+    /// The boot's reader plateaus at ~162 k rows/s and the edge stage costs 48 s
+    /// of an 80 s boot, on an 11-core box near load 5. That is one of two very
+    /// different problems: the reader *is* the limit (SQLite blob -> `String`
+    /// -> `serde_json`, and fanning out the parse helps), or the reader is only
+    /// matching a slower `restore_graph` (and fanning out does nothing). The
+    /// first run of this probe settled it for the reader: with a warm page
+    /// cache it ran 2.2x *slower* than cold, which no I/O-bound loop does.
+    ///
+    /// This drives the real [`parse_edges_across_cores`] rather than a copy, so
+    /// the parallel figure is a direct prediction of the new boot. Rounds
+    /// alternate single/parallel so drift in machine load hits both arms
+    /// equally — absolute pass numbers are not comparable across a minutes-long
+    /// run on a shared box.
+    ///
+    /// ```text
+    /// CONTEXTNEST_PROBE_CHECKPOINT=<file> cargo test --lib --release \
+    ///   probe_edge_reader_without_apply -- --ignored --nocapture
+    /// ```
+    ///
+    /// Read-only, and `#[ignore]`d so no CI run ever needs a multi-GB file.
+    #[test]
+    #[ignore = "needs CONTEXTNEST_PROBE_CHECKPOINT pointed at a real checkpoint"]
+    fn probe_edge_reader_without_apply() {
+        let Ok(path) = std::env::var("CONTEXTNEST_PROBE_CHECKPOINT") else {
+            eprintln!("set CONTEXTNEST_PROBE_CHECKPOINT to a checkpoint path");
+            return;
+        };
+        let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open checkpoint read-only");
+
+        // The real filter set, so the fan-out pays the same hash lookups the
+        // boot pays.
+        let kept: HashSet<String> = db
+            .prepare("SELECT id FROM objects WHERE kind='node'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let workers = parse_workers();
+        println!("kept={} parse_workers()={workers}", kept.len());
+
+        for round in 1..=2 {
+            for mode in [
+                EdgeMode::BorrowOnly,
+                EdgeMode::CopyOnly,
+                EdgeMode::ParseSingle,
+                EdgeMode::ParseParallel(workers),
+            ] {
+                let (seen, secs) = drain_edges(&db, &kept, mode);
+                println!(
+                    "round {round} [{:<16}]: seen={seen} in {secs:.1}s => {:.0} rows/s",
+                    mode.label(),
+                    seen as f64 / secs
+                );
+            }
+        }
+    }
+
+    /// How much of the edge loop one probe arm performs.
+    #[derive(Clone, Copy)]
+    enum EdgeMode {
+        /// Step the row and read the blob through SQLite's own buffer:
+        /// no allocation, no copy, no parse. Isolates the scan itself.
+        BorrowOnly,
+        /// Copy every blob into an owned `String`. Adds what `restore` pays
+        /// before it parses anything.
+        CopyOnly,
+        /// Copy and parse on one thread — `restore` as it was.
+        ParseSingle,
+        /// Copy on one thread, parse on `n`.
+        ParseParallel(usize),
+    }
+
+    impl EdgeMode {
+        fn label(self) -> &'static str {
+            match self {
+                EdgeMode::BorrowOnly => "borrow only",
+                EdgeMode::CopyOnly => "copy only",
+                EdgeMode::ParseSingle => "parse single",
+                EdgeMode::ParseParallel(_) => "parse parallel",
+            }
+        }
+    }
+
+    /// One pass over every edge row in the given mode, returning
+    /// `(rows seen, seconds)`. Wave size and filter match
+    /// [`CheckpointStore::restore`].
+    fn drain_edges(db: &Connection, kept: &HashSet<String>, mode: EdgeMode) -> (usize, f64) {
+        let workers = match mode {
+            EdgeMode::ParseParallel(w) => w,
+            _ => 1,
+        };
+        let started = std::time::Instant::now();
+        let mut seen = 0usize;
+        let mut sink = 0usize;
+        let mut wave: Vec<String> = Vec::with_capacity(PARSE_WAVE);
+        {
+            let mut statement = db
+                .prepare("SELECT payload FROM objects WHERE kind='edge'")
+                .unwrap();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                seen += 1;
+                if matches!(mode, EdgeMode::BorrowOnly) {
+                    if let rusqlite::types::ValueRef::Text(bytes) = row.get_ref(0).unwrap() {
+                        sink += bytes.len();
+                    }
+                    continue;
+                }
+                wave.push(row.get::<_, String>(0).unwrap());
+                if wave.len() == PARSE_WAVE {
+                    sink = sink.wrapping_add(flush_wave(
+                        std::mem::take(&mut wave),
+                        workers,
+                        kept,
+                        mode,
+                    ));
+                    wave.reserve(PARSE_WAVE);
+                }
+            }
+        }
+        sink = sink.wrapping_add(flush_wave(wave, workers, kept, mode));
+        std::hint::black_box(sink);
+        (seen, started.elapsed().as_secs_f64())
+    }
+
+    fn flush_wave(
+        wave: Vec<String>,
+        workers: usize,
+        kept: &HashSet<String>,
+        mode: EdgeMode,
+    ) -> usize {
+        match mode {
+            EdgeMode::BorrowOnly => 0,
+            EdgeMode::CopyOnly => wave.len(),
+            _ => parse_edges_across_cores(wave, workers, kept).unwrap().len(),
+        }
+    }
+
+    /// The fan-out must be invisible in the output: same edges, same order.
+    ///
+    /// Restore's stream is documented as ordered, so a future reader should not
+    /// have to discover that the parse reordered underneath it.
+    #[test]
+    fn parallel_edge_parse_matches_the_single_threaded_order() {
+        let kept: HashSet<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        // Every 7th edge touches a node outside `kept`, so the filter runs on
+        // both paths, and 5 000 rows split into several slices at every worker
+        // count below.
+        let raw: Vec<String> = (0..5000)
+            .map(|i| {
+                let source = if i % 7 == 0 { "dropped" } else { "a" };
+                serde_json::to_string(&edge(&format!("e{i}"), source, "b")).unwrap()
+            })
+            .collect();
+
+        let single = parse_edges_across_cores(raw.clone(), 1, &kept).unwrap();
+        assert_eq!(single.len(), 5000 - 5000usize.div_ceil(7));
+        assert!(single.iter().all(|e| e.source == "a" && e.target == "b"));
+
+        let expected: Vec<&str> = single.iter().map(|e| e.id.as_str()).collect();
+        for workers in [2usize, 3, 8, 64] {
+            let wide = parse_edges_across_cores(raw.clone(), workers, &kept).unwrap();
+            let got: Vec<&str> = wide.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                got, expected,
+                "fan-out over {workers} workers reordered the edges"
+            );
+        }
+    }
+
+    /// An empty or single-row wave must take the direct path, not spawn.
+    #[test]
+    fn parallel_edge_parse_handles_degenerate_waves() {
+        let kept: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert!(parse_edges_across_cores(Vec::new(), 8, &kept)
+            .unwrap()
+            .is_empty());
+        let one = vec![serde_json::to_string(&edge("e0", "a", "b")).unwrap()];
+        assert_eq!(parse_edges_across_cores(one, 8, &kept).unwrap().len(), 1);
+    }
+
+    /// Serialises the test that reads or writes [`PARSE_WORKERS_ENV`].
+    fn edge_parse_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn edge_parse_workers_respects_the_env_override_and_the_ceiling() {
+        let _guard = edge_parse_env_lock();
+        std::env::remove_var(PARSE_WORKERS_ENV);
+        assert!((1..=PARSE_MAX_WORKERS).contains(&parse_workers()));
+
+        std::env::set_var(PARSE_WORKERS_ENV, "1");
+        assert_eq!(
+            parse_workers(),
+            1,
+            "1 must restore single-threaded behaviour"
+        );
+
+        std::env::set_var(PARSE_WORKERS_ENV, "999");
+        assert_eq!(parse_workers(), PARSE_MAX_WORKERS, "the ceiling must hold");
+
+        std::env::set_var(PARSE_WORKERS_ENV, "not-a-number");
+        assert!((1..=PARSE_MAX_WORKERS).contains(&parse_workers()));
+
+        std::env::remove_var(PARSE_WORKERS_ENV);
     }
 }
