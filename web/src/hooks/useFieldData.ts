@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import { api } from '@/lib/api';
-import { pca2d } from '@/lib/pca';
+import { pca2d, projectVector } from '@/lib/pca';
 import { useSessions } from './useSessions';
 import { useStats } from './useStats';
 import type { BasinSummary, ConnectionRow, FragmentRow, SessionListItem } from '@/lib/types';
@@ -30,6 +30,11 @@ export type FieldFragment = FragmentRow & {
 export type FieldData = {
   fragments: FieldFragment[];
   basins: BasinSummary[];
+  /** Basins that passed the server's scope + mass filter, before the
+   *  `limit` cap. `basins.length < basinsTotal` means the canvas is
+   *  showing a ranked subset. */
+  basinsTotal: number;
+  basinsTruncated: boolean;
   connections: ConnectionRow[];
   kinds: string[];
   /** PCA result: { x, y } per fragment (same order as `fragments`) and
@@ -37,6 +42,11 @@ export type FieldData = {
   layout: {
     xy: Array<{ x: number; y: number }>;
     varianceRatio: number;
+    /** { x, y } per basin **id**, in the same raw PCA plane as `xy`, so
+     *  whichever affine transform the canvas applies to fragments
+     *  applies to basins too. Absent for a basin whose centroid is
+     *  missing or in a different embedding dimension. */
+    basinXY: Record<string, { x: number; y: number }>;
   };
 };
 
@@ -66,6 +76,12 @@ function ageDaysFrom(ts: string | null | undefined): number | null {
 // embedding cache makes subsequent refreshes near-instant.
 const FIELD_FRAGMENT_LIMIT = 250;
 
+// How many basins the canvas draws. The server ranks by scope-filtered
+// mass, so this is "the N biggest clusters in scope". Halos scale with
+// mass, so ~40 is about the most that stays readable before they merge
+// into one wash.
+const BASIN_LIMIT = 40;
+
 export type UseFieldOptions = {
   /** Gate expensive field calls until the user has chosen a scope. */
   enabled?: boolean;
@@ -75,6 +91,15 @@ export type UseFieldOptions = {
    *  Matched against the basename of `metadata.project_cwd` server-side. */
   project?: string;
 };
+
+/**
+ * The mass floor this hook applies for a given scope. Exported so the
+ * canvas legend can print the same number the request actually used
+ * instead of hard-coding a second copy of the rule.
+ */
+export function basinMinMassFor(sessionId: string | undefined): number {
+  return sessionId ? 1 : 3;
+}
 
 export function useFieldData(opts: UseFieldOptions = {}) {
   const sessions = useSessions();
@@ -94,14 +119,28 @@ export function useFieldData(opts: UseFieldOptions = {}) {
       }),
   });
 
+  // Mass floor for a *real* attractor basin. Basins are per semantic
+  // cluster, and the distribution is brutally skewed (median mass 1 on
+  // a populated substrate), so without a floor the canvas is mostly
+  // one-fragment "clusters".
+  //
+  // A project scope is wide enough that a `mass >= 3` floor separates
+  // clusters from singletons; a single session usually isn't, and
+  // there the useful question is the inverse — "which global clusters
+  // does this session feed?" — so the floor drops to 1 and the ranking
+  // does the work.
+  const basinMinMass = basinMinMassFor(opts.sessionId);
+
   const basinsQuery = useQuery({
-    queryKey: ['field/basins', opts.project ?? null, opts.sessionId ?? null],
+    queryKey: ['field/basins', opts.project ?? null, opts.sessionId ?? null, basinMinMass],
     enabled: opts.enabled ?? true,
     refetchInterval: 30_000,
     queryFn: () =>
       api.basins({
         project: opts.project,
         session_id: opts.sessionId,
+        min_mass: basinMinMass,
+        limit: BASIN_LIMIT,
       }),
   });
 
@@ -143,10 +182,12 @@ export function useFieldData(opts: UseFieldOptions = {}) {
   // placeholder so the projection still works (those fragments collapse
   // to the origin, which is honest).
   const layout = useMemo(() => {
+    const basins = basinsQuery.data?.basins ?? [];
     if (fragments.length < 2) {
       return {
         xy: fragments.map(() => ({ x: 0, y: 0 })),
         varianceRatio: 0,
+        basinXY: {},
       };
     }
     const dim =
@@ -155,13 +196,29 @@ export function useFieldData(opts: UseFieldOptions = {}) {
       f.embedding && f.embedding.length === dim ? f.embedding : new Array<number>(dim).fill(0),
     );
     const result = pca2d(matrix);
-    return { xy: result.coords, varianceRatio: result.varianceRatio };
-  }, [fragments]);
+
+    // Project each basin's own centroid through the basis we just
+    // built, rather than averaging the projected positions of whichever
+    // member fragments happened to load. Two reasons: the fragment list
+    // is capped (250), so a basin whose members mostly sit outside the
+    // cap would drift toward the origin; and a centroid is where the
+    // substrate actually says the cluster is.
+    const basinXY: Record<string, { x: number; y: number }> = {};
+    for (const b of basins) {
+      if (!b.centroid || b.centroid.length === 0) continue;
+      const p = projectVector(b.centroid, result.mean, result.pc1, result.pc2);
+      if (p) basinXY[b.id] = p;
+    }
+
+    return { xy: result.coords, varianceRatio: result.varianceRatio, basinXY };
+  }, [fragments, basinsQuery.data]);
 
   const data: FieldData = useMemo(
     () => ({
       fragments,
       basins: basinsQuery.data?.basins ?? [],
+      basinsTotal: basinsQuery.data?.total_candidates ?? 0,
+      basinsTruncated: basinsQuery.data?.truncated ?? false,
       connections: connectionsQuery.data?.connections ?? [],
       kinds: Array.from(
         new Set(
