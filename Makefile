@@ -140,6 +140,16 @@ CN_PROD_ARENA    ?= $(CN_PROD_DATA)/arena
 CN_PROD_CHECKPOINT ?= $(CN_PROD_DATA)/wal.canonical.sqlite
 CN_PROD_PORT     ?= $(lastword $(subst :, ,$(CN_PROD_BIND)))
 CN_PROD_CONFIG   ?= ./config.toml
+# Boot-time free-space floor, in MiB, handed to the substrate as
+# CONTEXTNEST_MIN_FREE_MB. The recipe below fails early with a message that
+# names the volume; the env var is what makes the same policy hold when the
+# launchd agent starts the binary directly, without a make in the path.
+# 0 disables. See src/services/volume_watchdog.rs.
+CN_PROD_MIN_FREE_MB ?= 5120
+# Volume name under /Volumes, derived from CN_PROD_DATA, used by the mount-point
+# check below. `$(word 2,...)` of a leading-slash path is the volume name:
+# /Volumes/docker-ssd/x → Volumes docker-ssd x → word 2 = docker-ssd.
+CN_PROD_VOLUME   ?= $(word 2,$(subst /, ,$(CN_PROD_DATA)))
 # Seconds to wait for /api/v1/substrate/health after starting prod. The listener
 # binds only after the canonical checkpoint restore finishes, and that phase is
 # I/O-bound on the data volume. Measured boots on ~330-380 k fragments:
@@ -162,12 +172,40 @@ CN_PROD_HEALTH_TIMEOUT ?= 3600
 # 3 s). A 3 s budget therefore reported a healthy server as down — keep this well
 # above the observed worst case.
 CN_PROD_HEALTH_PROBE_TIMEOUT ?= 15
+
+# ── launchd supervision ─────────────────────────────────────────────────
+# On 2026-10-14 the substrate survived a data-volume detach without dying: it
+# kept accepting TCP and never answered, burning 36 h of CPU, and the reboot
+# that cleared it was caused by this process. The volume watchdog (exit 75)
+# makes it die instead; this agent is what makes it come back.
+#
+# The agent runs the binary directly, not `make cn-prod`, so it has no build
+# step and no health wait — it is a supervisor for an already-built binary, and
+# `make cn-prod-stop` boots it out so the two never fight over the port.
+CN_AGENT_LABEL    ?= ai.sourceshift.contextnest
+CN_AGENT_PLIST    ?= $(HOME)/Library/LaunchAgents/$(CN_AGENT_LABEL).plist
+CN_AGENT_TEMPLATE ?= deploy/$(CN_AGENT_LABEL).plist.in
+# Where the agent's stdout/stderr land. On the BOOT volume on purpose: when the
+# data volume is what died, a log written beside it is unreadable exactly when
+# it is needed.
+CN_AGENT_LOG      ?= /tmp/contextnest-agent.log
+# Sourced (mode 600, operator-owned) before the binary starts — this is where
+# DEEPINFRA_API_KEY / OPENAI_API_KEY must live for the agent to embed. launchd
+# jobs inherit no interactive-shell environment, so a key exported in ~/.zshrc
+# will NOT reach the agent.
+CN_AGENT_ENV_FILE ?= $(HOME)/.contextnest/tenant-auth/server.env
+# Absolutised at render time: a launchd job starts with cwd `/`.
+CN_AGENT_BIN     ?= $(abspath $(CN_BIN))
+CN_AGENT_WORKDIR ?= $(abspath .)
+CN_AGENT_CONFIG  ?= $(abspath $(CN_PROD_CONFIG))
+
 SINCE         ?= 7d
 PROJECT       ?=
 
 .PHONY: cn-help cn-build cn-build-fast cn-test cn-lint cn-serve cn-serve-dev cn-run-existing \
         cn-redeploy cn-watch cn-ingest cn-wal-clear cn-curl-health cn-curl-inbox cn-config \
-        cn-preflight cn-prod cn-prod-stop cn-prod-status cn-prod-logs cn-prod-build cn-prod-preflight
+        cn-preflight cn-prod cn-prod-stop cn-prod-status cn-prod-logs cn-prod-build cn-prod-preflight \
+        cn-agent-install cn-agent-status cn-agent-uninstall
 
 cn-help:
 	@echo "ContextNest substrate targets"
@@ -181,6 +219,9 @@ cn-help:
 	@echo "  make cn-prod-stop       — stop every running contextnest (any checkout, any binary)"
 	@echo "  make cn-prod-status     — what is serving prod: pid, rss, checkpoint size, health"
 	@echo "  make cn-prod-logs       — tail the newest prod serve log"
+	@echo "  make cn-agent-install   — bootstrap the launchd supervisor (restarts on crash)"
+	@echo "  make cn-agent-status    — is the supervisor loaded, and what did it last do"
+	@echo "  make cn-agent-uninstall — unload + remove the supervisor"
 	@echo "  make cn-preflight       — print resolved WAL/checkpoint + refuse a pre-v0.2 checkpoint"
 	@echo "  make cn-serve           — run the release binary, WAL on, config.toml loaded"
 	@echo "  make cn-redeploy        — rebuild release + restart cn-serve (deploys a code change)"
@@ -289,6 +330,12 @@ cn-redeploy: ## Rebuild release + restart cn-serve (stops the running instance f
 # allocations) against the legacy checkpoint and put the host's compressor into
 # the band that panicked it on 09-30. SIGTERM, wait 10 s, then SIGKILL.
 cn-prod-stop:
+	@if launchctl print gui/$$(id -u)/$(CN_AGENT_LABEL) >/dev/null 2>&1; then \
+	  echo "booting out $(CN_AGENT_LABEL) first — with it loaded, launchd restarts"; \
+	  echo "  whatever we kill (a SIGTERM counts as an unsuccessful exit)."; \
+	  launchctl bootout gui/$$(id -u)/$(CN_AGENT_LABEL) 2>/dev/null || true; \
+	  sleep 1; \
+	fi
 	@echo "stopping every contextnest process (serve or ingest)…"
 	-@pkill -x contextnest 2>/dev/null; \
 	  for _ in 1 2 3 4 5 6 7 8 9 10; do \
@@ -355,9 +402,30 @@ cn-prod-build:
 # than the release build.
 cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substrate, build, start against CN_PROD_DATA, wait for health.
 	@if [ ! -d "$(CN_PROD_DATA)" ]; then \
-	  echo "ERROR: missing $(CN_PROD_DATA) — is docker-ssd mounted?"; exit 1; \
+	  echo "ERROR: missing $(CN_PROD_DATA) — is $(CN_PROD_VOLUME) mounted?"; exit 1; \
 	fi
+	@case "$(CN_PROD_DATA)" in \
+	  /Volumes/*) \
+	    if ! mount | grep -q " on /Volumes/$(CN_PROD_VOLUME) ("; then \
+	      echo "ERROR: /Volumes/$(CN_PROD_VOLUME) is NOT mounted, but $(CN_PROD_DATA) exists."; \
+	      echo "       That directory is a leftover on the boot volume. Starting now would"; \
+	      echo "       create a fresh, empty substrate there — and the real one would stay"; \
+	      echo "       hidden underneath it when the volume mounts. Refusing."; \
+	      echo "       Fix: mount $(CN_PROD_VOLUME), or remove the stale directory."; \
+	      exit 1; \
+	    fi ;; \
+	esac
 	@if [ ! -f "$(CN_PROD_WAL)" ]; then echo "ERROR: missing $(CN_PROD_WAL)"; exit 1; fi
+	@if [ "$(CN_PROD_MIN_FREE_MB)" -gt 0 ]; then \
+	  FREE_KB=$$(df -k "$(CN_PROD_DATA)" 2>/dev/null | awk 'NR==2 {print $$4}'); \
+	  if [ -n "$$FREE_KB" ] && [ "$$FREE_KB" -lt $$(( $(CN_PROD_MIN_FREE_MB) * 1024 )) ]; then \
+	    echo "ERROR: the data volume has $$(( FREE_KB / 1024 / 1024 )) GiB free, below the"; \
+	    echo "       $(CN_PROD_MIN_FREE_MB) MiB floor (CN_PROD_MIN_FREE_MB). A substrate that cannot"; \
+	    echo "       write is worse than one that is down: it accepts work it cannot keep."; \
+	    echo "       Free space, or lower the floor with CN_PROD_MIN_FREE_MB=<MiB> (0 disables)."; \
+	    df -h "$(CN_PROD_DATA)"; exit 1; \
+	  fi; \
+	fi
 	@if [ ! -x "$(CN_BIN)" ]; then echo "ERROR: missing $(CN_BIN) — run make cn-build"; exit 1; fi
 	@if [ ! -f "$(CN_PROD_CONFIG)" ]; then \
 	  echo "ERROR: no config at $(CN_PROD_CONFIG)."; \
@@ -379,6 +447,7 @@ cn-prod: cn-prod-preflight cn-prod-build cn-prod-stop ## Kill any running substr
 	  CONTEXTNEST_CONFIG=$(CN_PROD_CONFIG) \
 	  CONTEXTNEST_WAL_PATH=$(CN_PROD_WAL) \
 	  CONTEXTNEST_VECTOR_ARENA_DIR=$(CN_PROD_ARENA) \
+	  CONTEXTNEST_MIN_FREE_MB=$(CN_PROD_MIN_FREE_MB) \
 	  CONTEXTNEST_CONSOLIDATION_CONCURRENCY=2 \
 	  CONTEXTNEST_CPU_WORKERS=2 \
 	  TOKIO_WORKER_THREADS=4 \
@@ -424,6 +493,59 @@ cn-prod-status: ## Show what is serving prod: pid, footprint, health.
 
 cn-prod-logs: ## Follow the newest prod serve log.
 	@tail -f "$$(ls -t $(CN_PROD_DATA)/serve-*.log | head -1)"
+
+# ── launchd supervisor: install / inspect / remove ───────────────────────
+# Render the template into ~/Library/LaunchAgents and bootstrap it. Every path
+# is absolutised at install time: a launchd job starts with cwd `/` and its own
+# empty environment, so `./target/release/contextnest` and `./config.toml` would
+# both miss. Re-run this after moving the checkout or the data directory — the
+# rendered plist is a snapshot, not a reference.
+cn-agent-install: ## Render + bootstrap the launchd supervisor (auto-restart on crash).
+	@if [ ! -f "$(CN_AGENT_TEMPLATE)" ]; then echo "ERROR: missing $(CN_AGENT_TEMPLATE)"; exit 1; fi
+	@if [ ! -x "$(CN_AGENT_BIN)" ]; then \
+	  echo "ERROR: missing $(CN_AGENT_BIN) — run make cn-build first"; exit 1; \
+	fi
+	@if [ ! -d "$(CN_PROD_DATA)" ]; then echo "ERROR: missing $(CN_PROD_DATA)"; exit 1; fi
+	@mkdir -p "$$(dirname "$(CN_AGENT_PLIST)")"
+	@sed -e 's|@@LABEL@@|$(CN_AGENT_LABEL)|g' \
+	     -e 's|@@BIN@@|$(CN_AGENT_BIN)|g' \
+	     -e 's|@@WORKDIR@@|$(CN_AGENT_WORKDIR)|g' \
+	     -e 's|@@CONFIG@@|$(CN_AGENT_CONFIG)|g' \
+	     -e 's|@@WAL@@|$(CN_PROD_WAL)|g' \
+	     -e 's|@@ARENA@@|$(CN_PROD_ARENA)|g' \
+	     -e 's|@@BIND@@|$(CN_PROD_BIND)|g' \
+	     -e 's|@@MIN_FREE_MB@@|$(CN_PROD_MIN_FREE_MB)|g' \
+	     -e 's|@@ENVFILE@@|$(CN_AGENT_ENV_FILE)|g' \
+	     -e 's|@@LOG@@|$(CN_AGENT_LOG)|g' \
+	     $(CN_AGENT_TEMPLATE) > $(CN_AGENT_PLIST)
+	@plutil -lint $(CN_AGENT_PLIST)
+	@launchctl bootout gui/$$(id -u)/$(CN_AGENT_LABEL) 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) $(CN_AGENT_PLIST)
+	@echo "✓ $(CN_AGENT_LABEL) bootstrapped — starts now and at every login, and restarts"
+	@echo "  the substrate whenever it exits non-zero (volume watchdog 75, disk floor 74,"
+	@echo "  panic). Throttled to one attempt per 15 s."
+	@echo "  log: $(CN_AGENT_LOG)"
+	@echo "  NOTE: 'make cn-prod' and 'make cn-compact' boot it out — they own the process"
+	@echo "        while they run. Re-run this target to hand supervision back."
+
+cn-agent-status: ## Is the launchd supervisor loaded, and what did it last do?
+	@if ! launchctl print gui/$$(id -u)/$(CN_AGENT_LABEL) >/dev/null 2>&1; then \
+	  echo "$(CN_AGENT_LABEL): NOT loaded"; \
+	else \
+	  launchctl print gui/$$(id -u)/$(CN_AGENT_LABEL) \
+	    | grep -E "^[[:space:]]*(state|pid|last exit code|runs|program) " ; \
+	fi
+	@pgrep -x contextnest >/dev/null 2>&1 \
+	  && echo "substrate: running (pid $$(pgrep -x contextnest | tr '\n' ' '))" \
+	  || echo "substrate: not running"
+	@echo "--- last 5 lines of $(CN_AGENT_LOG) ---"
+	@tail -5 $(CN_AGENT_LOG) 2>/dev/null || echo "(no agent log yet)"
+
+cn-agent-uninstall: ## Unload and delete the launchd supervisor (permanent).
+	@launchctl bootout gui/$$(id -u)/$(CN_AGENT_LABEL) 2>/dev/null || true
+	@rm -f $(CN_AGENT_PLIST)
+	@echo "✓ $(CN_AGENT_LABEL) unloaded and removed — it will not come back at login."
+	@echo "  The running substrate, if any, was left alone."
 
 cn-ingest: $(CN_BIN)
 	$(CN_BIN) ingest claude-code \

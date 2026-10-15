@@ -1202,6 +1202,28 @@ async fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::
         None => tracing::info!("Memory guard disabled"),
     }
 
+    // Arm the data-volume watchdog before any boot work. Restore is the
+    // longest phase by far (tens of minutes on the operator's checkpoint), and
+    // it is exactly where a USB detach strands the process: the fds are
+    // revoked, the work never completes, and the listener that comes up after
+    // it would accept connections it can never answer. Arming here means the
+    // detach is caught during the boot rather than 36 hours later.
+    //
+    // The data directory is the WAL's parent: the checkpoint, the input WAL and
+    // `coord.db` are all siblings of it, so one `st_dev` covers the whole
+    // substrate. A boot with no WAL configured has nothing to guard.
+    if let Some(data_dir) = wal_path_from_env().and_then(|w| w.parent().map(|p| p.to_path_buf())) {
+        contextnest::services::volume_watchdog::spawn_watchdog(&data_dir);
+        // Same volume, other failure mode: too full to write. Checked here so
+        // it is enforced on every entry point — `make cn-prod` and the launchd
+        // agent both land in this function — rather than only under make.
+        let checkpoint = wal_path_from_env().map(|w| w.with_extension("canonical.sqlite"));
+        contextnest::services::volume_watchdog::enforce_free_space(
+            &data_dir,
+            checkpoint.as_deref(),
+        );
+    }
+
     let config = load_configuration().await?;
     tracing::info!("Configuration loaded successfully");
 
