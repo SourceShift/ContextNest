@@ -519,6 +519,15 @@ cn-agent-install: ## Render + bootstrap the launchd supervisor (auto-restart on 
 	     -e 's|@@LOG@@|$(CN_AGENT_LOG)|g' \
 	     $(CN_AGENT_TEMPLATE) > $(CN_AGENT_PLIST)
 	@plutil -lint $(CN_AGENT_PLIST)
+	@if ! grep -qE '^[[:space:]]*(export[[:space:]]+)?(DEEPINFRA_API_KEY|OPENAI_API_KEY)=' \
+	    "$(CN_AGENT_ENV_FILE)" 2>/dev/null; then \
+	  echo "WARNING: no DEEPINFRA_API_KEY or OPENAI_API_KEY in $(CN_AGENT_ENV_FILE)"; \
+	  echo "         A launchd job inherits NO interactive-shell environment, so a key"; \
+	  echo "         exported in ~/.zshrc does not reach it. Without one the substrate"; \
+	  echo "         serves retrieval but every embed fails — no ingest, no consolidation,"; \
+	  echo "         and it fails quietly. Add to that file (mode 600):"; \
+	  echo "           export DEEPINFRA_API_KEY=..."; \
+	fi
 	@launchctl bootout gui/$$(id -u)/$(CN_AGENT_LABEL) 2>/dev/null || true
 	@launchctl bootstrap gui/$$(id -u) $(CN_AGENT_PLIST)
 	@echo "✓ $(CN_AGENT_LABEL) bootstrapped — starts now and at every login, and restarts"
