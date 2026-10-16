@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { Icon, KindBadge, ProjBadge, SessionPill } from '@/components/atoms';
 import { api, ApiError } from '@/lib/api';
-import type { RetrieveHit } from '@/lib/types';
+import type { BasinsResponse, RetrieveHit } from '@/lib/types';
 
 /**
  * Fragment inspector (Tickets #3 + #4 from the coverage epic).
@@ -59,8 +59,12 @@ export function FragmentInspectorModal({
     queryKey: ['basins-for-fragment', hit?.session_id ?? null],
     queryFn: () =>
       hit?.session_id
-        ? api.basins({ session_id: hit.session_id })
-        : Promise.resolve({ basins: [] }),
+        ? api.basins({ session_id: hit.session_id, min_mass: 1 })
+        : Promise.resolve<BasinsResponse>({
+            basins: [],
+            total_candidates: 0,
+            truncated: false,
+          }),
     enabled: !!hit?.session_id,
     staleTime: 60_000,
   });

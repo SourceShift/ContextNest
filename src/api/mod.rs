@@ -14,6 +14,7 @@ pub mod agent_outcome;
 pub mod cc_hooks;
 pub mod coord;
 pub mod coord_footprints;
+pub mod coord_overlaps;
 pub mod coord_principals;
 pub mod coord_topics;
 pub mod coord_turn;
