@@ -71,7 +71,9 @@ HTTP POST /api/v1/tools/<name>
 `MemoryAttractorManager::process_memories` is the primary entry point.  Each `store`
 call triggers basin formation, connection-network indexing, and reconstruction-store
 population.  `retrieve`, `reconstruct`, and `resonate` resolve session-affine IDs via
-`SessionIndex` then hydrate canonical fragments via `get_fragment`.
+`SessionIndex`; `retrieve` then scores them **in place** via `score_candidates` (one
+store read lock, no fragment clone), while `reconstruct`/`resonate` hydrate canonical
+fragments via `get_fragment`.
 
 `LlmService` (Phase J, `src/services/llm.rs`) backs the `summarize` tool.  It wraps an
 `LlmProvider` enum selected entirely by env vars — no code change is needed to switch

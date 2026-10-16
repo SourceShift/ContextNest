@@ -239,6 +239,24 @@ impl SessionIndex {
         }
         map
     }
+
+    /// Every active fragment id, under a single read lock.
+    ///
+    /// The id-only counterpart to [`Self::active_fragments_session_map`]:
+    /// global retrieve needs the full candidate list but resolves a hit's
+    /// owning session only for the handful of fragments it actually returns,
+    /// so building the (fragment → session) mapping up front is work that gets
+    /// discarded — ~70 MB of cloned keys *and* values per request on the live
+    /// substrate.
+    ///
+    /// Iteration order is unspecified (it follows the `active` map), matching
+    /// the map-based predecessor. Ids are not deduplicated across sessions
+    /// here; a duplicate is scored twice and collapsed by the caller's logical
+    /// dedupe, which is cheaper than a 500k-entry dedup pass on this side.
+    pub async fn active_fragment_ids(&self) -> Vec<String> {
+        let active = self.active.read().await;
+        active.values().flatten().cloned().collect()
+    }
 }
 
 impl Default for SessionIndex {

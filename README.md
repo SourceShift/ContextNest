@@ -251,7 +251,7 @@ each claim is backed by an actually-running code path:
 |---|---|
 | `GET /api/v1/substrate/consolidation` | Background worker progress — `queued`, `consolidated_count`, `lag`. If lag stays high after a restart, the worker isn't running. |
 | `GET /api/v1/substrate/health` | Aggregate snapshot — fragments, basins (count, avg_mass), connections (edges, avg_degree, nodes), decay (half_life, median_age). If `basins.count == 0` on a populated substrate, the attractor pipeline is dormant. |
-| `GET /api/v1/field/basins` | Per-basin centroids + member counts. `source: "attractor"` means real basins; `source: "project"` is the pre-consolidation fallback. |
+| `GET /api/v1/field/basins` | Per-basin centroids + member counts, ranked by scope-filtered mass and capped (`?project=`, `?session_id=`, `?min_mass=` default 1, `?limit=` default 40, ceiling 500); `total_candidates` / `truncated` report what the cap dropped. `source: "attractor"` means real basins; `source: "project"` is the pre-consolidation fallback. Redirecting to `curl` with no params is the fastest way to see the substrate's heaviest clusters — the corpus carries ~291k basins, so an unbounded list is a 300 MB response. |
 
 See [docs/architecture-honest.md](docs/architecture-honest.md) for
 the full grep-verification recipe — every tagline claim should

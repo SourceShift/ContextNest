@@ -652,6 +652,23 @@ impl AttractorBasinManager {
             .collect()
     }
 
+    /// Fragment ids of the single basin containing `fragment_id`, if any.
+    ///
+    /// The targeted counterpart to [`Self::list_snapshots`]: same search
+    /// semantics — first basin, in map iteration order, whose membership
+    /// contains the id — but it clones only the *matching* basin's ids.
+    /// `list_snapshots` builds a full snapshot of every basin, centroids
+    /// included, to answer a question about one of them; on the live substrate
+    /// (~290k basins of 1024-d centroids) that is ~1.16 GB of allocation per
+    /// retrieve, discarded except for the single match.
+    pub async fn membership_containing(&self, fragment_id: &str) -> Option<Vec<String>> {
+        let basins = self.basins.read().await;
+        basins
+            .values()
+            .find(|b| b.associated_fragments.contains(fragment_id))
+            .map(|b| b.associated_fragments.iter().cloned().collect())
+    }
+
     /// A health projection that never copies vectors or membership strings.
     pub async fn membership_statistics(&self) -> (usize, usize, usize) {
         let basins = self.basins.read().await;

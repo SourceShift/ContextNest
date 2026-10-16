@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the ContextNest operator substrate.
+
+  NOT used directly. `make cn-agent-install` renders this template to
+  ~/Library/LaunchAgents/<label>.plist with the absolute paths of the current
+  checkout, then bootstraps it. This file holds no secrets: the program is a
+  non-login shell that sources <envfile> (mode 600, operator-owned) before
+  exec'ing the binary, so the embedding and tenant credentials never enter this
+  file, the rendered plist, or the repo.
+
+  KeepAlive is `SuccessfulExit=false`: the job restarts when the substrate exits
+  *non-zero*, which is exactly what the data-volume watchdog (75) and the
+  free-space floor (74) do. A clean shutdown therefore does not restart it — but
+  launchd counts a SIGTERM as unsuccessful too, so killing the process while the
+  agent is loaded just makes launchd start it again. That is why `make
+  cn-prod-stop` boots the agent out rather than merely killing the process.
+
+  ThrottleInterval is 15 s — one full data-volume-watchdog detection window — so
+  a volume that is still remounting is not hammered by restart attempts.
+
+  StandardOutPath/StandardErrorPath point at a path on the BOOT volume, not the
+  data volume. When the data volume is the thing that died, a log written beside
+  it is unreadable exactly when it is needed; the watchdog's breadcrumb (see
+  src/services/volume_watchdog.rs) exists for the same reason.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@@LABEL@@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>set -a; if [ -r @@ENVFILE@@ ]; then . @@ENVFILE@@; fi; set +a; cd @@WORKDIR@@; exec nice -n 10 @@BIN@@ serve --bind @@BIND@@</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CONTEXTNEST_CONFIG</key>
+        <string>@@CONFIG@@</string>
+        <key>CONTEXTNEST_WAL_PATH</key>
+        <string>@@WAL@@</string>
+        <key>CONTEXTNEST_VECTOR_ARENA_DIR</key>
+        <string>@@ARENA@@</string>
+        <key>CONTEXTNEST_MIN_FREE_MB</key>
+        <string>@@MIN_FREE_MB@@</string>
+        <key>CONTEXTNEST_CONSOLIDATION_CONCURRENCY</key>
+        <string>2</string>
+        <key>CONTEXTNEST_CPU_WORKERS</key>
+        <string>2</string>
+        <key>TOKIO_WORKER_THREADS</key>
+        <string>4</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>@@WORKDIR@@</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>@@LOG@@</string>
+    <key>StandardErrorPath</key>
+    <string>@@LOG@@</string>
+</dict>
+</plist>
