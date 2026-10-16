@@ -212,6 +212,30 @@ populated them).
   and label the response `source: "project"` so the frontend can
   show "consolidation in progress…".
 
+**As shipped (2026-10), the contract differs from the sketch above:**
+
+- `member_fragment_ids` is never serialized — membership is O(members)
+  per basin, and a field that renders 40 basins would ship tens of
+  thousands of ids. The client derives membership from cosine distance
+  to the projected centroid instead.
+- `label` is a snippet of the basin's most descriptive member text
+  (falling back to the dominant kind, then to a short id slug), not the
+  kind alone. There are ~22 distinct kinds across ~291k basins, so
+  kind-as-label identified nothing.
+- The response is ranked by **scope-filtered** mass and capped by
+  `limit` (default 40, ceiling 500); `min_mass` (default 1) drops
+  near-singleton basins. `total_candidates` and `truncated` report what
+  the cap removed. Without the cap this endpoint returned 300+ MB for a
+  single populated project.
+- `min_mass` is not applied to the project-derived fallback (a
+  one-fragment project is still a project), and a `min_mass` that
+  excludes every real basin returns an empty *attractor* list rather
+  than silently swapping over to project-derived basins.
+- The client positions a basin by projecting its **own** centroid
+  through the same PCA basis as the fragments. An earlier version
+  averaged the projected positions of the basin's loaded members, which
+  drifts whenever the 250-fragment window doesn't cover the basin.
+
 **Acceptance criteria:**
 
 - [x] After Phase 1 has consolidated some fragments, the

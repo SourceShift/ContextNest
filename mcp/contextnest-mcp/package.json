@@ -1,0 +1,24 @@
+{
+  "name": "contextnest-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for the ContextNest agent-memory substrate — typed tools over the seven-tool HTTP API",
+  "bin": {
+    "contextnest-mcp": "src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "smoke": "bash smoke.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
