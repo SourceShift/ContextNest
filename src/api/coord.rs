@@ -220,6 +220,12 @@ pub struct CoordMetrics {
     /// returned `Ok(true)` — the dedup table prevents two consecutive
     /// UPSes on the same pair from double-counting.
     pub coord_topic_notices_total: u64,
+    /// Cumulative count of overlap rows that transitioned to
+    /// `escalated` (Concord P4). Bumped once per hook request when any
+    /// `upsert_overlap` call returned `just_escalated` — a repeated
+    /// unacknowledged overlap has been posted to `human:operator`'s
+    /// mailbox.
+    pub coord_overlaps_escalated_total: u64,
 }
 
 /// Outcome label for a row in the contention audit log. Serialised as the

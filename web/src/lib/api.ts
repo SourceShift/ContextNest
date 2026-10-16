@@ -144,10 +144,18 @@ export const api = {
     return request<FragmentsResponse>(`/api/v1/fragments${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
 
-  basins: (params: { project?: string; session_id?: string } = {}) => {
+  basins: (
+    params: { project?: string; session_id?: string; min_mass?: number; limit?: number } = {},
+  ) => {
     const q = new URLSearchParams();
     if (params.project) q.set('project', params.project);
     if (params.session_id) q.set('session_id', params.session_id);
+    // `min_mass` and `limit` are server-side floors/caps: the substrate
+    // forms one basin per semantic cluster, so an unbounded list is
+    // thousands of near-singleton basins plus a megabyte of centroid
+    // vectors. See `BasinsQuery` in src/api/field.rs.
+    if (params.min_mass != null) q.set('min_mass', String(params.min_mass));
+    if (params.limit != null) q.set('limit', String(params.limit));
     const qs = q.toString();
     return request<BasinsResponse>(`/api/v1/field/basins${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },

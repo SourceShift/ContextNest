@@ -215,11 +215,13 @@ async fn real_basin_mass_excludes_discarded_fragments() {
 }
 
 #[tokio::test]
-async fn real_basin_label_uses_dominant_kind_when_available() {
+async fn real_basin_label_prefers_a_member_snippet_over_the_kind() {
     let (services, server) = make_setup().await;
     let sink = ServicesSink::new(services.clone());
-    // All three fragments carry kind=learning, so the dominant kind
-    // for whichever basin they land in must be "learning".
+    // All three fragments carry kind=learning. Before, every basin in
+    // this fixture labelled identically as "learning"; now the label
+    // must come from a member's text, which is the only thing that can
+    // tell two same-kind basins apart.
     for text in [
         "kind-driven basin labelling alpha",
         "kind-driven basin labelling beta",
@@ -242,16 +244,138 @@ async fn real_basin_label_uses_dominant_kind_when_available() {
         !attractor_basins.is_empty(),
         "expected at least one real basin after consolidation"
     );
-    // Every real basin in this fixture has only learning-kind
-    // members, so the label must be "learning" (not a basin-{slug}
-    // fallback).
     for b in attractor_basins {
-        assert_eq!(
-            b["label"], "learning",
-            "dominant kind should drive label, got {} for {:?}",
-            b["label"], b
+        let label = b["label"].as_str().expect("label is a string");
+        assert!(
+            label.starts_with("kind-driven basin labelling"),
+            "label should be a member snippet, got {label:?} for {b:?}"
+        );
+        assert_ne!(
+            label, "learning",
+            "a bare kind no longer identifies a basin"
         );
     }
+}
+
+#[tokio::test]
+async fn basins_are_ranked_by_mass_and_truncated_by_limit() {
+    let (services, server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+    // Distinct topics → the worker has material to form more than one
+    // basin from.
+    for (i, text) in [
+        "postgres migration deadlock on the ledger table",
+        "flutter widget tree rebuild storm in the profile page",
+        "german tax law EStG paragraph 9 deductions",
+        "embedding dimension mismatch after the model swap",
+        "watchdog exit code 75 on volume remount",
+        "tanstack router tree regeneration for a new route",
+        "clippy baseline drift from a newer rustc lint set",
+        "vector arena memory mapping under a usb detach",
+    ]
+    .iter()
+    .enumerate()
+    {
+        sink.store(&rec(text, &format!("cn-test-rank-{i}"), "/home/u/rank"))
+            .await
+            .unwrap();
+    }
+    drain_for_test(&services, &services.consolidation_queue, 8).await;
+
+    // Unbounded read first: tells us how many candidates exist.
+    let body: Value = server.get("/api/v1/field/basins?project=rank").await.json();
+    let total = body["total_candidates"].as_u64().expect("total_candidates");
+    assert!(total >= 1, "fixture should form at least one basin");
+
+    let body: Value = server
+        .get("/api/v1/field/basins?project=rank&limit=1")
+        .await
+        .json();
+    let basins = body["basins"].as_array().unwrap();
+    assert_eq!(basins.len(), 1, "limit=1 returns exactly one basin");
+    assert_eq!(
+        body["total_candidates"].as_u64().unwrap(),
+        total,
+        "total_candidates must report the pre-truncation count"
+    );
+    assert_eq!(
+        body["truncated"].as_bool().unwrap(),
+        total > 1,
+        "truncated reflects whether limit dropped anything"
+    );
+    // Ranking is by scope-filtered mass, so the single returned basin
+    // must be the heaviest one.
+    let masses: Vec<u64> = body["basins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["mass"].as_u64().unwrap())
+        .collect();
+    assert_eq!(masses.len(), 1);
+    assert!(masses[0] >= 1);
+}
+
+#[tokio::test]
+async fn min_mass_floor_reports_empty_instead_of_swapping_to_project_basins() {
+    let (services, server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+    sink.store(&rec("floored out", "cn-test-floor", "/home/u/floor"))
+        .await
+        .unwrap();
+    drain_for_test(&services, &services.consolidation_queue, 1).await;
+
+    // One fragment → one basin of mass 1. Without a floor it comes
+    // back as a real attractor basin.
+    let body: Value = server
+        .get("/api/v1/field/basins?project=floor")
+        .await
+        .json();
+    let basins = body["basins"].as_array().unwrap();
+    assert_eq!(basins.len(), 1);
+    assert_eq!(basins[0]["source"], "attractor");
+    assert_eq!(basins[0]["mass"], 1);
+
+    // A floor above that mass must yield an honest empty list. It must
+    // NOT silently fall through to the project-derived path, which
+    // would answer a different question ("which folders are here?")
+    // than the caller asked ("which clusters are here?").
+    let body: Value = server
+        .get("/api/v1/field/basins?project=floor&min_mass=2")
+        .await
+        .json();
+    let basins = body["basins"].as_array().unwrap();
+    assert!(
+        basins.is_empty(),
+        "floor above every basin's mass should return no basins, got {basins:?}"
+    );
+    assert_eq!(body["total_candidates"].as_u64().unwrap(), 0);
+    assert_eq!(body["truncated"].as_bool().unwrap(), false);
+}
+
+#[tokio::test]
+async fn basin_labels_are_deterministic_across_requests() {
+    // The old label was the dominant kind, chosen through HashMap
+    // iteration order — so two identical requests could disagree. The
+    // label now drives a rendered canvas, so it has to be stable.
+    let (services, server) = make_setup().await;
+    let sink = ServicesSink::new(services.clone());
+    for text in [
+        "deterministic labelling alpha topic",
+        "deterministic labelling beta topic",
+        "deterministic labelling gamma topic",
+    ] {
+        sink.store(&rec(text, "cn-test-det", "/home/u/det"))
+            .await
+            .unwrap();
+    }
+    drain_for_test(&services, &services.consolidation_queue, 4).await;
+
+    let first: Value = server.get("/api/v1/field/basins?project=det").await.json();
+    let second: Value = server.get("/api/v1/field/basins?project=det").await.json();
+    assert_eq!(
+        first["basins"], second["basins"],
+        "two identical requests must return identical basins"
+    );
 }
 
 #[tokio::test]

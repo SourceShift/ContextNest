@@ -284,6 +284,42 @@ impl VectorArena {
             .flatten()
     }
 
+    /// Cosine of every id in `ids` against `query`, positionally: `out[i]`
+    /// belongs to `ids[i]`.
+    ///
+    /// The batch form exists because both halves of [`Self::cosine_to`] are
+    /// per-call costs a scan would pay n times: `exact::norm(query)` walks the
+    /// query's dimensions, and `with_vector` acquires and releases the arena
+    /// read lock. Scoring one candidate per call over a full-substrate
+    /// retrieve (~527k rows) pays ~527k redundant norm passes and ~527k lock
+    /// round-trips for a single query.
+    ///
+    /// `None` when `id` has no row. A row that exists but cannot be scored —
+    /// zero norm, or dimensions that differ from the query's — yields
+    /// `Some(0.0)`, which is what the pre-arena `utils::cosine_similarity`
+    /// path produced for those same degenerate inputs. Callers therefore keep
+    /// seeing the fragment as canonical-but-unscored rather than absent.
+    pub fn cosine_batch(&self, ids: &[String], query: &[f32]) -> Vec<Option<f32>> {
+        // `unwrap_or(0.0)` rather than an early `None` return: a zero-norm
+        // query scores every row 0.0 instead of erasing the whole batch.
+        let query_norm = exact::norm(query).unwrap_or(0.0);
+        let inner = self.inner.read().unwrap();
+        ids.iter()
+            .map(|id| {
+                let row = *inner.index.get(id.as_str())?;
+                Some(
+                    cosine_rows(
+                        query,
+                        query_norm,
+                        inner.row_slice(row),
+                        inner.norms[row as usize],
+                    )
+                    .unwrap_or(0.0),
+                )
+            })
+            .collect()
+    }
+
     /// Established dimension, `None` before the first vector.
     pub fn dim(&self) -> Option<usize> {
         let dim = self.inner.read().unwrap().dim;
