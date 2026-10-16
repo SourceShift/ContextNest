@@ -23,6 +23,11 @@
 //!   idempotently on `CoordStore::open`
 //! - dod9: every response (including the JSON body, recursively)
 //!   never carries `permissionDecision`
+//! - p1c (digest): default `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS`
+//!   hides MEMORY.md paths and lists others; an explicit "" shows
+//!   everything; the 5-line cap and `(+N more)` count only non-
+//!   ignored paths; the cursor advances past ignored writes; pure
+//!   parser returns the default / empty / trimmed split entries.
 //!
 //! Plus a metrics check that `coord_digest_lines_total` advances by
 //! the emitted per-path line count.
@@ -107,6 +112,7 @@ struct Harness {
     store: Arc<CoordStore>,
     _tmp: TempDir,
     _digest_env: EnvGuard,
+    _ignore_env: EnvGuard,
     /// Held for the whole test (declared after `_digest_env`, so the env
     /// value is restored before the lock is released). Dropping it at the
     /// end of make_harness let dod7's set_var race other tests (1/40 runs).
@@ -116,8 +122,12 @@ struct Harness {
 async fn make_harness() -> Harness {
     let env_lock = lock_env();
     // Every test starts with the env var absent so a stray setvar in
-    // another test doesn't leak into ours.
+    // another test doesn't leak into ours. Concord P1c ignores
+    // `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS` by default
+    // (`**/.claude/projects/*/memory/**`); clear it too so dod1-dod8
+    // keep their `/r/...` test paths matching the prior baseline.
     let env = EnvGuard::clear("CONTEXTNEST_CONCORD_DIGEST");
+    let ignore_env = EnvGuard::clear("CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("coord.db");
@@ -135,6 +145,7 @@ async fn make_harness() -> Harness {
         store,
         _tmp: tmp,
         _digest_env: env,
+        _ignore_env: ignore_env,
         _env_lock: env_lock,
     }
 }
@@ -623,5 +634,225 @@ async fn metrics_coord_digest_lines_total_advances_by_emitted_lines() {
         after_total,
         before_total + emitted as u64,
         "metric advanced by exactly the emitted per-path line count"
+    );
+}
+
+// ─────────────────── p1c (digest) — default globs hide MEMORY.md ───────────────────
+
+/// Concord P1c: with `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS` unset
+/// (defaults to `**/.claude/projects/*/memory/**`), writes under
+/// `MEMORY.md` are filtered from the per-turn digest. A non-matching
+/// path written by the same outsider in the same window still surfaces.
+#[tokio::test]
+async fn p1c_default_globs_drop_memory_paths() {
+    let h = make_harness().await;
+    ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+
+    fp(
+        &h.store,
+        "loop:a",
+        "read",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+    fp(&h.store, "loop:a", "read", "/w/src/x.rs");
+
+    let mut b = PrincipalUpsert::default();
+    b.harness = Some("codex".into());
+    h.store.upsert_principal("loop:b", b).expect("upsert b");
+    fp(
+        &h.store,
+        "loop:b",
+        "write",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+    fp(&h.store, "loop:b", "write", "/w/src/x.rs");
+
+    let body = ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    let ctx_text = ctx(&body);
+    assert!(
+        ctx_text.contains("src/x.rs"),
+        "non-ignored path appears; got {ctx_text:?}"
+    );
+    assert!(
+        !ctx_text.contains("MEMORY.md"),
+        "ignored path hidden by default globs; got {ctx_text:?}"
+    );
+}
+
+/// Concord P1c: explicit `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS=""`
+/// disables ignores — both MEMORY.md and src/x.rs appear.
+#[tokio::test]
+async fn p1c_empty_ignore_env_disables_filter() {
+    let h = make_harness().await;
+    let _ignore = EnvGuard::set("CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS", Some(""));
+    ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+
+    fp(
+        &h.store,
+        "loop:a",
+        "read",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+    fp(&h.store, "loop:a", "read", "/w/src/x.rs");
+
+    let mut b = PrincipalUpsert::default();
+    b.harness = Some("codex".into());
+    h.store.upsert_principal("loop:b", b).expect("upsert b");
+    fp(
+        &h.store,
+        "loop:b",
+        "write",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+    fp(&h.store, "loop:b", "write", "/w/src/x.rs");
+
+    let body = ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    let ctx_text = ctx(&body);
+    assert!(
+        ctx_text.contains("MEMORY.md"),
+        "empty env disables filter; got {ctx_text:?}"
+    );
+    assert!(
+        ctx_text.contains("src/x.rs"),
+        "empty env disables filter; got {ctx_text:?}"
+    );
+}
+
+/// Concord P1c: 7 non-ignored paths and 3 ignored paths, with the
+/// ignored ones written LAST so they are the newest rows. A
+/// limit-then-filter implementation would fill the cap with ignored
+/// rows and under-report. Exactly 5 per-path lines and `(+2 more)` —
+/// the count reflects only non-ignored paths.
+#[tokio::test]
+async fn p1c_cap_and_count_exclude_ignored_paths() {
+    let h = make_harness().await;
+    ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+
+    for i in 0..7 {
+        fp(&h.store, "loop:a", "read", &format!("/r/f{i}.rs"));
+    }
+    for i in 0..3 {
+        fp(
+            &h.store,
+            "loop:a",
+            "read",
+            &format!("/w/.claude/projects/p/memory/m{i}.md"),
+        );
+    }
+
+    let mut b = PrincipalUpsert::default();
+    b.harness = Some("codex".into());
+    h.store.upsert_principal("loop:b", b).expect("upsert b");
+    // Write the 7 /r/f first (older seqs), then the 3 memory LAST so
+    // they are newest — a LIMIT-before-filter would put them in the
+    // top 5 and bury /r/f4.rs.
+    for i in 0..7 {
+        fp(&h.store, "loop:b", "write", &format!("/r/f{i}.rs"));
+    }
+    for i in 0..3 {
+        fp(
+            &h.store,
+            "loop:b",
+            "write",
+            &format!("/w/.claude/projects/p/memory/m{i}.md"),
+        );
+    }
+
+    let body = ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    let ctx_text = ctx(&body);
+    let lines: Vec<&str> = ctx_text
+        .lines()
+        .filter(|l| l.starts_with("- /r/f"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        5,
+        "exactly 5 per-path /r/f lines; got {ctx_text:?}"
+    );
+    assert!(
+        !ctx_text
+            .lines()
+            .any(|l| l.starts_with("- ") && l.contains("memory/")),
+        "no ignored path leaked into the cap; got {ctx_text:?}"
+    );
+    assert!(
+        ctx_text.contains("(+2 more)"),
+        "summary counts only non-ignored paths; got {ctx_text:?}"
+    );
+    assert!(
+        !ctx_text.contains("(+5 more)"),
+        "summary must NOT include ignored paths; got {ctx_text:?}"
+    );
+}
+
+/// Concord P1c: a turn that only sees ignored writes produces no
+/// digest header, AND the cursor moves forward — a flipped-to "" UPS
+/// with no new activity MUST NOT re-dig them.
+#[tokio::test]
+async fn p1c_ignored_only_turn_advances_cursor_silently() {
+    let h = make_harness().await;
+    ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    fp(
+        &h.store,
+        "loop:a",
+        "read",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+
+    let mut b = PrincipalUpsert::default();
+    b.harness = Some("codex".into());
+    h.store.upsert_principal("loop:b", b).expect("upsert b");
+    fp(
+        &h.store,
+        "loop:b",
+        "write",
+        "/w/.claude/projects/p/memory/MEMORY.md",
+    );
+
+    // First UPS — ignored path only, so no digest header.
+    let body = ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    let ctx_text = ctx(&body);
+    assert!(
+        !ctx_text.contains("changed by other agents"),
+        "ignored-only turn renders no digest; got {ctx_text:?}"
+    );
+    assert!(
+        !ctx_text.contains("MEMORY.md"),
+        "ignored path absent; got {ctx_text:?}"
+    );
+
+    // Flip the env to "" so ignores no longer apply, and UPS again
+    // with no new writes — the cursor must have advanced past the
+    // prior MEMORY.md write so nothing surfaces.
+    let _flip = EnvGuard::set("CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS", Some(""));
+    let body2 = ups(&h.server, "loop:a", "s1", "UserPromptSubmit").await;
+    let ctx_text2 = ctx(&body2);
+    assert!(
+        !ctx_text2.contains("changed by other agents"),
+        "flipping env after a fully-digested turn must not re-surface; got {ctx_text2:?}"
+    );
+    assert!(
+        !ctx_text2.contains("MEMORY"),
+        "flipping env after a fully-digested turn must not re-surface; got {ctx_text2:?}"
+    );
+}
+
+/// Concord P1c: pure parser unit test for `parse_digest_ignore_globs`.
+#[test]
+fn p1c_parse_digest_ignore_globs_unit() {
+    use contextnest::api::coord_turn::parse_digest_ignore_globs;
+    assert_eq!(
+        parse_digest_ignore_globs(None),
+        vec!["**/.claude/projects/*/memory/**".to_string()],
+        "unset falls back to default"
+    );
+    assert!(
+        parse_digest_ignore_globs(Some("")).is_empty(),
+        "empty string disables ignores"
+    );
+    assert_eq!(
+        parse_digest_ignore_globs(Some(" a/** , ,b ")),
+        vec!["a/**".to_string(), "b".to_string()],
+        "trims, drops empties, preserves entries"
     );
 }
