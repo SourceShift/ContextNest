@@ -25,6 +25,20 @@ pub struct FragmentMeta {
     pub confidence: f32,
 }
 
+/// One candidate's score against a query embedding.
+///
+/// No vector, no fragment — this is the retrieve hot path's batch
+/// primitive. `canonical == false` means this store has no entry for the
+/// id, so the caller must rebuild the hit from the sidecars (the
+/// post-WAL-replay fallback path).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CandidateScore {
+    pub similarity: f32,
+    /// Canonical importance — the ranking tiebreaker behind similarity.
+    pub importance: f32,
+    pub canonical: bool,
+}
+
 #[derive(Debug)]
 struct Entry {
     meta: FragmentMeta,
@@ -161,6 +175,52 @@ impl FragmentStore {
         }
     }
 
+    /// Score every id in `ids` against `query`, positionally: `out[i]`
+    /// belongs to `ids[i]`.
+    ///
+    /// Two whole-batch savings over calling [`Self::get`] (or
+    /// [`Self::cosine_to`]) per candidate: one arena read lock, and one
+    /// query-norm pass — see [`VectorArena::cosine_batch`]. The importance
+    /// tiebreaker is read by borrow from [`Self::meta`], so nothing here
+    /// allocates a vector or a connection set.
+    ///
+    /// What this replaces mattered at substrate scale: `get` → `hydrate`
+    /// allocated a fresh `Vec<f32>` plus a cloned `HashSet<String>` of
+    /// connections for *every* candidate, ~2.5 GB of churn on a global
+    /// query, of which all but `top_k` results were discarded unread.
+    ///
+    /// `entries` stays the authority on canonical-ness rather than the arena:
+    /// the arena is shared with the connection graph, so a live row is not by
+    /// itself evidence of a fragment. This mirrors `get`, which returned
+    /// `None` for an id the store does not hold.
+    pub fn score_batch(&self, ids: &[String], query: &[f32]) -> Vec<CandidateScore> {
+        let mut scores = self.arena.cosine_batch(ids, query);
+        ids.iter()
+            .zip(scores.iter_mut())
+            .map(|(id, slot)| match self.entries.get(id) {
+                Some(entry) => {
+                    if let Some(inline) = &entry.inline {
+                        // The arena rejected this vector (its dimension
+                        // differs from the arena's), so it lives inline.
+                        *slot = Some(super::utils::cosine_similarity(query, inline));
+                    }
+                    CandidateScore {
+                        similarity: slot.unwrap_or(0.0),
+                        importance: entry.meta.importance,
+                        canonical: true,
+                    }
+                }
+                None => CandidateScore {
+                    similarity: 0.0,
+                    // Neutral default, mirroring the retrieve handler's
+                    // sidecar-only hits and `restore_sidecars_bulk`.
+                    importance: 0.5,
+                    canonical: false,
+                },
+            })
+            .collect()
+    }
+
     fn hydrate(&self, entry: &Entry) -> MemoryFragment {
         let content = match &entry.inline {
             Some(inline) => inline.clone(),
@@ -195,6 +255,45 @@ mod tests {
             connections: HashSet::new(),
             confidence: 0.9,
         }
+    }
+
+    #[test]
+    fn score_batch_matches_cosine_to_positionally() {
+        let arena = Arc::new(VectorArena::new());
+        let mut store = FragmentStore::new(arena.clone());
+        store.insert(fragment("a", vec![1.0, 0.0, 0.0]));
+        store.insert(fragment("b", vec![0.0, 1.0, 0.0]));
+        let query = vec![0.9, 0.1, 0.0];
+        let ids = vec!["a".to_string(), "b".to_string(), "ghost".to_string()];
+        let scored = store.score_batch(&ids, &query);
+
+        assert_eq!(scored.len(), ids.len(), "one score per id, in order");
+        // The batch path must not be a different formula — it is the same
+        // cosine, with the query norm hoisted out of the loop.
+        assert_eq!(scored[0].similarity, store.cosine_to("a", &query).unwrap());
+        assert_eq!(scored[1].similarity, store.cosine_to("b", &query).unwrap());
+        assert!(scored[0].similarity > scored[1].similarity);
+        assert!(scored[0].canonical && scored[1].canonical);
+        assert_eq!(scored[0].importance, 0.5);
+
+        // "ghost" is the sidecar-only fallback: absent from the store means
+        // absent, not zero-scored-canonical.
+        assert!(!scored[2].canonical);
+        assert_eq!(scored[2].similarity, 0.0);
+    }
+
+    #[test]
+    fn score_batch_ignores_arena_rows_the_store_does_not_own() {
+        let arena = Arc::new(VectorArena::new());
+        let store = FragmentStore::new(arena.clone());
+        // The arena is shared with the connection graph, so a live row is not
+        // by itself evidence of a fragment — `entries` stays the authority,
+        // exactly as `get` was.
+        arena
+            .claim("node-only", Holder::Node, &[1.0, 0.0, 0.0])
+            .unwrap();
+        let scored = store.score_batch(&["node-only".to_string()], &[1.0, 0.0, 0.0]);
+        assert!(!scored[0].canonical);
     }
 
     #[test]

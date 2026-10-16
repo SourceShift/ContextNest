@@ -13,6 +13,8 @@ make cn-serve           # release binary, WAL on, binds 127.0.0.1:28080
 make cn-serve-dev       # fast-profile binary, auto-rebuilds
 make cn-watch           # cargo-watch + fast profile
 make cn-ingest SINCE=7d PROJECT=researcher   # backfill ~/.claude/projects/*
+make cn-agent-install   # hand supervision to launchd (auto-restart on crash)
+make cn-agent-status    # is the supervisor loaded, and what did it last do
 make cn-help            # full target list
 ```
 
@@ -153,8 +155,11 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_CONSOLIDATION_RECURRENCE_MIN_COUNT` | 0 | T1 (arXiv:2605.16045). When > 0, defers a fragment to the subconscious store if it has fewer than N session peers over the cosine floor. Sidecar stays retrievable; no basin, no graph work. Reconsideration re-enqueues when a peer arrives. |
 | `CONTEXTNEST_RECONSTRUCT_COSINE_FLOOR` | 0.15 | T4 (arXiv:2601.14287). Drops fragments below this cosine from `reconstruct`'s chain assembly before top-K truncation. Set 0.0 to disable. |
 | `CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT` | 0.1 | T5 (arXiv:2606.12945). Weight on the frequency-of-use boost `1 + w * log2(count + 1)` applied to retrieve scoring. Set 0.0 to disable. |
+| `CONTEXTNEST_RETRIEVE_CANDIDATE_POOL` | unset → `max(20 × top_k, 1000)` | Upper bound on candidates **materialized** into hits. Scoring stays exact over every candidate; only this many get text + metadata pulled from the sidecars. `0` = unbounded (the pre-knob behaviour) — the A/B escape hatch for a global query, which otherwise scores all ~527k active fragments. |
 | `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | LRU bound on the embedding response cache (~16 MB at 1024-d). `0` disables it. |
 | `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | Put the operator's vector arena in a file-backed mapping under this dir (derived state, unlinked at boot). Use a volume with free space. |
+| `CONTEXTNEST_VOLUME_WATCH` | on | `0` disables the data-volume watchdog. Exits 75 after ~15 s if the data directory's `st_dev`/`st_ino` change (a USB detach + remount revokes every fd and never recovers). See `docs/architecture-honest.md` → "Data-volume resilience". |
+| `CONTEXTNEST_MIN_FREE_MB` | 5120 | Free-space floor on the data volume; below it the process refuses to boot (exit 74). `0` disables. |
 
 Full list in `docs/architecture-honest.md`.
 

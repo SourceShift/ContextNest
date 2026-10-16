@@ -6,9 +6,9 @@ use crate::error::ContextNestResult;
 use crate::error::{ContextNestError, Result};
 use crate::memory::attractors::vector_arena::VectorArena;
 use crate::memory::attractors::{
-    utils, AdaptiveDecaySystem, AttractorBasinManager, ComponentStatus, ConnectionNetwork,
-    GapFillingEngine, MemoryAttractorConfig, MemoryAttractorMetrics, MemoryFragment,
-    MemoryReconstructionProtocol, ReconstructedMemory,
+    fragment_store::CandidateScore, utils, AdaptiveDecaySystem, AttractorBasinManager,
+    ComponentStatus, ConnectionNetwork, GapFillingEngine, MemoryAttractorConfig,
+    MemoryAttractorMetrics, MemoryFragment, MemoryReconstructionProtocol, ReconstructedMemory,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -801,6 +801,36 @@ impl MemoryAttractorManager {
         let store_arc = self.reconstruction_protocol.fragment_store();
         let store = store_arc.read().await;
         store.cosine_to(id, query)
+    }
+
+    /// Score a batch of candidate ids against `query`, positionally:
+    /// `out[i]` belongs to `ids[i]`.
+    ///
+    /// One fragment-store read lock for the whole batch and no vector or
+    /// fragment clone — see `FragmentStore::score_batch`, which is what the
+    /// retrieve hot path wants in place of one [`Self::get_fragment`] per
+    /// candidate.
+    pub async fn score_candidates(&self, ids: &[String], query: &[f32]) -> Vec<CandidateScore> {
+        let store_arc = self.reconstruction_protocol.fragment_store();
+        let store = store_arc.read().await;
+        store.score_batch(ids, query)
+    }
+
+    /// Membership of the basin containing `fragment_id`, if any.
+    ///
+    /// Clone-free anchor lookup for `basin_aware_expand`: it scans basin
+    /// memberships under one read lock and clones only the matching basin's
+    /// fragment-id set. The obvious-looking alternative,
+    /// [`Self::list_basin_snapshots`], clones **every** basin's centroid
+    /// vector and membership list to answer the same question — ~1.16 GB of
+    /// allocation per retrieve on the live substrate, discarded except for the
+    /// single match.
+    ///
+    /// Deliberately not derived from `FragmentMeta::attractor_basin_id`: that
+    /// field is written `None` in several canonical paths, so keying off it
+    /// would silently disable basin expansion rather than fail loudly.
+    pub async fn basin_membership_containing(&self, fragment_id: &str) -> Option<Vec<String>> {
+        self.basin_manager.membership_containing(fragment_id).await
     }
 
     /// Copy of a canonical fragment's vector. `None` for unknown ids.
