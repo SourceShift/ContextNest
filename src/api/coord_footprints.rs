@@ -72,7 +72,7 @@ use tracing::error;
 
 use crate::api::coord_turn::{self, TurnInputWithHeaders};
 use crate::services::coord_store::{
-    CoordStore, CoordStoreResult, HotClaim, HotClaimOutcome, OtherWriter, PrincipalUpsert,
+    CoordStore, CoordStoreResult, Freeze, HotClaim, HotClaimOutcome, OtherWriter, PrincipalUpsert,
     LINEAGE_MAX_HOPS,
 };
 use crate::services::ContextNestServices;
@@ -171,6 +171,96 @@ pub fn parse_owns_mode(raw: Option<&str>) -> OwnsMode {
         Some("deny") => OwnsMode::Deny,
         _ => OwnsMode::Audit,
     }
+}
+
+/// Default implicit-scope globs used when
+/// `CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS` is unset. A worktree's
+/// edits to paths matching this list are treated as covered by the
+/// owns check, no audit row, no hand glyph, no metric bump, and no
+/// permissionDecision (Concord P2e).
+const DEFAULT_OWNS_IMPLICIT_GLOBS: &str = ".mini-ork/**";
+
+/// The implicit-scope globs, read fresh from env on every call so test
+/// suites can flip them without restarting the binary. An explicitly
+/// set value is split on ',', trimmed, and stripped of empty entries —
+/// so an empty string disables the implicit set. Unset →
+/// [`DEFAULT_OWNS_IMPLICIT_GLOBS`].
+pub fn owns_implicit_globs() -> Vec<String> {
+    parse_owns_implicit_globs(
+        std::env::var("CONTEXTNEST_CONCORD_OWNS_IMPLICIT_GLOBS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser behind [`owns_implicit_globs`]: `None` (unset) → the
+/// default `.mini-ork/**`; a set value is split on ',', trimmed, and
+/// stripped of empties (so "" disables). Unit tests call this directly
+/// — mutating the process env from parallel test threads raced
+/// (`cargo test` runs tests concurrently).
+pub fn parse_owns_implicit_globs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or(DEFAULT_OWNS_IMPLICIT_GLOBS)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Pure parser behind [`owns_own_kickoff_enabled`]. Only an exact `"0"`
+/// (trimmed) disables the rule; unset or any other value enables it.
+/// Mirrors [`parse_disk_check_enabled`].
+pub fn parse_owns_own_kickoff_enabled(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|s| s.trim()), Some("0"))
+}
+
+/// Read `CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF` fresh on every call.
+/// `=0` disables the own-kickoff implicit rule; anything else (or
+/// unset) enables it.
+pub fn owns_own_kickoff_enabled() -> bool {
+    parse_owns_own_kickoff_enabled(
+        std::env::var("CONTEXTNEST_CONCORD_OWNS_OWN_KICKOFF")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure matcher for the own-kickoff implicit rule (Concord P2e).
+/// True iff `principal_id` starts with `agent:wt-<slug>` with a
+/// non-empty slug, `rel` is under `kickoffs/`, ends in `.md`, and its
+/// file name starts with `<slug>`. Matching only on the file name
+/// (a plain `starts_with`) lets slug `vt1-mr-relations` cover
+/// `kickoffs/vt1-mr-relations-r2.md` while rejecting
+/// `kickoffs/auto/xvt1-mr-relations.md`.
+pub fn own_kickoff_covers(principal_id: &str, rel: &str) -> bool {
+    let slug = match principal_id.strip_prefix("agent:wt-") {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    if !rel.starts_with("kickoffs/") || !rel.ends_with(".md") {
+        return false;
+    }
+    let file_name = match rel.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => return false,
+    };
+    file_name.starts_with(slug)
+}
+
+/// Pure combinator that decides whether a target is implicitly covered
+/// by the P2e implicit-scope rules. Reads `rel` against `implicit_globs`
+/// first via [`glob_match`], then falls back to the own-kickoff matcher
+/// when `own_kickoff` is enabled. Env I/O lives in the readers above;
+/// this function stays pure so unit tests can drive it without
+/// touching the process env.
+pub fn owns_implicitly_covered(
+    principal_id: &str,
+    rel: &str,
+    implicit_globs: &[String],
+    own_kickoff: bool,
+) -> bool {
+    implicit_globs.iter().any(|g| glob_match(g, rel))
+        || (own_kickoff && own_kickoff_covers(principal_id, rel))
 }
 
 /// True iff `entry` covers `rel` — either they are equal, `rel` is a
@@ -322,18 +412,50 @@ pub fn classify_disk_drift(
 /// editing." For `Deleted`, "changed on disk" becomes "was deleted on
 /// disk" — the rest of the sentence is identical so the model has the
 /// same instruction regardless of variant.
-pub fn render_unrecorded_context(path: &Path, drift: DiskDrift, last_ts: DateTime<Utc>) -> String {
+///
+/// When `attr` is `Some` (Concord P1d), one attribution sentence is
+/// appended: `Probably <principal> (<harness>, <cwd basename>) ran
+/// \`<command, first 120 chars>\` at <ts>.` — with "your own shell
+/// command" substituted for the `<principal> (<harness>, <cwd
+/// basename>) ran` part when the exec principal is in the caller's
+/// lineage.
+fn render_unrecorded_context(
+    path: &Path,
+    drift: DiskDrift,
+    last_ts: DateTime<Utc>,
+    attr: Option<&ExecAttribution>,
+) -> String {
     let ts = last_ts.to_rfc3339_opts(SecondsFormat::Secs, true);
     let verb = match drift {
         DiskDrift::Changed => "changed on disk",
         DiskDrift::Deleted => "was deleted on disk",
     };
-    format!(
+    let mut out = format!(
         "[concord] `{}` {} after the last change any agent recorded ({}), and no agent recorded this write \u{2014} a shell command (possibly your own), an editor, a formatter, or a git operation. Re-read it before editing.",
         path.display(),
         verb,
         ts,
-    )
+    );
+    if let Some(a) = attr {
+        let harness = a.harness.as_deref().unwrap_or("unknown");
+        let cwd_base = Path::new(&a.cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let detail: String = a.detail.chars().take(120).collect();
+        let ats = a.ts.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let sentence = if a.is_self {
+            format!("Probably your own shell command `{}` at {}.", detail, ats)
+        } else {
+            format!(
+                "Probably {} ({}, {}) ran `{}` at {}.",
+                a.principal_id, harness, cwd_base, detail, ats
+            )
+        };
+        out.push_str("\n\n");
+        out.push_str(&sentence);
+    }
+    out
 }
 
 /// Match `path` against a component glob `pattern`. Both are split on
@@ -441,6 +563,21 @@ pub fn resolve_tool_path(tool_name: &str, extra: &Value, cwd: &Path) -> Option<P
         Ok(c) => c,
         Err(_) => joined,
     })
+}
+
+/// Canonicalize a Bash cwd the same way [`resolve_tool_path`]
+/// canonicalizes file paths: `std::fs::canonicalize` when it succeeds
+/// (macOS `/var` → `/private/var`, symlink resolution), else the raw
+/// path. The exec-footprint branch stores this as the footprint `path`
+/// so the P1d ancestor check and the read/write file paths share one
+/// canonicalization rule — if they diverged, the ancestor match would
+/// silently never fire on macOS.
+pub fn canonicalize_cwd(cwd: &str) -> PathBuf {
+    let p = PathBuf::from(cwd);
+    match std::fs::canonicalize(&p) {
+        Ok(c) => c,
+        Err(_) => p,
+    }
 }
 
 /// Resolve a principal id for the hook call without mutating store
@@ -598,16 +735,39 @@ pub async fn coord_footprints(
         .get("tool_name")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let op = match file_tool_op(tool_name) {
-        Some(o) => o,
-        None => return Json(json!({ "recorded": false })),
-    };
     let cwd_str = input.inner.cwd.clone().unwrap_or_default();
     let cwd_path = Path::new(&cwd_str);
-    let path = match resolve_tool_path(tool_name, &input.inner.extra, cwd_path) {
-        Some(p) => p,
-        None => return Json(json!({ "recorded": false })),
+
+    // A Bash call records an exec footprint (command + cwd, never
+    // stat'ed, never a write). The file tools record read/write
+    // footprints on the resolved file path. Both share the
+    // resolve/upsert/bind/record tail below.
+    let (op, path, detail): (&'static str, PathBuf, Option<String>) = if tool_name == "Bash" {
+        let command = input
+            .inner
+            .extra
+            .get("tool_input")
+            .and_then(Value::as_object)
+            .and_then(|ti| ti.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let detail = match command {
+            Some(cmd) if !cmd.trim().is_empty() => cmd,
+            _ => return Json(json!({ "recorded": false })),
+        };
+        ("exec", canonicalize_cwd(&cwd_str), Some(detail))
+    } else {
+        let op = match file_tool_op(tool_name) {
+            Some(o) => o,
+            None => return Json(json!({ "recorded": false })),
+        };
+        let path = match resolve_tool_path(tool_name, &input.inner.extra, cwd_path) {
+            Some(p) => p,
+            None => return Json(json!({ "recorded": false })),
+        };
+        (op, path, None)
     };
+
     let principal_id = match resolve_hook_principal(&services.coord_store, &input) {
         Ok(Some(p)) => p,
         Ok(None) => return Json(json!({ "recorded": false })),
@@ -657,14 +817,23 @@ pub async fn coord_footprints(
         return Json(json!({ "recorded": false }));
     }
 
-    let (mtime_ns, size) = stat_file(&path);
+    // Exec rows skip stat_file entirely (there is no file to stat) —
+    // the (mtime_ns, size) tuple is forced to (None, None).
+    let (mtime_ns, size) = if op == "exec" {
+        (None, None)
+    } else {
+        stat_file(&path)
+    };
     let worker_id = if session_id.is_empty() {
         principal_id.clone()
     } else {
         session_id.clone()
     };
-    let seq = match store.record_footprint(&principal_id, &worker_id, op, &path_str, mtime_ns, size)
-    {
+    let seq = match &detail {
+        Some(d) => store.record_exec_footprint(&principal_id, &worker_id, &path_str, d),
+        None => store.record_footprint(&principal_id, &worker_id, op, &path_str, mtime_ns, size),
+    };
+    let seq = match seq {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_footprints: record_footprint failed");
@@ -742,26 +911,103 @@ pub async fn coord_precheck(
             m.coord_precheck_unrecorded_total = m.coord_precheck_unrecorded_total.saturating_add(1);
         }
     }
+    let now = Utc::now();
+    let path_str = outcome
+        .path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    let caller = outcome.principal_id.as_deref();
+    let mut any_escalated = false;
+
+    // Each fired signal records one overlap row (Concord P4) and carries
+    // its own ` (overlap O-<id>)` suffix on its rendered line — the
+    // suffix never lands on the joined blob, so every signal keeps its
+    // own id.
     let p1_text = match (&outcome.path, outcome.warn) {
-        (Some(p), true) => render_precheck_context(p, &outcome.others),
+        (Some(p), true) => {
+            let mut text = render_precheck_context(p, &outcome.others);
+            if let (Some(pid), Some(subject), Some(other)) =
+                (caller, path_str.as_deref(), outcome.others.first())
+            {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "stale",
+                    subject,
+                    pid,
+                    Some(&other.principal_id),
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         _ => String::new(),
     };
     let unrecorded_text = match (&outcome.path, &outcome.unrecorded) {
-        (Some(p), Some((drift, ts))) => render_unrecorded_context(p, *drift, *ts),
+        (Some(p), Some((drift, ts, attr))) => {
+            let mut text = render_unrecorded_context(p, *drift, *ts, attr.as_ref());
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "unrecorded",
+                    subject,
+                    pid,
+                    None,
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         _ => String::new(),
     };
     let hot_text = match (&outcome.path, &outcome.hot) {
-        (Some(p), Some(claim)) => render_hot_context(p, claim),
+        (Some(p), Some(claim)) => {
+            let mut text = render_hot_context(p, claim);
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "hot",
+                    subject,
+                    pid,
+                    Some(&claim.principal_id),
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         _ => String::new(),
     };
     let owns_text = match &outcome.owns {
-        Some(hit) => render_owns_context(&hit.rel, &hit.owns),
+        Some(hit) => {
+            let mut text = render_owns_context(&hit.rel, &hit.owns);
+            if let (Some(pid), Some(subject)) = (caller, path_str.as_deref()) {
+                text.push_str(&overlap_suffix(
+                    &services.coord_store,
+                    "owns",
+                    subject,
+                    pid,
+                    None,
+                    now,
+                    &mut any_escalated,
+                ));
+            }
+            text
+        }
         None => String::new(),
     };
     // Compose the four advisory strings in [p1, unrecorded, hot, owns]
     // order so existing hot/p1 reasons (and tests that read them) stay
     // byte-identical when only one branch fires.
     let additional_context = join_context(&[&p1_text, &unrecorded_text, &hot_text, &owns_text]);
+
+    // Escalation is counted once per request, after every store call has
+    // returned and the metrics lock is free to take.
+    if any_escalated {
+        let mut m = services.coord_metrics.write().await;
+        m.coord_overlaps_escalated_total = m.coord_overlaps_escalated_total.saturating_add(1);
+    }
 
     let others_json: Vec<Value> = outcome
         .others
@@ -777,9 +1023,11 @@ pub async fn coord_precheck(
         })
         .collect();
 
-    // Compose the hot + owns decisions strictest-wins. Both contribute
-    // ONLY when their check fired; Audit / Warn map to None. The
-    // unrecorded signal is advisory only — never participates in the
+    // Compose the hot + owns decisions strictest-wins, then overlay the
+    // freeze decision (Concord P4), which is unconditional — a matching
+    // freeze always Denies, regardless of hot/owns mode. Hot/owns
+    // contribute ONLY when their check fired; Audit / Warn map to None.
+    // The unrecorded signal is advisory only — never participates in the
     // permissionDecision composition.
     #[derive(PartialOrd, Ord, Eq, PartialEq, Clone, Copy)]
     enum Decision {
@@ -805,7 +1053,16 @@ pub async fn coord_precheck(
     } else {
         Decision::None
     };
-    let decision = std::cmp::max(hot_decision, owns_decision);
+    let freeze_decision = if outcome.freeze.is_some() {
+        Decision::Deny
+    } else {
+        Decision::None
+    };
+    let freeze_text = match (&outcome.freeze, path_str.as_deref()) {
+        (Some(f), Some(p)) => render_freeze_context(p, f),
+        _ => String::new(),
+    };
+    let decision = std::cmp::max(std::cmp::max(hot_decision, owns_decision), freeze_decision);
 
     // Build hookSpecificOutput as a Map so `permissionDecision` can be
     // inserted conditionally — absent (not null, not "allow") for
@@ -825,6 +1082,9 @@ pub async fn coord_precheck(
         }
         if owns_decision != Decision::None && !owns_text.is_empty() {
             reason_parts.push(owns_text.clone());
+        }
+        if freeze_decision != Decision::None && !freeze_text.is_empty() {
+            reason_parts.push(freeze_text.clone());
         }
         hook.insert("permissionDecision".to_string(), json!(value));
         hook.insert(
@@ -860,12 +1120,53 @@ fn join_context(parts: &[&str]) -> String {
     out
 }
 
+/// Record one overlap notice and return the ` (overlap O-<id>)` suffix to
+/// append to the matching signal's rendered line. On a store error the
+/// suffix is empty (the signal still renders, just without a tracked id)
+/// and the error is logged — the hook must never block.
+fn overlap_suffix(
+    store: &CoordStore,
+    kind: &str,
+    subject: &str,
+    a: &str,
+    b: Option<&str>,
+    now: DateTime<Utc>,
+    any_escalated: &mut bool,
+) -> String {
+    match store.upsert_overlap(kind, subject, a, b, now) {
+        Ok(item) => {
+            if item.just_escalated {
+                *any_escalated = true;
+            }
+            format!(" (overlap O-{})", item.id)
+        }
+        Err(e) => {
+            error!(error = %e, kind = %kind, "coord_precheck: upsert_overlap failed");
+            String::new()
+        }
+    }
+}
+
+/// Render the P4 freeze deny reason: `⛔ <path> is frozen by <by>:
+/// <reason> (until <expires_at>)`.
+fn render_freeze_context(path: &str, f: &Freeze) -> String {
+    format!(
+        "⛔ {path} is frozen by {}: {} (until {})",
+        f.by,
+        f.reason,
+        f.expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
 /// The pure decision behind `coord_precheck`. `warn`/`others` carry the
 /// P1 stale-premise signal; `hot` carries the P2 hot-conflict claim;
 /// `owns` carries the P2d owns-scope audit hit (some when the target
 /// is outside the worktree's claim, none otherwise); `unrecorded`
 /// carries the P1b disk-truth drift (when the file on disk no longer
-/// matches the newest recorded footprint on the path).
+/// matches the newest recorded footprint on the path). The P2e
+/// implicit scope — a worktree's own kickoff and the implicit-glob set
+/// (default `.mini-ork/**`) — short-circuits the owns arm to `None`
+/// before the audit row is written.
 ///
 /// The hot and owns checks both run BEFORE the P1 no-prior-footprint
 /// early return so a caller that has never touched the path still sees
@@ -879,10 +1180,46 @@ struct PrecheckOutcome {
     path: Option<PathBuf>,
     hot: Option<HotClaim>,
     owns: Option<OwnsHit>,
-    /// `(drift, ts)` when the P1b disk check fired: on-disk state
-    /// diverged from the latest recorded footprint on the path, past
-    /// the grace window (or the file is gone). `None` otherwise.
-    unrecorded: Option<(DiskDrift, DateTime<Utc>)>,
+    /// `(drift, ts, attribution)` when the P1b disk check fired:
+    /// on-disk state diverged from the latest recorded footprint on
+    /// the path, past the grace window (or the file is gone).
+    /// `attribution` is the most plausible exec footprint that caused
+    /// the change (Concord P1d), `None` when no candidate matched.
+    /// `None` otherwise (no drift).
+    unrecorded: Option<(DiskDrift, DateTime<Utc>, Option<ExecAttribution>)>,
+    /// The resolved caller principal, `None` when unresolvable (an
+    /// unbound session). Carried so the handler can key each overlap
+    /// notice to its caller without re-resolving.
+    principal_id: Option<String>,
+    /// The live, non-exempt freeze that matched the target path (Concord
+    /// P4), `None` when no freeze applies. Its presence forces the
+    /// composed `permissionDecision` to `"deny"`.
+    freeze: Option<Freeze>,
+}
+
+/// The most plausible shell command (an exec footprint) that caused an
+/// unrecorded disk change (Concord P1d). `cwd` is the command's
+/// canonicalized working directory, `detail` the command string, `ts`
+/// the exec row's timestamp. `is_self` is true when the exec row's
+/// principal is in the caller's lineage (so the renderer can say "your
+/// own shell command" instead of naming a principal).
+struct ExecAttribution {
+    principal_id: String,
+    harness: Option<String>,
+    cwd: String,
+    detail: String,
+    ts: DateTime<Utc>,
+    is_self: bool,
+}
+
+/// The P1 stale-premise query result: whether a foreign writer exists,
+/// the deduped writers, the caller's last footprint seq on the path,
+/// and the caller's lineage (reused by the P1d attribution self-check).
+struct P1Lookup {
+    warn: bool,
+    others: Vec<OtherWriter>,
+    last: Option<i64>,
+    excl: HashSet<String>,
 }
 
 /// One owns-scope audit hit (Concord P2d). `worktree_principal` is the
@@ -902,6 +1239,57 @@ struct OwnsHit {
     owns: Vec<String>,
 }
 
+/// Scan exec footprints newer than `after_seq` for the most plausible
+/// shell command that changed `path` (Concord P1d). A candidate matches
+/// when its cwd is `path`'s parent (or an ancestor of it) AND its
+/// command mentions the file — either by bare file name or by the
+/// path's cwd-relative form. Newest match wins. Store errors log and
+/// degrade to `None` (advisory only). `is_self` is decided against the
+/// caller's already-computed lineage set.
+fn attribute_exec_footprint(
+    store: &CoordStore,
+    after_seq: i64,
+    path: &Path,
+    excl: &HashSet<String>,
+) -> Option<ExecAttribution> {
+    let candidates = match store.exec_footprints_after(after_seq, 32) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "coord_precheck: exec_footprints_after failed");
+            return None;
+        }
+    };
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(path);
+    for c in candidates {
+        let cwd = Path::new(&c.path);
+        if !parent.starts_with(cwd) {
+            continue;
+        }
+        let detail = c.detail.as_deref().unwrap_or("");
+        if detail.is_empty() {
+            continue;
+        }
+        // Mention the file: bare name, or the cwd-relative path form
+        // (for commands run in an ancestor directory).
+        let rel = path.strip_prefix(cwd).ok().and_then(|r| r.to_str());
+        let mentions = (!file_name.is_empty() && detail.contains(file_name))
+            || rel.is_some_and(|r| !r.is_empty() && detail.contains(r));
+        if !mentions {
+            continue;
+        }
+        return Some(ExecAttribution {
+            is_self: excl.contains(&c.principal_id),
+            principal_id: c.principal_id,
+            harness: c.harness,
+            cwd: c.path,
+            detail: c.detail.unwrap_or_default(),
+            ts: c.ts,
+        });
+    }
+    None
+}
+
 fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> PrecheckOutcome {
     let noop = PrecheckOutcome {
         warn: false,
@@ -910,6 +1298,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         hot: None,
         owns: None,
         unrecorded: None,
+        principal_id: None,
+        freeze: None,
     };
     let tool_name = input
         .inner
@@ -947,7 +1337,21 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
             // matched against; re-deriving it from the raw path broke for
             // new files under a symlinked root (macOS /var → /private/var).
             let rel_str = wt.rel.clone();
-            if !wt.owns.iter().any(|e| owns_covers(e, &rel_str)) {
+            // P2e implicit-scope: a worktree's own kickoff and the
+            // implicit-glob set (default `.mini-ork/**`) are covered,
+            // so the arm short-circuits to None BEFORE the audit row is
+            // written — that suppresses the glyph, the row, the metric
+            // bump, and the permissionDecision in one shot.
+            let implicit = owns_implicitly_covered(
+                &wt.principal_id,
+                &rel_str,
+                &owns_implicit_globs(),
+                owns_own_kickoff_enabled(),
+            );
+            let covered = wt.owns.iter().any(|e| owns_covers(e, &rel_str));
+            if implicit || covered {
+                None
+            } else {
                 if let Err(e) = store.record_owns_violation(
                     &wt.principal_id,
                     &rel_str,
@@ -960,8 +1364,6 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                     rel: rel_str,
                     owns: wt.owns,
                 })
-            } else {
-                None
             }
         }
         Ok(_) => None,
@@ -970,6 +1372,32 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
             None
         }
     };
+
+    // Freeze check (Concord P4). A live, non-exempt freeze forces the
+    // precheck decision to Deny unconditionally. It runs BEFORE the
+    // unbound-caller early return: an unidentified session is an outsider
+    // (empty lineage), so a freeze must stop it too. The lookup stays
+    // fail-safe: a store error (list or lineage) logs and degrades to
+    // `None` — never to an empty-lineage default for a KNOWN caller, which
+    // would wrongly deny the freezer's own lineage.
+    let freeze_path = path.to_string_lossy().to_string();
+    let freeze: Option<Freeze> = (|| -> CoordStoreResult<Option<Freeze>> {
+        let freezes = store.list_freezes(Utc::now())?;
+        if freezes.is_empty() {
+            return Ok(None);
+        }
+        let lineage: HashSet<String> = match caller_principal.as_deref() {
+            Some(p) => store.lineage(p, LINEAGE_MAX_HOPS)?,
+            None => HashSet::new(),
+        };
+        Ok(freezes
+            .into_iter()
+            .find(|f| glob_match(&f.glob, &freeze_path) && !lineage.contains(&f.by)))
+    })()
+    .unwrap_or_else(|e| {
+        error!(error = %e, caller = ?caller_principal, "coord_precheck: freeze lookup failed");
+        None
+    });
 
     let principal_id = match caller_principal {
         Some(p) => p,
@@ -981,6 +1409,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 hot: None,
                 owns,
                 unrecorded: None,
+                principal_id: None,
+                freeze,
             }
         }
     };
@@ -1009,20 +1439,42 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         None
     };
 
-    let outcome: CoordStoreResult<(bool, Vec<OtherWriter>, Option<i64>)> = (|| {
+    let outcome: CoordStoreResult<P1Lookup> = (|| {
         let last = match store.last_footprint_seq(&principal_id, &path_str)? {
             Some(s) => s,
-            None => return Ok((false, Vec::new(), None)),
+            None => {
+                return Ok(P1Lookup {
+                    warn: false,
+                    others: Vec::new(),
+                    last: None,
+                    excl: HashSet::new(),
+                })
+            }
         };
         let excl: HashSet<String> = store.lineage(&principal_id, LINEAGE_MAX_HOPS)?;
         let others = store.writes_after(&path_str, last, &excl, 3)?;
-        Ok((!others.is_empty(), others, Some(last)))
+        Ok(P1Lookup {
+            warn: !others.is_empty(),
+            others,
+            last: Some(last),
+            excl,
+        })
     })();
-    let (warn, others, last) = match outcome {
-        Ok((warn, others, last)) => (warn, others, last),
+    let P1Lookup {
+        warn,
+        others,
+        last,
+        excl,
+    } = match outcome {
+        Ok(l) => l,
         Err(e) => {
             error!(error = %e, principal_id = %principal_id, "coord_precheck: store query failed");
-            (false, Vec::new(), None)
+            P1Lookup {
+                warn: false,
+                others: Vec::new(),
+                last: None,
+                excl: HashSet::new(),
+            }
         }
     };
 
@@ -1033,7 +1485,15 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
     // window, this is an unrecorded write. Disabled by setting
     // CONTEXTNEST_CONCORD_DISK_CHECK=0. Errors log and degrade to
     // "no unrecorded change" so the hook can never block.
-    let unrecorded: Option<(DiskDrift, DateTime<Utc>)> = if !others.is_empty()
+    //
+    // A `Deleted` drift on a `Write` tool is silently dropped: a
+    // Write replaces the whole file, so a prior deletion (worktree
+    // rollback, then re-create) breaks no premise — there is no
+    // partial update to lose. `Changed` stays reportable for every
+    // tool (a real lost update), and `Deleted` still fires for Edit,
+    // MultiEdit, and NotebookEdit.
+    let unrecorded: Option<(DiskDrift, DateTime<Utc>, Option<ExecAttribution>)> = if !others
+        .is_empty()
         || last.is_none()
         || !disk_check_enabled()
     {
@@ -1054,7 +1514,11 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
                 };
                 let current = stat_file(&path);
                 match classify_disk_drift(fp.mtime_ns, fp.size, current, now_ns, disk_grace_ms()) {
-                    Some(drift) => Some((drift, fp.ts)),
+                    Some(drift) if drift == DiskDrift::Deleted && tool_name == "Write" => None,
+                    Some(drift) => {
+                        let attribution = attribute_exec_footprint(store, fp.seq, &path, &excl);
+                        Some((drift, fp.ts, attribution))
+                    }
                     None => None,
                 }
             }
@@ -1073,6 +1537,8 @@ fn precheck_decision(store: &CoordStore, input: &TurnInputWithHeaders) -> Preche
         hot,
         owns,
         unrecorded,
+        principal_id: Some(principal_id),
+        freeze,
     }
 }
 
@@ -1438,6 +1904,105 @@ mod tests {
         assert!(out.contains("re-scope the worktree"));
     }
 
+    // ────────────── owns implicit scope (Concord P2e) ──────────────
+
+    #[test]
+    fn parse_owns_implicit_globs_none_default_empty_and_trim() {
+        // Unset → default.
+        assert_eq!(
+            parse_owns_implicit_globs(None),
+            vec![".mini-ork/**".to_string()]
+        );
+        // Empty string disables the implicit set.
+        assert!(parse_owns_implicit_globs(Some("")).is_empty());
+        // Trim + drop empties.
+        assert_eq!(
+            parse_owns_implicit_globs(Some(" a/** , , b/*.log ")),
+            vec!["a/**".to_string(), "b/*.log".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_owns_own_kickoff_enabled_only_exact_zero_disables() {
+        assert!(parse_owns_own_kickoff_enabled(None));
+        assert!(!parse_owns_own_kickoff_enabled(Some("0")));
+        assert!(!parse_owns_own_kickoff_enabled(Some(" 0 ")));
+        assert!(parse_owns_own_kickoff_enabled(Some("1")));
+        assert!(parse_owns_own_kickoff_enabled(Some("false")));
+    }
+
+    #[test]
+    fn own_kickoff_covers_positive_and_negative_cases() {
+        // Positives: file name starts with the slug.
+        assert!(own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.md"
+        ));
+        assert!(own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/vt1-mr-relations-r2.md"
+        ));
+
+        // Negatives: wrong dir / wrong slug / wrong extension / wrong id form.
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/other.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/xvt1-mr-relations.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "docs/vt1-mr-relations.md"
+        ));
+        assert!(!own_kickoff_covers(
+            "agent:wt-vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.txt"
+        ));
+        // Non-`agent:wt-` principal id → no own-kickoff coverage.
+        assert!(!own_kickoff_covers(
+            "loop:vt1-mr-relations",
+            "kickoffs/auto/vt1-mr-relations.md"
+        ));
+        // Empty slug (bare `agent:wt-`) → no own-kickoff coverage.
+        assert!(!own_kickoff_covers("agent:wt-", "kickoffs/auto/.md"));
+    }
+
+    #[test]
+    fn owns_implicitly_covered_matches_glob_or_own_kickoff() {
+        // Default implicit globs cover a run-artifact path.
+        let defaults = parse_owns_implicit_globs(None);
+        assert!(owns_implicitly_covered(
+            "agent:wt-vt1",
+            ".mini-ork/runs/r1/impl.log",
+            &defaults,
+            false
+        ));
+        // Empty globs + own_kickoff=false cover neither the run-artifact
+        // nor a same-named kickoff.
+        let empty: Vec<String> = vec![];
+        assert!(!owns_implicitly_covered(
+            "agent:wt-vt1",
+            ".mini-ork/runs/r1/impl.log",
+            &empty,
+            false
+        ));
+        assert!(!owns_implicitly_covered(
+            "agent:wt-vt1",
+            "kickoffs/auto/vt1.md",
+            &empty,
+            false
+        ));
+        // Empty globs + own_kickoff=true still covers the matching kickoff.
+        assert!(owns_implicitly_covered(
+            "agent:wt-vt1",
+            "kickoffs/auto/vt1.md",
+            &empty,
+            true
+        ));
+    }
+
     // ────────────── disk-truth (P1b) ──────────────
 
     #[test]
@@ -1559,7 +2124,7 @@ mod tests {
     #[test]
     fn render_unrecorded_context_changed_uses_present_tense() {
         let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
-        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Changed, ts);
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Changed, ts, None);
         assert!(out.contains("[concord]"));
         assert!(out.contains("`/work/f.txt`"));
         assert!(out.contains("changed on disk"));
@@ -1571,7 +2136,7 @@ mod tests {
     #[test]
     fn render_unrecorded_context_deleted_uses_past_tense() {
         let ts: DateTime<Utc> = "2026-10-03T12:34:56Z".parse().unwrap();
-        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Deleted, ts);
+        let out = render_unrecorded_context(Path::new("/work/f.txt"), DiskDrift::Deleted, ts, None);
         assert!(out.contains("[concord]"));
         assert!(out.contains("`/work/f.txt`"));
         assert!(out.contains("was deleted on disk"));

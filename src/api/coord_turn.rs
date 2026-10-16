@@ -54,6 +54,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tracing::{error, warn};
 
+use crate::api::coord_footprints::glob_match;
 use crate::api::coord_topics;
 use crate::services::coord_store::{
     validate_principal_id, CoordStore, CoordStoreResult, Message, PrincipalUpsert, TurnDigest,
@@ -250,6 +251,70 @@ pub fn digest_enabled() -> bool {
     parse_digest_enabled(std::env::var("CONTEXTNEST_CONCORD_DIGEST").ok().as_deref())
 }
 
+/// Pure parser behind [`intent_alpha`]. Trims, parses as `f32`, and
+/// accepts only finite values in `(0, 1]` — anything else falls back
+/// to [`DEFAULT_INTENT_ALPHA`]. `0` and negatives fail the range
+/// check, `nan` fails `is_finite`, unparseable strings fail the
+/// parse, and `inf` / values above 1.0 fail the upper bound.
+pub fn parse_intent_alpha(raw: Option<&str>) -> f32 {
+    match raw.and_then(|s| s.trim().parse::<f32>().ok()) {
+        Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
+        _ => DEFAULT_INTENT_ALPHA,
+    }
+}
+
+/// Default blend weight for `upsert_intent_blended`. 0.3 mixes the
+/// new prompt at 30% and the stored prior at 70% — conservative
+/// enough that a single off-topic prompt can't drag an established
+/// intent off-topic, while still letting a tight stream of similar
+/// prompts slowly steer the stored vector.
+const DEFAULT_INTENT_ALPHA: f32 = 0.3;
+
+/// Read `CONTEXTNEST_CONCORD_INTENT_ALPHA` fresh on every call. The
+/// per-turn handler reads this once on the request path and moves the
+/// value into the spawned capture task so a test that mutates the
+/// env while a turn is in flight never feeds the task a stale value.
+pub fn intent_alpha() -> f32 {
+    parse_intent_alpha(
+        std::env::var("CONTEXTNEST_CONCORD_INTENT_ALPHA")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Default glob set for paths the per-turn digest drops before the
+/// cap and the count. Auto-memory writes (`MEMORY.md` and friends) are
+/// the loudest contributor in practice — they accumulate per principal
+/// and never affect another agent's plan. The cursor still advances
+/// past them, so dropping them is once-only behaviour.
+const DEFAULT_DIGEST_IGNORE_GLOBS: &str = "**/.claude/projects/*/memory/**";
+
+/// Pure parser behind [`digest_ignore_globs`]: `None` (unset) → the
+/// defaults; a set value is split on ',', trimmed, and stripped of
+/// empties (so "" disables ignores). Unit tests call this directly —
+/// mutating the process env from parallel test threads raced.
+pub fn parse_digest_ignore_globs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or(DEFAULT_DIGEST_IGNORE_GLOBS)
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The per-turn digest ignore-glob list, read fresh from
+/// `CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS` on every call so test
+/// suites can flip it without restarting the binary. Defaults to
+/// [`DEFAULT_DIGEST_IGNORE_GLOBS`] when unset; an explicit empty string
+/// disables ignores.
+pub fn digest_ignore_globs() -> Vec<String> {
+    parse_digest_ignore_globs(
+        std::env::var("CONTEXTNEST_CONCORD_DIGEST_IGNORE_GLOBS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Pure renderer for the turn digest. Returns `(text, path_lines)`:
 /// `text` is the body to splice after the mailbox (empty when there
 /// are no changes), and `path_lines` is the number of per-path lines
@@ -428,7 +493,10 @@ pub fn run_turn(store: &CoordStore, input: &TurnInputWithHeaders) -> CoordStoreR
         // or empty. Take the digest first; if it fails, log and
         // degrade to mailbox-only — do NOT propagate.
         let principal_id_for_digest = principal_id.clone();
-        match store.take_turn_digest(&principal_id_for_digest, DIGEST_MAX_PATHS) {
+        let ignore_globs = digest_ignore_globs();
+        match store.take_turn_digest(&principal_id_for_digest, DIGEST_MAX_PATHS, &|p: &str| {
+            ignore_globs.iter().any(|g| glob_match(g, p))
+        }) {
             Ok(digest) => {
                 if digest_enabled() {
                     let (text, lines) = render_digest(&digest);
@@ -527,6 +595,7 @@ pub async fn coord_turn(
     // UserPromptSubmit. Capture runs even when notices are off so
     // `/api/v1/coord/topic-pairs` has data to calibrate against.
     let mut topic_noticed = false;
+    let mut topic_escalated = false;
     let mut additional_context = outcome.additional_context.clone();
     let mut captured: Option<String> = None;
     let mut compare_pid: Option<String> = None;
@@ -554,11 +623,38 @@ pub async fn coord_turn(
                     .claim_topic_notice(pid, &m.other, dedup, now)
                 {
                     Ok(true) => {
-                        let line = coord_topics::render_topic_notice(
+                        let mut line = coord_topics::render_topic_notice(
                             &m.other,
                             &m.other_text,
                             m.similarity,
                         );
+                        // Concord P4: a topic notice is also a tracked
+                        // overlap keyed by the same sorted `a|b` pair
+                        // convention `claim_topic_notice` already uses.
+                        let mut ids = [pid.to_string(), m.other.clone()];
+                        ids.sort();
+                        let pair_key = format!("{}|{}", ids[0], ids[1]);
+                        match services.coord_store.upsert_overlap(
+                            "topic",
+                            &pair_key,
+                            pid,
+                            Some(&m.other),
+                            now,
+                        ) {
+                            Ok(item) => {
+                                if item.just_escalated {
+                                    topic_escalated = true;
+                                }
+                                line.push_str(&format!(" (overlap O-{})", item.id));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    principal_id = %pid,
+                                    "coord_turn: upsert_overlap topic failed"
+                                );
+                            }
+                        }
                         if additional_context.is_empty() {
                             additional_context = line;
                         } else {
@@ -602,7 +698,7 @@ pub async fn coord_turn(
     // write guard so the metric snapshot is one consistent view.
     // Only take the write guard when there is something to count, so
     // SessionStart and quiet turns stay off the metrics lock.
-    if outcome.digest_lines > 0 || topic_noticed {
+    if outcome.digest_lines > 0 || topic_noticed || topic_escalated {
         let mut m = services.coord_metrics.write().await;
         if outcome.digest_lines > 0 {
             m.coord_digest_lines_total = m
@@ -611,6 +707,9 @@ pub async fn coord_turn(
         }
         if topic_noticed {
             m.coord_topic_notices_total = m.coord_topic_notices_total.saturating_add(1);
+        }
+        if topic_escalated {
+            m.coord_overlaps_escalated_total = m.coord_overlaps_escalated_total.saturating_add(1);
         }
     }
 
@@ -623,15 +722,27 @@ pub async fn coord_turn(
             let store = services.coord_store.clone();
             let pid_owned = pid.clone();
             let text_owned = text.clone();
+            // Read blend knobs on the request path so the spawned
+            // task stays deterministic under ENV_LOCK: tests that flip
+            // these between calls see the change on the next turn,
+            // never mid-flight.
+            let alpha = intent_alpha();
+            let window_secs = coord_topics::topic_window_secs();
             tokio::spawn(async move {
                 match embedding.generate_embedding(&text_owned).await {
                     Ok(v) if !v.is_empty() => {
-                        if let Err(e) = store.upsert_intent(&pid_owned, &text_owned, &v, Utc::now())
-                        {
+                        if let Err(e) = store.upsert_intent_blended(
+                            &pid_owned,
+                            &text_owned,
+                            &v,
+                            Utc::now(),
+                            alpha,
+                            window_secs,
+                        ) {
                             tracing::warn!(
                                 error = %e,
                                 principal_id = %pid_owned,
-                                "coord_turn: upsert_intent failed"
+                                "coord_turn: upsert_intent_blended failed"
                             );
                         }
                     }
