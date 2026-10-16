@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { BrandMark, Icon } from '@/components/atoms';
 import { ProjectScopePicker, SessionScopePicker } from '@/components/ScopeFilters';
-import { useFieldData } from '@/hooks/useFieldData';
+import { basinMinMassFor, useFieldData } from '@/hooks/useFieldData';
 import { useSessions } from '@/hooks/useSessions';
 import type { FieldFragment } from '@/hooks/useFieldData';
 import { api } from '@/lib/api';
@@ -77,6 +77,21 @@ function clientToDesign(
     x: view.tx + fx * (VB_W / view.scale),
     y: view.ty + fy * (VB_H / view.scale),
   };
+}
+
+// Basin labels are snippets of real fragment text, so they can run to
+// the server's 48-char budget. A plate that wide overlaps its
+// neighbours on a 1000×600 canvas, so clamp for display only — the
+// full label still reaches the side panel.
+const LABEL_DISPLAY_CHARS = 34;
+
+function clampLabel(label: string): string {
+  // Array.from iterates code points, so a slice can't split a surrogate
+  // pair (emoji in a fragment's first line).
+  const chars = Array.from(label);
+  return chars.length <= LABEL_DISPLAY_CHARS
+    ? label
+    : `${chars.slice(0, LABEL_DISPLAY_CHARS).join('')}…`;
 }
 
 function clampView(view: ViewState): ViewState {
@@ -332,23 +347,21 @@ function FieldPage() {
       };
     });
 
-    // Basin position = mean of its member fragment positions.
-    const bXY: Record<string, { x: number; y: number; count: number }> = {};
-    for (const f of field.data.fragments) {
-      const proj = f.project;
-      const p = fXY[f.id];
-      if (!p) continue;
-      const acc = bXY[proj] ?? { x: 0, y: 0, count: 0 };
-      acc.x += p.x;
-      acc.y += p.y;
-      acc.count += 1;
-      bXY[proj] = acc;
+    // Basins arrive already projected into this same PCA plane (their
+    // own centroid, see useFieldData) — they just need the identical
+    // affine transform the dots get.
+    //
+    // Keyed by basin **id**. The previous version keyed this map by
+    // `f.project` and looked basins up with `basinXY[b.label]`, which
+    // only ever matched the project-derived fallback basins; every real
+    // attractor basin (labelled by content) hit `undefined` and was
+    // dropped by a `return null`, so the canvas showed dots and no
+    // fields, with no error anywhere.
+    const bXY: Record<string, { x: number; y: number }> = {};
+    for (const [id, raw] of Object.entries(field.data.layout.basinXY)) {
+      bXY[id] = { x: raw.x * s + offsetX, y: raw.y * s + offsetY };
     }
-    const basinPositions: Record<string, { x: number; y: number }> = {};
-    for (const [proj, acc] of Object.entries(bXY)) {
-      basinPositions[proj] = { x: acc.x / acc.count, y: acc.y / acc.count };
-    }
-    return { fragmentXY: fXY, basinXY: basinPositions };
+    return { fragmentXY: fXY, basinXY: bXY };
   }, [field.data]);
 
   // Compute the active fragment set after applying age filter + scrubber.
@@ -512,6 +525,43 @@ function FieldPage() {
 
   const hasEmbeddings = field.data.fragments.some((f) => f.embedding && f.embedding.length > 0);
 
+  const maxBasinMass = useMemo(
+    () => field.data.basins.reduce((m, b) => Math.max(m, b.mass), 1),
+    [field.data.basins],
+  );
+
+  // Halo radius scales with mass *relative to the heaviest basin in the
+  // current response*. Absolute mass is a property of the whole
+  // substrate (the heaviest basin here holds 447 fragments, a demo one
+  // holds 12), so a fixed `sqrt(mass)` scale would draw one enormous
+  // blob that swallows every other halo in the scope.
+  const basinRadius = (mass: number) => 26 + 54 * Math.sqrt(mass / maxBasinMass);
+
+  // Which fragments belong to which basin. The server doesn't ship
+  // membership (that's O(members) per basin), so we derive it the way
+  // the substrate itself scores: nearest centroid by cosine. Used only
+  // to dim non-members when a basin is selected.
+  const basinMembership = useMemo(() => {
+    const m = new Map<string, string>();
+    const basins = field.data.basins.filter((b) => b.centroid && b.centroid.length > 0);
+    if (basins.length === 0) return m;
+    for (const f of field.data.fragments) {
+      if (!f.embedding || f.embedding.length === 0) continue;
+      let best = -Infinity;
+      let bestId: string | null = null;
+      for (const b of basins) {
+        if (b.centroid.length !== f.embedding.length) continue;
+        const sim = cosineSimilarity(f.embedding, b.centroid);
+        if (sim > best) {
+          best = sim;
+          bestId = b.id;
+        }
+      }
+      if (bestId) m.set(f.id, bestId);
+    }
+    return m;
+  }, [field.data.fragments, field.data.basins]);
+
   const fragmentOpacity = (f: FieldFragment): number => {
     if (!visibleIds.has(f.id)) return 0.05;
     // Query-overlay mode takes priority over every other dimming
@@ -529,7 +579,7 @@ function FieldPage() {
     if (selectedFragment) return 0.18;
     if (hovered && hovered.fragmentId === f.id) return 1;
     if (hovered && neighborIds.has(f.id)) return 0.95;
-    if (selectedBasin && f.project !== selectedBasinObj?.label) return 0.18;
+    if (selectedBasin && basinMembership.get(f.id) !== selectedBasin) return 0.18;
     const ageFade = f.ageDays == null ? 0.7 : Math.max(0.35, 1 - f.ageDays / 30);
     return ageFade;
   };
@@ -761,11 +811,11 @@ function FieldPage() {
 
                 <rect width={VB_W} height={VB_H} fill="url(#field-grid)" />
 
-                {/* Basin halos at the centroid of each basin's fragments */}
+                {/* Basin halos at each basin's own projected centroid */}
                 {field.data.basins.map((b) => {
-                  const p = basinXY[b.label];
+                  const p = basinXY[b.id];
                   if (!p) return null;
-                  const r = 40 + Math.min(100, Math.sqrt(b.mass) * 4);
+                  const r = basinRadius(b.mass);
                   return (
                     <circle
                       key={b.id}
@@ -868,7 +918,7 @@ function FieldPage() {
 
                 {/* Basin centroid markers + labels */}
                 {field.data.basins.map((b) => {
-                  const p = basinXY[b.label];
+                  const p = basinXY[b.id];
                   if (!p) return null;
                   const dominantKind = Object.entries(b.by_kind).sort(
                     (a, c) => c[1] - a[1],
@@ -877,6 +927,12 @@ function FieldPage() {
                     ? (KIND_COLOR[dominantKind] ?? KIND_COLOR.unknown)
                     : KIND_COLOR.unknown;
                   const isSel = selectedBasin === b.id;
+                  // The label is a snippet of a member's own words, so
+                  // it can be long: clamp it and paint it on a plate,
+                  // otherwise it runs across neighbouring halos and
+                  // becomes unreadable against the glow.
+                  const labelText = `${clampLabel(b.label)} · ${b.mass}`;
+                  const plateW = labelText.length * 6.3 + 14;
                   return (
                     <g
                       key={b.id}
@@ -898,11 +954,23 @@ function FieldPage() {
                         fill="#0a0a0a"
                         stroke={color}
                         strokeWidth={1.5}
-                        strokeOpacity={0.7}
+                        strokeOpacity={isSel ? 1 : 0.7}
+                      />
+                      <rect
+                        x={-plateW / 2}
+                        y={-25}
+                        width={plateW}
+                        height={16}
+                        rx={3}
+                        fill="#0a0a0a"
+                        fillOpacity={0.78}
+                        stroke={color}
+                        strokeOpacity={isSel ? 0.6 : 0.28}
+                        style={{ pointerEvents: 'none' }}
                       />
                       <text
                         x={0}
-                        y={-14}
+                        y={-13}
                         textAnchor="middle"
                         fill={color}
                         fontFamily="JetBrains Mono, monospace"
@@ -910,7 +978,7 @@ function FieldPage() {
                         letterSpacing={0.4}
                         style={{ pointerEvents: 'none' }}
                       >
-                        {b.label} · {b.mass}
+                        {labelText}
                       </text>
                     </g>
                   );
@@ -974,6 +1042,18 @@ function FieldPage() {
 
                 <div className="field-legend-panel">
                   <div className="legend">
+                    <div className="legend-row">
+                      <span className="legend-label">basin</span>
+                      <span className="legend-decay">
+                        {field.data.basins.length === 0
+                          ? `no attractor cluster ≥ ${basinMinMassFor(focusedSession)} fragments in this scope`
+                          : `${field.data.basins.length} attractor${
+                              field.data.basinsTruncated
+                                ? ` of ${field.data.basinsTotal}`
+                                : ''
+                            } · mass ≥ ${basinMinMassFor(focusedSession)}`}
+                      </span>
+                    </div>
                     <div className="legend-row">
                       <span className="legend-label">filter by kind</span>
                       <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>

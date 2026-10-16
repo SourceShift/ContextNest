@@ -235,6 +235,13 @@ pub struct RetrieveResponse {
     /// `hits` (+ optional `reconstruction`) array they always have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_groups: Option<Vec<SessionGroup>>,
+    /// `Some(false)` when the caller named sessions and **none** of them
+    /// exists in the index — the empty `hits` that came with it describes the
+    /// question, not the substrate. Omitted otherwise, so no existing client
+    /// parses a new field and no status code changes (see the private
+    /// `unknown_session_flag` helper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_known: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,48 +605,227 @@ pub async fn store_with_id(
     Ok(())
 }
 
+/// Which fragments a retrieve call searches, and how each returned hit
+/// learns its owning session.
+///
+/// This replaces the `Option<HashMap<fragment_id, session_id>>` the handler
+/// used to build up front. That map was the whole active index — every
+/// fragment cloned into a fresh owned map (~70 MB on the live substrate) —
+/// while the only consumers were `top_k` hits and the basin/connection
+/// expanders. Global search paid it on every request and read ~0.002% of it.
+enum SessionScope {
+    /// Caller named one session. Hits carry no owner tag, preserving the old
+    /// wire shape for cc_hooks / MCP / single-session dashboard calls.
+    Single,
+    /// Caller named a set of sessions. The pre-filtered owner map is kept:
+    /// the caller's request already bounds it, and expansion needs owner tags
+    /// for siblings it adds.
+    Selected(HashMap<String, String>),
+    /// Global search. Owners are resolved per hit from the index's O(1)
+    /// reverse lookup, so nothing proportional to the substrate is built.
+    Global,
+}
+
+impl SessionScope {
+    /// Owner tag for one fragment, if this scope tags hits at all.
+    async fn owner(&self, services: &ContextNestServices, fragment_id: &str) -> Option<String> {
+        match self {
+            SessionScope::Single => None,
+            SessionScope::Selected(map) => map.get(fragment_id).cloned(),
+            // Equivalent to the old global map: a hit reached the pool because
+            // it was in the *active* index, so the reverse lookup returns the
+            // same session the map would have.
+            SessionScope::Global => services.session_index.find_session(fragment_id).await,
+        }
+    }
+
+    /// Owner tags for the pool, resolved once before any sidecar lock is
+    /// taken — `owner` awaits the index lock, and holding a `fragment_texts`
+    /// or `fragment_metadata` guard across that await buys nothing.
+    async fn owners_for(
+        &self,
+        services: &ContextNestServices,
+        ranked: &[RankedCandidate],
+    ) -> HashMap<String, String> {
+        let mut owners = HashMap::new();
+        match self {
+            SessionScope::Single => {}
+            SessionScope::Selected(map) => {
+                for candidate in ranked {
+                    if let Some(session) = map.get(&candidate.id) {
+                        owners.insert(candidate.id.clone(), session.clone());
+                    }
+                }
+            }
+            SessionScope::Global => {
+                for candidate in ranked {
+                    if let Some(session) = services.session_index.find_session(&candidate.id).await
+                    {
+                        owners.insert(candidate.id.clone(), session);
+                    }
+                }
+            }
+        }
+        owners
+    }
+}
+
+/// A candidate after the ranking factors are applied, before materialization.
+struct RankedCandidate {
+    id: String,
+    /// Final ranking score: cosine × decay × kind weight × density × trust ×
+    /// frequency (or 0.0 for a sidecar-only candidate, which has no embedding
+    /// to score).
+    similarity: f32,
+    importance: f32,
+    canonical: bool,
+}
+
+/// Ranking order shared by the pre-expansion rank and the post-expansion
+/// re-sort: score descending, importance descending as tiebreaker. NaN-safe —
+/// an unorderable score keeps its position rather than poisoning the sort.
+fn by_score_then_importance(sim_a: f32, imp_a: f32, sim_b: f32, imp_b: f32) -> std::cmp::Ordering {
+    sim_b
+        .partial_cmp(&sim_a)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            imp_b
+                .partial_cmp(&imp_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Upper bound on how many scored candidates get materialized into full hits.
+///
+/// Scoring is exact and clone-free over *every* candidate, so this bound does
+/// not approximate the ranking — it only decides how long a tail survives into
+/// materialization and dedupe. With `top_k` ≤ 50 in practice, the default pool
+/// is three to five orders of magnitude larger than anything the caller can
+/// observe, so it is reachable only when a caller asks for a very large
+/// `top_k` or sets the knob deliberately.
+///
+/// - unset ⇒ `max(20 × top_k, 1000)`
+/// - `n > 0` ⇒ exactly `n`
+/// - `0` ⇒ unbounded, reproducing pre-`CONTEXTNEST_RETRIEVE_CANDIDATE_POOL`
+///   behaviour exactly. This is the A/B escape hatch: the change is
+///   reversible without a revert.
+fn candidate_pool_limit(top_k: usize) -> usize {
+    match std::env::var("CONTEXTNEST_RETRIEVE_CANDIDATE_POOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(limit) => limit,
+        None => top_k.saturating_mul(20).max(1000),
+    }
+}
+
+/// `Some(false)` when the caller named sessions and none of them exists in the
+/// index at all; `None` in every other case — the caller named none, or named
+/// sessions that do exist.
+///
+/// This exists because "that session has no matching memories" and "that
+/// session does not exist" produced byte-identical responses: a 200 with an
+/// empty `hits` array, in ~1.4 ms, with no log line. A memory substrate whose
+/// miss is indistinguishable from a typo is a substrate whose users debug the
+/// wrong layer — a mock fixture id from the dashboard's `mock-data.ts` reaching
+/// a real request URL blanked a whole session page while every other signal
+/// said the backend was healthy.
+///
+/// The flag is deliberately one-sided rather than `Some(true)` for a known
+/// session: an absent field already means "this was not a session-existence
+/// problem", so a session that exists but has had everything discarded needs no
+/// new wire state. That keeps the change additive — clients that predate the
+/// field parse the response exactly as they always did.
+async fn unknown_session_flag(
+    services: &ContextNestServices,
+    req: &RetrieveRequest,
+) -> Option<bool> {
+    let named: Vec<&String> = match (&req.session_ids, &req.session_id) {
+        (Some(ids), _) if !ids.is_empty() => ids.iter().collect(),
+        (_, Some(session_id)) => vec![session_id],
+        _ => return None,
+    };
+    let all_sessions = services.session_index.list_all_sessions().await;
+    let known: HashSet<&str> = all_sessions.iter().map(String::as_str).collect();
+    let any_known = named.iter().any(|id| known.contains(id.as_str()));
+    if any_known {
+        return None;
+    }
+    tracing::warn!(
+        sessions = ?named,
+        "retrieve: none of the requested session ids exist in the index; \
+         returning an empty hit set. The session id is almost certainly \
+         wrong — the dashboard's mock fixture ids (`cc-*`) are not real \
+         sessions, and ingest strips that legacy prefix."
+    );
+    Some(false)
+}
+
 /// POST /api/v1/tools/retrieve — fetch relevant memory fragments for a query.
-/// Phase H pipeline:
+///
+/// Pipeline:
 ///   1. Embed the query
 ///   2. Pull active fragment IDs for the session from `session_index`
 ///   3. If `metadata_filter` is set, **prefilter** active IDs against the
 ///      metadata sidecar so non-matching fragments never get hydrated.
 ///      This is the hot-path saver for high-fan-out callers (Inbox UI).
-///   4. For each survivor, fetch the canonical fragment via
-///      `MemoryAttractorManager::get_fragment` and score by cosine similarity
-///      against the query embedding
-///   5. Look up text from `fragment_texts` sidecar
-///   6. Sort by similarity desc, importance desc, truncate to `top_k`
+///   4. Score **every** survivor by cosine similarity in place, under a single
+///      fragment-store read lock — no vector, no fragment clone
+///      (`MemoryAttractorManager::score_candidates`)
+///   5. Apply the ranking factors, rank, then **bound** how many candidates
+///      are materialized (`candidate_pool_limit`)
+///   6. For the pool only, look up text from `fragment_texts` + metadata, then
+///      expand through basins/connections and truncate to `top_k`
+///
+/// Steps 4–6 are what keep a global query (no `session_id`) off the
+/// per-candidate hydration path: every candidate used to cost a 4 KB vector
+/// clone plus a clone of its connection set, and every candidate was
+/// materialized into a full hit — text included — only for the `top_k`
+/// truncation to discard it.
 pub async fn retrieve(
     State(services): State<ContextNestServices>,
     Json(req): Json<RetrieveRequest>,
 ) -> impl IntoResponse {
-    // Branch decision: global/cross-session mode vs single-session mode.
-    // `multi_session` carries a fragment_id → owning session_id map so
-    // each `RetrieveHit` can be tagged with its origin. Single-session
-    // mode is used only when the caller explicitly passes `session_id`,
-    // preserving the old wire shape where hits omit `session_id`.
+    // Branch decision: which fragments this call searches, and how each hit
+    // learns its owning session. Single-session mode is used only when the
+    // caller explicitly passes `session_id`, preserving the old wire shape
+    // where hits omit `session_id`.
     //
     // Important UI contract: omitting both session_id and session_ids means
     // "search globally". The dashboard should not send hundreds of session
     // IDs just to express no filter; that bloats requests and makes global
     // search depend on the frontend's session-list freshness.
-    let multi_session: Option<HashMap<String, String>> = match req.session_ids.as_ref() {
+    let (scope, active_ids): (SessionScope, Vec<String>) = match req.session_ids.as_ref() {
         Some(ids) if !ids.is_empty() => {
             let wanted: HashSet<&String> = ids.iter().collect();
             // One read-lock snapshot, then filter in-process — same
             // pattern the inbox endpoint uses for its cross-session feed.
+            // The map is kept as the scope: the caller's own list bounds it,
+            // and expansion needs owner tags for the siblings it adds.
             let all = services.session_index.active_fragments_session_map().await;
             let map: HashMap<String, String> = all
                 .into_iter()
                 .filter(|(_, sess)| wanted.contains(sess))
                 .collect();
-            Some(map)
+            let candidates: Vec<String> = map.keys().cloned().collect();
+            (SessionScope::Selected(map), candidates)
         }
-        _ if req.session_id.is_none() => {
-            Some(services.session_index.active_fragments_session_map().await)
+        // Global search: one pass over the active index for the candidate
+        // list, nothing proportional to the substrate for owner tagging.
+        _ if req.session_id.is_none() => (
+            SessionScope::Global,
+            services.session_index.active_fragment_ids().await,
+        ),
+        _ => {
+            let session_id = req
+                .session_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+            (
+                SessionScope::Single,
+                services.session_index.list_active(&session_id).await,
+            )
         }
-        _ => None,
     };
 
     let query_embedding = match services.embedding.generate_embedding(&req.query).await {
@@ -651,27 +837,26 @@ pub async fn retrieve(
                     hits: Vec::new(),
                     reconstruction: None,
                     session_groups: None,
+                    session_known: None,
                 }),
             );
         }
     };
 
-    let active_ids: Vec<String> = if let Some(map) = multi_session.as_ref() {
-        map.keys().cloned().collect()
-    } else {
-        let session_id = req
-            .session_id
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SESSION.to_string());
-        services.session_index.list_active(&session_id).await
-    };
     if active_ids.is_empty() {
+        // Same 200 + empty-hits shape as ever (cc_hooks, MCP and the dashboard
+        // all parse it), but a caller that *named* sessions and got nothing
+        // back can now tell "no such session" from "nothing matches". No
+        // status-code change: surfacing a client bug as a 4xx here would break
+        // the unknown-session handling the existing callers rely on.
+        let session_known = unknown_session_flag(&services, &req).await;
         return (
             StatusCode::OK,
             Json(RetrieveResponse {
                 hits: Vec::new(),
                 reconstruction: None,
                 session_groups: None,
+                session_known,
             }),
         );
     }
@@ -734,141 +919,183 @@ pub async fn retrieve(
     };
 
     if candidate_ids.is_empty() {
+        // The session exists and the filter is what emptied the set, so
+        // `session_known` stays absent: this is a legitimate empty answer.
         return (
             StatusCode::OK,
             Json(RetrieveResponse {
                 hits: Vec::new(),
                 reconstruction: None,
                 session_groups: None,
+                session_known: None,
             }),
         );
     }
 
-    // Phase 1: hydrate canonical fragments + score. Hold *no* `fragment_texts`
-    // lock during this loop — `get_fragment` takes `fragment_store.read()` so
-    // concurrent `store`/`update` writers can still progress on the text
-    // sidecar. (Phase-H review finding 2.2: prior version held the
-    // fragment_texts read lock across the entire scan.)
+    // Phase 1: score **every** candidate in place. This takes one
+    // fragment-store read lock for the whole batch, computes the query norm
+    // once, and clones neither the embedding nor the connection set — see
+    // `MemoryAttractorManager::score_candidates`. It holds *no*
+    // `fragment_texts` lock, so concurrent `store`/`update` writers still
+    // progress on the text sidecar (Phase-H review finding 2.2).
     //
-    // Sidecar fallback rationale: after a sidecars-only WAL replay (the
-    // default startup mode) the canonical attractor store is empty,
-    // even though `session_index` + `fragment_metadata` +
-    // `fragment_texts` are all repopulated. Without a fallback, every
-    // `retrieve` against a replayed substrate returned zero hits — the
-    // dashboard's per-section views silently went blank while the inbox
-    // showed identical data via a different endpoint. We track which
-    // candidate IDs the canonical store could not produce and rebuild
-    // their hits from the sidecars in Phase 2. similarity is set to 0
-    // for these (no embedding to compare); they sort to the bottom of
-    // the result set behind any genuinely scored hit.
-    let mut hydrated: Vec<(MemoryFragment, f32)> = Vec::with_capacity(candidate_ids.len());
-    let mut sidecar_only_ids: Vec<String> = Vec::new();
-    for id in &candidate_ids {
-        match services.attractor_manager.get_fragment(id).await {
-            Ok(Some(fragment)) => {
-                let similarity = services
-                    .embedding
-                    .calculate_similarity(&query_embedding, &fragment.content);
-                hydrated.push((fragment, similarity));
-            }
-            // SessionIndex says it's active but manager doesn't have it.
-            // This is the post-WAL-replay case OR a transient index drift
-            // race. Either way, treat the sidecar as the source of truth
-            // and synthesize a minimal hit downstream.
-            Ok(None) | Err(_) => sidecar_only_ids.push(id.clone()),
+    // Sidecar fallback: after a sidecars-only WAL replay (the default startup
+    // mode) the canonical attractor store is empty even though `session_index`
+    // + `fragment_metadata` + `fragment_texts` are all repopulated. Without a
+    // fallback, every `retrieve` against a replayed substrate returned zero
+    // hits — the dashboard's per-section views silently went blank while the
+    // inbox showed identical data via a different endpoint. Candidates the
+    // store cannot produce come back `canonical: false` and are rebuilt from
+    // the sidecars below, at similarity 0.0 (no embedding to compare), so they
+    // sort behind every genuinely scored hit.
+    let scored_candidates = services
+        .attractor_manager
+        .score_candidates(&candidate_ids, &query_embedding)
+        .await;
+
+    // Apply the ranking factors *before* choosing what to materialize. Every
+    // factor below is a function of the metadata sidecar alone — age decay,
+    // kind signal weight, content density, provenance trust, retrieval
+    // frequency — so the final score is known without the text sidecar. That
+    // is what lets the pool bound sit on the *final* ranking rather than a
+    // pre-multiplier approximation: `kind_weight` can zero a high-cosine
+    // boilerplate fragment, and bounding on raw cosine would let it hold a
+    // pool slot it should never have had.
+    let mut ranked: Vec<RankedCandidate> = Vec::with_capacity(scored_candidates.len());
+    {
+        let metadata = services.fragment_metadata.read().await;
+        // `score_candidates` is positional: `scored[i]` belongs to
+        // `candidate_ids[i]`. The id lives in the input slice, not in the
+        // score — that is what makes the batch a batch.
+        for (id, candidate) in candidate_ids.iter().zip(scored_candidates) {
+            let fragment_meta = metadata.get(id);
+            let similarity = if candidate.canonical {
+                // Phase 2 of the neural-field epic: apply age-based decay to
+                // cosine similarity. Fragments that haven't been read in a
+                // long time score lower than recent ones with identical
+                // content, mirroring the "forgetting curve" that makes a
+                // memory substrate feel alive.
+                let decay = fragment_meta.map(decay_multiplier).unwrap_or(1.0);
+                // D2 — kind-aware signal weight. UserContent kinds keep
+                // full signal (1.0×); SystemState kinds halve (0.5×);
+                // Boilerplate (initial_prompt_window etc.) zeroes out
+                // (0.0×) — effectively excluded from ranking without
+                // needing every caller to pass `exclude_kinds`. Env
+                // overrides via CONTEXTNEST_KIND_WEIGHT_<KIND_UPPER>.
+                let kind_weight = fragment_meta
+                    .and_then(|m| m.get("kind"))
+                    .and_then(|v| v.as_str())
+                    .map(crate::services::kind_registry::signal_weight)
+                    .unwrap_or(1.0);
+                // Option A — content_density multiplier. Computed at
+                // consolidation time and stored in metadata as
+                // `_cn_content_density` (f64 ∈ [0,1]). Discriminates
+                // terminology-bearing fragments ("arxiv:2603.16131" → ~0.2)
+                // from content-bearing ones ("Pulled 200 May 2026 papers
+                // through jina ranker" → ~0.7). Legacy fragments without
+                // the field fall back to neutral 1.0 — they get a fair
+                // ranking until the next consolidation pass populates the
+                // density. Weight knob:
+                //   CONTEXTNEST_RETRIEVE_DENSITY_WEIGHT (default 1.0).
+                // A value of 0.0 turns the multiplier off entirely
+                // (returns neutral 1.0 regardless of stored density) —
+                // useful for A/B verification.
+                let density = fragment_meta
+                    .and_then(|m| m.get("_cn_content_density"))
+                    .and_then(|v| v.as_f64())
+                    .map(|d| d as f32)
+                    .map(|d| apply_density_weight(d, *density_weight_cached()))
+                    .unwrap_or(1.0);
+                // Trust weight — demote self-reported claims the ingest
+                // extractor could not ground against a real tool receipt.
+                // `provenance` (set on Verification records) ranks
+                // observed > partial > claimed/absent/contradicted. Records
+                // without the tag (the vast majority) score a neutral 1.0,
+                // so this is backward-compatible. Knobs:
+                //   CONTEXTNEST_RETRIEVE_TRUST_<TIER>.
+                let trust = fragment_meta.map(provenance_weight).unwrap_or(1.0);
+                // T5 (arXiv:2606.12945) — frequency-of-use boost. Fragments
+                // that have been retrieved often are more valuable than
+                // those that have never been used. Logarithmic scaling so
+                // the boost saturates: a 10x-used fragment isn't 10x
+                // better than a 1x-used one. Neutral 1.0 for fragments
+                // that were never retrieved (retrieval_count missing / 0).
+                // Weight knob: CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT
+                // (default 0.1). Set 0.0 to disable.
+                let frequency = fragment_meta.map(frequency_multiplier).unwrap_or(1.0);
+                // Multiplication order is load-bearing for float equality
+                // with the pre-refactor ranking; keep it as written.
+                candidate.similarity * decay * kind_weight * density * trust * frequency
+            } else {
+                0.0
+            };
+            ranked.push(RankedCandidate {
+                id: id.clone(),
+                similarity,
+                importance: candidate.importance,
+                canonical: candidate.canonical,
+            });
         }
     }
 
-    // Phase 2: bulk text + metadata lookup for survivors only. Locks scale
-    // with the post-filter set, not the session size. Same map is used
-    // for both hydrated (canonical) and sidecar-only hits so we acquire
-    // each read lock exactly once.
+    // Rank by the same comparator the tail of this handler applies after
+    // expansion, so the pool boundary and the response ordering agree. It is
+    // applied to the *final* score, so unlike a raw-cosine pre-sort it cannot
+    // promote a fragment the multipliers are about to zero.
+    ranked.sort_by(|a, b| {
+        by_score_then_importance(a.similarity, a.importance, b.similarity, b.importance)
+    });
+
+    // Bound materialization. Every candidate above was scored exactly; this
+    // decides only how many get turned into hits. With `top_k` ≤ 50 in
+    // practice the default pool is 20×–1000× larger than anything the caller
+    // can observe, so the returned ranking matches the unbounded one unless
+    // the caller asks for a very large `top_k` or sets the knob.
+    //
+    // Known edge: dedupe runs over the pool, so when a logical group straddles
+    // the pool boundary the surviving representative is whichever member fell
+    // inside it. Group members are near-identical text and therefore adjacent
+    // in the ranking, so this can only bite around rank ≈ pool;
+    // `CONTEXTNEST_RETRIEVE_CANDIDATE_POOL=0` removes the edge entirely.
+    let pool_limit = candidate_pool_limit(req.top_k);
+    if pool_limit > 0 && ranked.len() > pool_limit {
+        ranked.truncate(pool_limit);
+    }
+
+    // Owner tags for the pool only, resolved before any sidecar lock is taken
+    // so no guard is ever held across an await.
+    let owners = scope.owners_for(&services, &ranked).await;
+
+    // Phase 2: bulk text + metadata lookup for the pool only. Locks scale
+    // with the pool, not the session size, and each is acquired exactly once
+    // for both canonical and sidecar-only hits.
     let texts = services.fragment_texts.read().await;
     let metadata = services.fragment_metadata.read().await;
-    // Phase 2 of the neural-field epic: apply age-based decay to cosine
-    // similarity. Fragments that haven't been read in a long time score
-    // lower than recent ones with identical content, mirroring the
-    // "forgetting curve" that makes a memory substrate feel alive.
-    // Sidecar-only hits keep their similarity at 0 (no embedding to
-    // decay) and never reach this branch.
-    let mut scored: Vec<RetrieveHit> = hydrated
-        .into_iter()
-        .map(|(fragment, base_similarity)| {
-            let fragment_meta = metadata.get(&fragment.id);
-            let content = texts.get(&fragment.id).cloned().unwrap_or_default();
-            let owner = multi_session
-                .as_ref()
-                .and_then(|m| m.get(&fragment.id).cloned());
-            let decay = fragment_meta.map(decay_multiplier).unwrap_or(1.0);
-            // D2 — kind-aware signal weight. UserContent kinds keep
-            // full signal (1.0×); SystemState kinds halve (0.5×);
-            // Boilerplate (initial_prompt_window etc.) zeroes out
-            // (0.0×) — effectively excluded from ranking without
-            // needing every caller to pass `exclude_kinds`. Env
-            // overrides via CONTEXTNEST_KIND_WEIGHT_<KIND_UPPER>.
-            let kind_weight = fragment_meta
-                .and_then(|m| m.get("kind"))
-                .and_then(|v| v.as_str())
-                .map(crate::services::kind_registry::signal_weight)
-                .unwrap_or(1.0);
-            // Option A — content_density multiplier. Computed at
-            // consolidation time and stored in metadata as
-            // `_cn_content_density` (f64 ∈ [0,1]). Discriminates
-            // terminology-bearing fragments ("arxiv:2603.16131" → ~0.2)
-            // from content-bearing ones ("Pulled 200 May 2026 papers
-            // through jina ranker" → ~0.7). Legacy fragments without
-            // the field fall back to neutral 1.0 — they get a fair
-            // ranking until the next consolidation pass populates the
-            // density. Weight knob:
-            //   CONTEXTNEST_RETRIEVE_DENSITY_WEIGHT (default 1.0).
-            // A value of 0.0 turns the multiplier off entirely
-            // (returns neutral 1.0 regardless of stored density) —
-            // useful for A/B verification.
-            let density = fragment_meta
-                .and_then(|m| m.get("_cn_content_density"))
-                .and_then(|v| v.as_f64())
-                .map(|d| d as f32)
-                .map(|d| apply_density_weight(d, *density_weight_cached()))
-                .unwrap_or(1.0);
-            // Trust weight — demote self-reported claims the ingest
-            // extractor could not ground against a real tool receipt.
-            // `provenance` (set on Verification records) ranks
-            // observed > partial > claimed/absent/contradicted. Records
-            // without the tag (the vast majority) score a neutral 1.0,
-            // so this is backward-compatible. Knobs:
-            //   CONTEXTNEST_RETRIEVE_TRUST_<TIER>.
-            let trust = fragment_meta.map(provenance_weight).unwrap_or(1.0);
-            // T5 (arXiv:2606.12945) — frequency-of-use boost. Fragments
-            // that have been retrieved often are more valuable than
-            // those that have never been used. Logarithmic scaling so
-            // the boost saturates: a 10x-used fragment isn't 10x
-            // better than a 1x-used one. Neutral 1.0 for fragments
-            // that were never retrieved (retrieval_count missing / 0).
-            // Weight knob: CONTEXTNEST_RETRIEVE_FREQUENCY_WEIGHT
-            // (default 0.1). Set 0.0 to disable.
-            let frequency = fragment_meta.map(frequency_multiplier).unwrap_or(1.0);
-            RetrieveHit {
-                id: fragment.id,
-                content,
-                importance: fragment.importance,
-                similarity: base_similarity * decay * kind_weight * density * trust * frequency,
+    let mut scored: Vec<RetrieveHit> = Vec::with_capacity(ranked.len());
+    for candidate in &ranked {
+        let fragment_meta = metadata.get(&candidate.id);
+        let owner = owners.get(&candidate.id).cloned();
+        if candidate.canonical {
+            scored.push(RetrieveHit {
+                id: candidate.id.clone(),
+                content: texts.get(&candidate.id).cloned().unwrap_or_default(),
+                importance: candidate.importance,
+                similarity: candidate.similarity,
                 metadata: fragment_meta.cloned().unwrap_or_default(),
                 session_id: owner,
-            }
-        })
-        .collect();
-
-    for id in &sidecar_only_ids {
-        // Skip fragments that have neither text nor metadata — that's a
-        // truly orphaned index entry, not a sidecar-only fragment.
-        let content = texts.get(id).cloned();
-        let meta = metadata.get(id).cloned();
+            });
+            continue;
+        }
+        // Sidecar-only fallback: rebuild the hit from the sidecars. Skip
+        // fragments that have neither text nor metadata — that's a truly
+        // orphaned index entry, not a sidecar-only fragment.
+        let content = texts.get(&candidate.id).cloned();
+        let meta = fragment_meta.cloned();
         if content.is_none() && meta.is_none() {
             continue;
         }
-        let owner = multi_session.as_ref().and_then(|m| m.get(id).cloned());
         scored.push(RetrieveHit {
-            id: id.clone(),
+            id: candidate.id.clone(),
             content: content.unwrap_or_default(),
             // Importance default mirrors `restore_sidecars_bulk` — neutral
             // 0.5 because we don't have the canonical fragment's value.
@@ -884,18 +1111,6 @@ pub async fn retrieve(
     drop(texts);
     drop(metadata);
 
-    // Sort by similarity desc, then importance desc as tiebreaker.
-    scored.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.importance
-                    .partial_cmp(&a.importance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
-
     // Phase 4 of the neural-field epic: basin-aware expansion. Look up
     // the top hit's basin and surface its other members at a boosted
     // similarity. Gives "you've worked on this topic before"
@@ -903,7 +1118,7 @@ pub async fn retrieve(
     // word-match the query but are semantically siblings of the top
     // hit. Configurable via `CONTEXTNEST_RETRIEVE_BASIN_BOOST` (0.0
     // disables); see `basin_aware_expand` for the full design.
-    basin_aware_expand(&services, &mut scored, &candidate_ids, &multi_session).await;
+    basin_aware_expand(&services, &mut scored, &candidate_ids, &scope).await;
 
     // Phase 5 of the neural-field epic: ConnectionNetwork expansion.
     // Pull the top hit's 1-hop learned-graph neighbors (populated by
@@ -913,19 +1128,12 @@ pub async fn retrieve(
     // basin expansion: basins cluster by embedding proximity, the
     // connection network records "fragments that co-occurred" — the
     // two signals overlap but aren't identical.
-    connection_aware_expand(&services, &mut scored, &candidate_ids, &multi_session).await;
+    connection_aware_expand(&services, &mut scored, &candidate_ids, &scope).await;
 
-    // Re-sort because expansion may have inserted higher-scoring
-    // basin siblings than the post-truncate tail of the original set.
+    // Re-sort because expansion may have inserted higher-scoring basin
+    // siblings than the tail of the original set.
     scored.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.importance
-                    .partial_cmp(&a.importance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        by_score_then_importance(a.similarity, a.importance, b.similarity, b.importance)
     });
     dedupe_logical_hits(&mut scored);
     scored.truncate(req.top_k);
@@ -999,22 +1207,24 @@ pub async fn retrieve(
     // multi-session reconstruction would need different semantics
     // (cross-session chains aren't well-defined for the current
     // ReconstructionProtocol).
-    let reconstruction =
-        if multi_session.is_none() && auto_reconstruct_enabled() && is_chain_query(&req.query) {
-            let session_for_reconstruct = req
-                .session_id
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SESSION.to_string());
-            compute_reconstruction(
-                &services,
-                &query_embedding,
-                &session_for_reconstruct,
-                auto_reconstruct_depth(),
-            )
-            .await
-        } else {
-            None
-        };
+    let reconstruction = if matches!(scope, SessionScope::Single)
+        && auto_reconstruct_enabled()
+        && is_chain_query(&req.query)
+    {
+        let session_for_reconstruct = req
+            .session_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SESSION.to_string());
+        compute_reconstruction(
+            &services,
+            &query_embedding,
+            &session_for_reconstruct,
+            auto_reconstruct_depth(),
+        )
+        .await
+    } else {
+        None
+    };
 
     // Option B — session rollup. Build session_groups when the caller
     // passed `group_by: "session"`. Computed AFTER all scoring is done
@@ -1034,6 +1244,9 @@ pub async fn retrieve(
             hits: scored,
             reconstruction,
             session_groups,
+            // Reaching here means the candidate set was non-empty, so the
+            // "does this session exist" question never arose.
+            session_known: None,
         }),
     )
 }
@@ -1150,7 +1363,7 @@ async fn basin_aware_expand(
     services: &ContextNestServices,
     scored: &mut Vec<RetrieveHit>,
     candidate_ids: &[String],
-    multi_session: &Option<HashMap<String, String>>,
+    scope: &SessionScope,
 ) {
     let boost: f32 = std::env::var("CONTEXTNEST_RETRIEVE_BASIN_BOOST")
         .ok()
@@ -1175,10 +1388,15 @@ async fn basin_aware_expand(
     }
     let top_id = top.id.clone();
 
-    let snapshots = services.attractor_manager.list_basin_snapshots().await;
-    let Some(basin) = snapshots
-        .into_iter()
-        .find(|s| s.fragment_ids.contains(&top_id))
+    // Membership of the one basin containing the top hit. This used to be
+    // `list_basin_snapshots().into_iter().find(..)`, which projected **every**
+    // basin — centroids included — to answer a question about one of them:
+    // ~1.16 GB of allocation on the live substrate, per retrieve, including
+    // session-scoped ones.
+    let Some(members) = services
+        .attractor_manager
+        .basin_membership_containing(&top_id)
+        .await
     else {
         return;
     };
@@ -1193,7 +1411,7 @@ async fn basin_aware_expand(
         // block end so the rest of retrieve() can reacquire freely.
         let texts = services.fragment_texts.read().await;
         let metadata = services.fragment_metadata.read().await;
-        for sib_id in &basin.fragment_ids {
+        for sib_id in &members {
             if additions.len() >= max_expansion {
                 break;
             }
@@ -1223,16 +1441,22 @@ async fn basin_aware_expand(
             if crate::services::kind_registry::is_boilerplate(sib_kind) {
                 continue;
             }
-            let owner = multi_session.as_ref().and_then(|m| m.get(sib_id).cloned());
             additions.push(RetrieveHit {
                 id: sib_id.clone(),
                 content,
                 importance: 0.5,
                 similarity: boosted,
                 metadata: meta,
-                session_id: owner,
+                // Filled in below, once the sidecar locks are released.
+                session_id: None,
             });
         }
+    }
+    // Owner tags are resolved after the sidecar read guards drop: `owner`
+    // awaits the session index's lock, and holding a text/metadata guard
+    // across that await is neither necessary nor safe.
+    for hit in additions.iter_mut() {
+        hit.session_id = scope.owner(services, &hit.id).await;
     }
     scored.extend(additions);
 }
@@ -1268,7 +1492,7 @@ async fn connection_aware_expand(
     services: &ContextNestServices,
     scored: &mut Vec<RetrieveHit>,
     candidate_ids: &[String],
-    multi_session: &Option<HashMap<String, String>>,
+    scope: &SessionScope,
 ) {
     let boost: f32 = std::env::var("CONTEXTNEST_RETRIEVE_CONNECTION_BOOST")
         .ok()
@@ -1338,18 +1562,21 @@ async fn connection_aware_expand(
             if crate::services::kind_registry::is_boilerplate(nbr_kind) {
                 continue;
             }
-            let owner = multi_session
-                .as_ref()
-                .and_then(|m| m.get(neighbor_id).cloned());
             additions.push(RetrieveHit {
                 id: neighbor_id.clone(),
                 content,
                 importance: 0.5,
                 similarity: top_sim * weight * boost,
                 metadata: meta,
-                session_id: owner,
+                // Filled in below, once the sidecar locks are released.
+                session_id: None,
             });
         }
+    }
+    // Owner tags after the sidecar read guards drop — see the same pattern in
+    // `basin_aware_expand`.
+    for hit in additions.iter_mut() {
+        hit.session_id = scope.owner(services, &hit.id).await;
     }
     scored.extend(additions);
 }
@@ -2454,6 +2681,22 @@ pub fn create_tools_router() -> Router<ContextNestServices> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_pool_default_is_generous_relative_to_top_k() {
+        // The bound is a tail bound, not a scoring approximation: it must
+        // never bite at any top_k a caller can realistically observe. Only the
+        // default is asserted here; the operator override is exercised
+        // end-to-end rather than through the process environment, because
+        // `cargo test` runs these in-process and an env write would leak
+        // across tests.
+        if std::env::var("CONTEXTNEST_RETRIEVE_CANDIDATE_POOL").is_ok() {
+            return;
+        }
+        assert_eq!(candidate_pool_limit(10), 1000, "20×10 is below the floor");
+        assert_eq!(candidate_pool_limit(50), 1000, "20×50 is at the floor");
+        assert_eq!(candidate_pool_limit(200), 4000, "above the floor it scales");
+    }
 
     #[test]
     fn chain_phrases_trigger_is_chain_query() {
