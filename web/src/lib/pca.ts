@@ -30,7 +30,38 @@ export type Pca2dResult = {
   coords: Array<{ x: number; y: number }>;
   /** Variance captured by PC1 + PC2 / total variance. 0..1. */
   varianceRatio: number;
+  /**
+   * The basis the coords above were produced with. Any vector that
+   * wasn't part of the input — a basin centroid, say — can be projected
+   * into the SAME 2D plane via `projectVector`, which is the only way
+   * to place a marker at a genuine position in this space rather than
+   * averaging the positions of whichever members happened to load.
+   * Empty when the input was degenerate (fewer than 2 rows).
+   */
+  mean: number[];
+  pc1: number[];
+  pc2: number[];
 };
+
+/**
+ * Project one vector into a basis previously produced by `pca2d`.
+ * Returns null when the vector doesn't match the basis's dimension —
+ * embedding spaces change (256-d TF-IDF vs 1024-d hosted models), and a
+ * mismatch means the two vectors are not comparable at all.
+ */
+export function projectVector(
+  vec: number[],
+  mean: number[],
+  pc1: number[],
+  pc2: number[],
+): { x: number; y: number } | null {
+  const dim = mean.length;
+  if (dim === 0 || vec.length !== dim || pc1.length !== dim || pc2.length !== dim) {
+    return null;
+  }
+  const centered = vec.map((v, i) => v - mean[i]);
+  return { x: dot(centered, pc1), y: dot(centered, pc2) };
+}
 
 const ITERS = 60;
 
@@ -109,6 +140,9 @@ export function pca2d(rows: number[][]): Pca2dResult {
     return {
       coords: rows.map(() => ({ x: 0, y: 0 })),
       varianceRatio: 0,
+      mean: [],
+      pc1: [],
+      pc2: [],
     };
   }
 
@@ -157,7 +191,7 @@ export function pca2d(rows: number[][]): Pca2dResult {
   const varianceRatio =
     totalVar > 1e-12 ? Math.min(1, (e1 + e2) / totalVar) : 0;
 
-  return { coords, varianceRatio };
+  return { coords, varianceRatio, mean, pc1, pc2 };
 }
 
 /**
