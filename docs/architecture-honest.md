@@ -82,18 +82,29 @@ POST /api/v1/tools/retrieve { query, top_k, session_id, metadata_filter? }
   → embed query
   → active_ids = session_index.list_active(session_id)
   → candidate_ids = active_ids filtered by metadata_filter
-  → for each candidate, hydrate canonical MemoryFragment via
-        attractor_manager.get_fragment(id)
+  → for every candidate, score in place:
+        attractor_manager.score_candidates(candidate_ids, query_emb)
+    (one fragment-store read lock, query norm computed once, no vector
+     and no connection-set clone — this replaced one get_fragment(id)
+     per candidate, whose hydrate cloned a 4 KB Vec<f32> plus a full
+     HashSet<String> each, then discarded all but top_k of them)
     (sidecar fallback for ids the canonical store didn't have yet —
      e.g. fragment ingested 0.5s ago, worker hasn't reached it; we
      return content from sidecars at similarity = 0)
-  → for each canonical hit:
+  → for each candidate:
         base_similarity = cosine(query_emb, fragment.embedding)
-        decay = decay_multiplier(metadata)  ← Phase 2
-        final_similarity = base × decay
-  → sort by similarity desc
+        final_similarity = base × decay × kind_weight
+                                 × density × trust × frequency
+  → sort by final_similarity desc, then bound materialization to
+        max(20 × top_k, 1000)   (CONTEXTNEST_RETRIEVE_CANDIDATE_POOL)
+  → materialize the pool only: text + metadata from the sidecars
+    (scoring is exact over the whole candidate set; the bound decides
+     only how long a tail gets text pulled — see the knob table)
   ─── Phase 4 basin expansion ───
   → find which basin contains scored[0].id
+    (basin_membership_containing — scans memberships under one read
+     lock; list_basin_snapshots would clone every basin's centroid,
+     ~1.16 GB per retrieve on the live substrate, to answer this)
   → for each basin sibling not already in scored AND in candidate_ids:
         append at similarity = top_sim × 0.7 (CONTEXTNEST_RETRIEVE_BASIN_BOOST)
   ─── Phase 5 connection expansion ───
@@ -136,6 +147,7 @@ All optional, env-overridable, sensible defaults:
 | `CONTEXTNEST_RETRIEVE_CONNECTION_MIN_WEIGHT` | 0.1 | 5 | Floor on edge weight |
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT` | true | 6 | Auto-attach reconstruction on chain queries |
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH` | 5 | 6 | top-N fragments stitched in the chain |
+| `CONTEXTNEST_RETRIEVE_CANDIDATE_POOL` | unset → `max(20 × top_k, 1000)` | 4–6 | Upper bound on candidates **materialized** into hits. Every candidate is still scored exactly (one store read-lock, query norm computed once, no vector clone); this bounds only how many get text + metadata pulled from the sidecars. `0` = unbounded, i.e. the pre-knob behaviour |
 | `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | disk-first | LRU bound on the text→vector response cache (~16 MB at 1024-d); `0` disables it |
 | `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | disk-first | Directory for the operator's file-backed vector arena. Derived state: created fresh and unlinked at boot, rebuilt from the checkpoint. Pages are written back to the file under memory pressure instead of compressed/swapped |
 | `CONTEXTNEST_VOLUME_WATCH` | on | boot | `0` disables the data-volume watchdog. Armed on the WAL's parent directory before any boot work; samples `st_dev` + `st_ino` every 5 s and exits with code 75 (`EXIT_VOLUME_LOST`) after 3 consecutive misses (~15 s). See "Data-volume resilience" below |
