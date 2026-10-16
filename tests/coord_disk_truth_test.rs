@@ -26,6 +26,10 @@
 //!   paragraph (and no metric bump).
 //! - dod10: invariant — no `permissionDecision` in any response, every
 //!   response is 200.
+//! - p1c: a Write on a deleted file is silent (no metric bump, no
+//!   "deleted on disk" text); Edit on a deleted file still reports
+//!   ("was deleted on disk"); Write on a changed file still reports
+//!   ("changed on disk").
 //!
 //! Every test takes ENV_LOCK first and holds it for its whole body so
 //! env mutation cannot race with sibling tests in the same binary
@@ -913,4 +917,216 @@ async fn dod9_no_prior_caller_footprint_no_signal() {
         .as_str()
         .unwrap_or("");
     assert!(!ctx.contains("changed on disk"));
+}
+
+// ─────────────────── p1c — Write on deleted file is silent ───────────────────
+
+/// A Write tool replaces the whole file, so a prior deletion breaks no
+/// premise. Concord P1c must NOT emit "was deleted on disk", must NOT
+/// set `unrecorded_change`, and must NOT bump the
+/// `coord_precheck_unrecorded_total` metric.
+#[tokio::test]
+async fn p1c_write_on_deleted_file_is_silent() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&[
+        ("CONTEXTNEST_CONCORD_DISK_CHECK", None),
+        ("CONTEXTNEST_CONCORD_DISK_GRACE_MS", Some("0")),
+        ("CONTEXTNEST_CONCORD_HOT_MODE", None),
+        ("CONTEXTNEST_CONCORD_HOT_GLOBS", None),
+        ("CONTEXTNEST_CONCORD_HOT_TTL_SECS", None),
+        ("CONTEXTNEST_CONCORD_OWNS_MODE", None),
+        ("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", None),
+    ]);
+    let h = make_harness().await;
+    let dir = h.tmp.path().to_path_buf();
+    let f = dir.join("f.txt");
+    write_file(&f, b"v1");
+    let cwd = dir.to_string_lossy().to_string();
+
+    // Canonicalize BEFORE removal so the precheck can still resolve
+    // the path. canonicalize fails on a missing file, so this must
+    // happen first.
+    let canonical = std::fs::canonicalize(&f).expect("canonical");
+
+    post_footprint(
+        &h.server,
+        &FootprintPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Read".to_string(),
+            path: canonical.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    std::fs::remove_file(&canonical).expect("rm");
+
+    let before = metrics(&h.server).await;
+    let before_unrec = before["coord_precheck_unrecorded_total"]
+        .as_u64()
+        .unwrap_or(0);
+
+    // Precheck a Write on the deleted file — must be silent.
+    let res = post_precheck(
+        &h.server,
+        &PrecheckPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Write".to_string(),
+            path: canonical.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    assert_eq!(
+        res["unrecorded_change"],
+        json!(false),
+        "Write on deleted file: unrecorded_change must be false; got {res}"
+    );
+    assert_eq!(
+        res["warn"],
+        json!(false),
+        "Write on deleted file: warn must be false; got {res}"
+    );
+    let ctx = res["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !ctx.contains("deleted on disk"),
+        "Write on deleted file must not mention deletion; got: {ctx}"
+    );
+    assert!(
+        !ctx.contains("changed on disk"),
+        "Write on deleted file must not mention change; got: {ctx}"
+    );
+
+    let after = metrics(&h.server).await;
+    let after_unrec = after["coord_precheck_unrecorded_total"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        after_unrec, before_unrec,
+        "Write on deleted file must NOT bump coord_precheck_unrecorded_total"
+    );
+}
+
+/// Edit on a deleted file still reports "was deleted on disk" — the
+/// suppression targets (Deleted, Write) only; Edit and the other write-
+/// class tools must keep the existing paragraph + flag.
+#[tokio::test]
+async fn p1c_edit_on_deleted_file_still_reports() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&[
+        ("CONTEXTNEST_CONCORD_DISK_CHECK", None),
+        ("CONTEXTNEST_CONCORD_DISK_GRACE_MS", Some("0")),
+        ("CONTEXTNEST_CONCORD_HOT_MODE", None),
+        ("CONTEXTNEST_CONCORD_HOT_GLOBS", None),
+        ("CONTEXTNEST_CONCORD_HOT_TTL_SECS", None),
+        ("CONTEXTNEST_CONCORD_OWNS_MODE", None),
+        ("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", None),
+    ]);
+    let h = make_harness().await;
+    let dir = h.tmp.path().to_path_buf();
+    let f = dir.join("f.txt");
+    write_file(&f, b"v1");
+    let cwd = dir.to_string_lossy().to_string();
+
+    let canonical = std::fs::canonicalize(&f).expect("canonical");
+
+    post_footprint(
+        &h.server,
+        &FootprintPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Read".to_string(),
+            path: canonical.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    std::fs::remove_file(&canonical).expect("rm");
+
+    let res = post_precheck(
+        &h.server,
+        &PrecheckPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Edit".to_string(),
+            path: canonical.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    assert_eq!(
+        res["unrecorded_change"],
+        json!(true),
+        "Edit on deleted file: unrecorded_change must remain true; got {res}"
+    );
+    let ctx = res["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("ctx");
+    assert!(
+        ctx.contains("was deleted on disk"),
+        "Edit on deleted file must keep the deletion text; got: {ctx}"
+    );
+}
+
+/// Write on a CHANGED file still reports "changed on disk" — the
+/// suppression is exactly (Deleted, Write), not a blanket "ignore disk
+/// drift on Write". A real lost update would otherwise silently succeed.
+#[tokio::test]
+async fn p1c_write_on_changed_file_still_reports() {
+    let _lock = lock_env();
+    let _env = EnvGuard::set(&[
+        ("CONTEXTNEST_CONCORD_DISK_CHECK", None),
+        ("CONTEXTNEST_CONCORD_DISK_GRACE_MS", Some("0")),
+        ("CONTEXTNEST_CONCORD_HOT_MODE", None),
+        ("CONTEXTNEST_CONCORD_HOT_GLOBS", None),
+        ("CONTEXTNEST_CONCORD_HOT_TTL_SECS", None),
+        ("CONTEXTNEST_CONCORD_OWNS_MODE", None),
+        ("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS", None),
+    ]);
+    let h = make_harness().await;
+    let dir = h.tmp.path().to_path_buf();
+    let f = dir.join("f.txt");
+    write_file(&f, b"v1");
+    let cwd = dir.to_string_lossy().to_string();
+
+    post_footprint(
+        &h.server,
+        &FootprintPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Read".to_string(),
+            path: f.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    std::thread::sleep(StdDuration::from_millis(20));
+    append_unrecorded(&f, b"\nshell wrote this");
+
+    let res = post_precheck(
+        &h.server,
+        &PrecheckPost {
+            sid: "s1".to_string(),
+            principal_header: Some("loop:a".to_string()),
+            tool: "Write".to_string(),
+            path: f.clone(),
+            cwd: Some(cwd.clone()),
+        },
+    )
+    .await;
+    assert_eq!(
+        res["unrecorded_change"],
+        json!(true),
+        "Write on changed file: unrecorded_change must remain true; got {res}"
+    );
+    let ctx = res["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("ctx");
+    assert!(
+        ctx.contains("changed on disk"),
+        "Write on changed file must keep the change text; got: {ctx}"
+    );
 }

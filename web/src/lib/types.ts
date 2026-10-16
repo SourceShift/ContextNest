@@ -181,6 +181,11 @@ export type BasinSummary = {
 
 export type BasinsResponse = {
   basins: BasinSummary[];
+  /** Basins that passed the scope + `min_mass` filter, before the
+   *  server's `limit` truncated the list. */
+  total_candidates: number;
+  /** True when `limit` dropped basins from the response. */
+  truncated: boolean;
 };
 
 export type ConnectionRow = {

@@ -2,10 +2,12 @@
 //!
 //! - `GET /api/v1/fragments` — bulk fragment listing, optionally with
 //!   embeddings, used by the client-side PCA layout.
-//! - `GET /api/v1/field/basins` — basin centroids. Real centroids come
-//!   from [`MemoryAttractorManager`]; when it's empty (post-sidecar
-//!   replay), we fall back to project-derived centroids computed as
-//!   the mean of contributing fragment embeddings.
+//! - `GET /api/v1/field/basins` — basin centroids, ranked by
+//!   scope-filtered mass and capped by `limit` (default 40). Real
+//!   centroids come from [`MemoryAttractorManager`]; when it's empty
+//!   (post-sidecar replay), we fall back to project-derived centroids
+//!   computed as the mean of contributing fragment embeddings. See
+//!   [`BasinsQuery`] for the `min_mass` / `limit` contract.
 //! - `GET /api/v1/connections` — retrieve co-occurrence edges. The
 //!   ConnectionLog in services accumulates fragment-pair counts every
 //!   time a `/retrieve` call returns multiple hits; this endpoint
@@ -30,8 +32,9 @@ use axum::{
 };
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::memory::attractors::attractor_basin::BasinSnapshot;
 use crate::services::ContextNestServices;
 
 // How many fragments we may embed in parallel.
@@ -309,9 +312,34 @@ pub enum BasinSource {
     Project,
 }
 
+/// Default cap on returned basins. The substrate forms one basin per
+/// semantic cluster, so the cardinality is a function of how much has
+/// been ingested — the operator's own corpus carried 291,244 basins
+/// over 507,845 consolidated fragments as of 2026-10. A viz that maps
+/// over all of them is unusable, and the centroids alone ran to 300+
+/// MB of JSON, so the endpoint always ranks and truncates.
+const BASIN_LIMIT_DEFAULT: usize = 40;
+/// Ceiling for the `limit` query param.
+const BASIN_LIMIT_CEILING: usize = 500;
+/// Longest label we derive from a member fragment's text.
+const BASIN_LABEL_MAX_CHARS: usize = 48;
+/// A line shorter than this makes a useless label; fall through to the
+/// dominant kind instead.
+const BASIN_LABEL_MIN_CHARS: usize = 8;
+
+fn default_basin_limit() -> usize {
+    BASIN_LIMIT_DEFAULT
+}
+
 #[derive(Debug, Serialize)]
 pub struct BasinsResponse {
     pub basins: Vec<BasinSummary>,
+    /// Basins that passed the scope + mass filter, *before* `limit`
+    /// truncated the list. Lets the client say "showing 40 of 1,426"
+    /// instead of silently implying the substrate has 40 clusters.
+    pub total_candidates: usize,
+    /// True when `limit` dropped basins from the response.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +351,57 @@ pub struct BasinsQuery {
     /// both must match.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Minimum mass for a *real* attractor basin to be returned, where
+    /// mass counts only the members that survive the scope filter.
+    /// Defaults to 1 (no floor). Real basins are heavily skewed —
+    /// median mass 1 across the corpus — so a floor is what separates
+    /// "cluster" from "one fragment that happened to land alone".
+    ///
+    /// Deliberately NOT applied to the project-derived fallback: a
+    /// one-fragment project is still a project.
+    #[serde(default = "default_min_mass")]
+    pub min_mass: usize,
+    /// Cap on returned basins, ranked by scope-filtered mass. Default
+    /// 40, ceiling [`BASIN_LIMIT_CEILING`].
+    #[serde(default = "default_basin_limit")]
+    pub limit: usize,
+}
+
+fn default_min_mass() -> usize {
+    1
+}
+
+/// Reduce a fragment's text to a candidate basin label: the first
+/// non-empty line, whitespace-collapsed, capped at
+/// [`BASIN_LABEL_MAX_CHARS`] characters.
+///
+/// Returns the label plus its *pre-cap* length as a score, so a caller
+/// comparing the members of one basin can prefer the most descriptive
+/// among them without re-reading their texts. `None` when there is no
+/// line worth labelling a cluster with (blank, or shorter than
+/// [`BASIN_LABEL_MIN_CHARS`]).
+///
+/// The cap counts `char`s, never bytes: fragment text is arbitrary
+/// UTF-8 and a byte slice would panic mid-codepoint.
+fn label_candidate(text: &str) -> Option<(String, usize)> {
+    let line: String = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line_len = line.chars().count();
+    if line_len < BASIN_LABEL_MIN_CHARS {
+        return None;
+    }
+    let capped: String = line.chars().take(BASIN_LABEL_MAX_CHARS).collect();
+    let label = if line_len > BASIN_LABEL_MAX_CHARS {
+        format!("{capped}…")
+    } else {
+        capped
+    };
+    Some((label, line_len.min(BASIN_LABEL_MAX_CHARS)))
 }
 
 pub async fn list_basins(
@@ -335,74 +414,158 @@ pub async fn list_basins(
     // project-derived fallback. When the worker has caught up the
     // response is genuinely attractor-shaped; before it catches up the
     // project basins keep the frontend usable instead of going blank.
+    let limit = q.limit.clamp(1, BASIN_LIMIT_CEILING);
+    let min_mass = q.min_mass.max(1);
+
     let snapshots = services.attractor_manager.list_basin_snapshots().await;
     if !snapshots.is_empty() {
         let active = services.session_index.active_fragments_session_map().await;
         let metadata = services.fragment_metadata.read().await;
 
-        let mut basins: Vec<BasinSummary> = Vec::with_capacity(snapshots.len());
-        for snap in snapshots {
-            let mut by_kind: HashMap<String, usize> = HashMap::new();
-            let mut sessions: Vec<String> = Vec::new();
+        let matches = |frag_id: &str| -> bool {
             // Only count fragments that are still active in some
             // session — discarded ones shouldn't inflate basin mass.
-            let mut active_mass = 0usize;
-            for fid in &snap.fragment_ids {
-                if let Some(session_id) = active.get(fid) {
-                    if let Some(filter_session) = &q.session_id {
-                        if session_id != filter_session {
-                            continue;
-                        }
+            let Some(session_id) = active.get(frag_id) else {
+                return false;
+            };
+            if let Some(filter_session) = &q.session_id {
+                if session_id != filter_session {
+                    return false;
+                }
+            }
+            if let Some(filter_project) = &q.project {
+                return meta_matches_project(metadata.get(frag_id), filter_project);
+            }
+            true
+        };
+
+        // === Pass 1: scope-filtered mass per basin, nothing else ===
+        //
+        // Deliberately cheap. The substrate carries one basin per
+        // semantic cluster (291k on the operator's corpus), so this
+        // loop runs over ~0.5M member ids per request; building the
+        // `by_kind` histogram, the `sessions` list and a 1024-float
+        // centroid for every basin — 99% of which the `limit` then
+        // discards — is what made this endpoint return 300 MB.
+        let mut ranked: Vec<(&BasinSnapshot, usize)> = snapshots
+            .iter()
+            .map(|snap| {
+                let mass = snap
+                    .fragment_ids
+                    .iter()
+                    .filter(|fid| matches(fid.as_str()))
+                    .count();
+                (snap, mass)
+            })
+            .collect();
+        // Basins with no surviving member (everything soft-deleted, or
+        // filtered out of scope) are phantom centroids — drop them
+        // rather than shipping them to the viz.
+        //
+        // `scope_matched_anything` distinguishes "the scope matched no
+        // real basin at all" (→ project fallback, below) from "the
+        // caller's `min_mass` excluded every basin" (→ honest empty
+        // list). Without it, raising a threshold would silently swap
+        // the response over to project-derived basins.
+        let scope_matched_anything = ranked.iter().any(|(_, mass)| *mass > 0);
+        ranked.retain(|(_, mass)| *mass >= min_mass);
+        let total_candidates = ranked.len();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+        let truncated = total_candidates > limit;
+        ranked.truncate(limit);
+
+        if !ranked.is_empty() {
+            // === Pass 2: rich fields, for the survivors only ===
+            //
+            // Lock order matches `list_fragments`: metadata, then texts.
+            let texts = services.fragment_texts.read().await;
+            let mut basins: Vec<BasinSummary> = Vec::with_capacity(ranked.len());
+            for (snap, mass) in ranked {
+                let mut by_kind: HashMap<String, usize> = HashMap::new();
+                let mut sessions: Vec<String> = Vec::new();
+                let mut seen_sessions: HashSet<&str> = HashSet::new();
+                // Best label candidate so far: (label, score).
+                let mut label_member: Option<(String, usize)> = None;
+                for fid in &snap.fragment_ids {
+                    if !matches(fid.as_str()) {
+                        continue;
                     }
-                    let meta = metadata.get(fid);
-                    if let Some(filter_project) = &q.project {
-                        if !meta_matches_project(meta, filter_project) {
-                            continue;
-                        }
-                    }
-                    active_mass += 1;
-                    if !sessions.contains(session_id) {
+                    // `matches` already proved the fragment is active.
+                    let session_id = active.get(fid).expect("matches() checks active");
+                    if seen_sessions.insert(session_id.as_str()) {
                         sessions.push(session_id.clone());
                     }
-                    if let Some(meta) = meta {
-                        if let Some(kind) = meta.get("kind").and_then(|v| v.as_str()) {
-                            *by_kind.entry(kind.to_string()).or_insert(0) += 1;
+                    let meta = metadata.get(fid);
+                    if let Some(kind) = meta.and_then(|m| m.get("kind")).and_then(|v| v.as_str()) {
+                        *by_kind.entry(kind.to_string()).or_insert(0) += 1;
+                    }
+                    if let Some((candidate, score)) =
+                        texts.get(fid).and_then(|text| label_candidate(text))
+                    {
+                        // Strictly better wins; ties keep the earliest
+                        // member, so the label is stable across requests.
+                        if label_member
+                            .as_ref()
+                            .map(|(_, s)| score > *s)
+                            .unwrap_or(true)
+                        {
+                            label_member = Some((candidate, score));
                         }
                     }
                 }
-            }
-            // Label = the dominant kind, falling back to a short basin
-            // id slug. Frontends already render the label on the basin
-            // disc, so "decision" / "learning" reads better than a uuid.
-            let dominant_kind = by_kind
-                .iter()
-                .max_by_key(|(_, n)| *n)
-                .map(|(k, _)| k.clone());
-            let short = snap.id.split('-').next().unwrap_or("basin");
-            let label = dominant_kind.unwrap_or_else(|| format!("basin-{short}"));
+                // Deterministic dominant kind — HashMap iteration order
+                // isn't, and the label below feeds a stable UI.
+                let mut kinds: Vec<(&String, &usize)> = by_kind.iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                let dominant_kind = kinds.first().map(|(k, _)| (*k).clone());
 
-            basins.push(BasinSummary {
-                id: format!("basin-{}", snap.id),
-                label,
-                source: BasinSource::Attractor,
-                mass: active_mass,
-                centroid: snap.center,
-                by_kind,
-                sessions,
-            });
+                // Label = a headline lifted from the basin's most
+                // descriptive member fragment, falling back to the
+                // dominant kind, then to a short id slug. The snippet is
+                // the only option that distinguishes two basins sharing
+                // a kind — "accomplishment" labels 4,152 basins.
+                let label = label_member
+                    .map(|(candidate, _)| candidate)
+                    .or(dominant_kind)
+                    .unwrap_or_else(|| {
+                        let short = snap.id.split('-').next().unwrap_or("basin");
+                        format!("basin-{short}")
+                    });
+
+                basins.push(BasinSummary {
+                    id: format!("basin-{}", snap.id),
+                    label,
+                    source: BasinSource::Attractor,
+                    mass,
+                    centroid: snap.center.clone(),
+                    by_kind,
+                    sessions,
+                });
+            }
+            drop(texts);
+            drop(metadata);
+            return Ok(Json(BasinsResponse {
+                basins,
+                total_candidates,
+                truncated,
+            }));
         }
         drop(metadata);
-        // Empty basins (every member fragment got discarded) shouldn't
-        // be returned — they confuse the viz with phantom centroids.
-        basins.retain(|b| b.mass > 0);
-        // Sort by mass desc — heavy basins first, label as tiebreaker.
-        basins.sort_by(|a, b| b.mass.cmp(&a.mass).then_with(|| a.label.cmp(&b.label)));
-        if !basins.is_empty() {
-            return Ok(Json(BasinsResponse { basins }));
+        if scope_matched_anything {
+            // The scope matches real basins, but none reached
+            // `min_mass`. Report the empty set rather than presenting
+            // project-derived basins as if they were attractors.
+            return Ok(Json(BasinsResponse {
+                basins: Vec::new(),
+                total_candidates: 0,
+                truncated: false,
+            }));
         }
-        // If every real basin filtered out (all members discarded), drop
-        // through to the project fallback rather than returning an empty
-        // list — keeps the viz useful while the worker re-balances.
+        // Every real basin's members were discarded or filtered out of
+        // scope, so there is nothing attractor-shaped to show — drop
+        // through to the project fallback rather than returning an
+        // empty list, which keeps the viz useful while the worker
+        // re-balances.
     }
 
     // Fallback: project-derived basins. Used when (a) consolidation
@@ -460,8 +623,17 @@ pub async fn list_basins(
     // Sort by mass desc so the heavy basins come first — frontends that
     // cap rendering at N get the most-important slots.
     basins.sort_by(|a, b| b.mass.cmp(&a.mass).then_with(|| a.label.cmp(&b.label)));
+    // Same `limit` contract as the attractor path. `min_mass` is NOT
+    // applied here: a one-fragment project is still a project.
+    let total_candidates = basins.len();
+    let truncated = total_candidates > limit;
+    basins.truncate(limit);
 
-    Ok(Json(BasinsResponse { basins }))
+    Ok(Json(BasinsResponse {
+        basins,
+        total_candidates,
+        truncated,
+    }))
 }
 
 // =============================================================================
@@ -550,4 +722,40 @@ pub fn create_field_router() -> Router<ContextNestServices> {
         .route("/api/v1/fragments", get(list_fragments))
         .route("/api/v1/field/basins", get(list_basins))
         .route("/api/v1/connections", get(list_connections))
+}
+
+#[cfg(test)]
+mod label_candidate_tests {
+    use super::{label_candidate, BASIN_LABEL_MAX_CHARS};
+
+    #[test]
+    fn takes_the_first_non_empty_line_collapsed() {
+        // Leading blank lines are skipped and internal runs of
+        // whitespace collapse, so a multi-line fragment still yields a
+        // one-line label.
+        let (label, score) =
+            label_candidate("\n\n  cargo   test --lib → 14 passed  \nanother line")
+                .expect("a substantive first line is a valid label");
+        assert_eq!(label, "cargo test --lib → 14 passed");
+        assert_eq!(score, label.chars().count());
+    }
+
+    #[test]
+    fn caps_at_the_budget_on_char_boundaries() {
+        // Multi-byte text must not be sliced mid-codepoint — a byte
+        // index here would panic.
+        let long = "é".repeat(200);
+        let (label, score) = label_candidate(&long).expect("long line is a valid label");
+        assert_eq!(score, BASIN_LABEL_MAX_CHARS);
+        assert_eq!(label.chars().count(), BASIN_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn rejects_text_too_thin_to_label_a_cluster() {
+        assert!(label_candidate("").is_none());
+        assert!(label_candidate("   \n\t\n  ").is_none());
+        assert!(label_candidate("ok").is_none());
+        assert!(label_candidate("a long enough line").is_some());
+    }
 }
