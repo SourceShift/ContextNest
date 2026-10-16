@@ -138,6 +138,65 @@ All optional, env-overridable, sensible defaults:
 | `CONTEXTNEST_RETRIEVE_AUTO_RECONSTRUCT_DEPTH` | 5 | 6 | top-N fragments stitched in the chain |
 | `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | disk-first | LRU bound on the text→vector response cache (~16 MB at 1024-d); `0` disables it |
 | `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | disk-first | Directory for the operator's file-backed vector arena. Derived state: created fresh and unlinked at boot, rebuilt from the checkpoint. Pages are written back to the file under memory pressure instead of compressed/swapped |
+| `CONTEXTNEST_VOLUME_WATCH` | on | boot | `0` disables the data-volume watchdog. Armed on the WAL's parent directory before any boot work; samples `st_dev` + `st_ino` every 5 s and exits with code 75 (`EXIT_VOLUME_LOST`) after 3 consecutive misses (~15 s). See "Data-volume resilience" below |
+| `CONTEXTNEST_MIN_FREE_MB` | 5120 | boot | Free-space floor on the data volume, in MiB. Below it the process logs at `error!` and exits with code 74 (`EXIT_DISK_FLOOR`) rather than accept work it cannot keep. `0` disables. Separately warns when the volume cannot hold two checkpoints, which is what `cn-compact` needs |
+
+### Exit codes
+
+Three deliberate self-terminations, so a supervisor can tell them apart:
+
+| Code | Name | Cause | Restartable? |
+|---|---|---|---|
+| 70 | `EXIT_RSS_CEILING` | Resident memory hit `CONTEXTNEST_MAX_RSS_MB` | Only after raising the ceiling — respawning hits it again |
+| 74 | `EXIT_DISK_FLOOR` | Data volume below `CONTEXTNEST_MIN_FREE_MB` | Only after freeing space |
+| 75 | `EXIT_VOLUME_LOST` | The data volume detached or remounted (`EX_TEMPFAIL`) | Yes — as soon as the volume is back |
+
+## Data-volume resilience
+
+Two failure modes where the substrate's own data volume takes the process down,
+both added after the 2026-10-14 incident.
+
+**The volume detaches and the server does not die.** During a Maintenance Sleep
+the operator's USB volume dropped off the bus, spent ~5 s re-enumerating on a
+*new* BSD node (`disk8s1` → `disk7s1`), and came back. Every fd held across that
+gap was **revoked** — and a revoked vnode never recovers, even once the disk is
+back. The TCP listener is a socket, not a file on that volume, so the process
+kept accepting connections and answered none of them: 36 hours of a core
+spinning in the kernel, with every port-only health check reporting it healthy.
+
+`src/services/volume_watchdog.rs` samples the *identity* of the data directory —
+`st_dev` and `st_ino` — not merely whether the path resolves. That distinction is
+the whole point: after a remount the path resolves again, to a directory that
+looks right to any path comparison, while every fd stays revoked. Only the device
+number separates the two mounts. Three consecutive misses (~15 s) are required so
+a busy volume's transient `stat` failure cannot take the substrate down.
+
+There is no in-process recovery, so the watchdog exits with `_exit(2)` — *not*
+`std::process::exit`, which runs atexit handlers and flushes stdio, and a flush
+against a revoked fd is one more way to hang instead of a way to be heard. Because
+the log is on the casualty, it leaves a one-line breadcrumb at
+`$TMPDIR/contextnest-volume-lost.log` — on the boot volume, mounted
+independently — before exiting.
+
+**The volume fills up.** A detach is dramatic; a full volume is common. Below
+`CONTEXTNEST_MIN_FREE_MB` the process refuses to boot, and below twice the
+checkpoint size it warns that `cn-compact` is impossible (it writes a second full
+copy before swapping, and `cn-compact` is also what applies the edge packing, so
+this gates the boot-time win too). Both checks are enforced in-process, not only
+in the Makefile, so they hold when a launchd agent is the thing starting the
+binary.
+
+The floor is deliberately *low* (5 GiB, ~3× the observed worst-case WAL growth).
+A high floor would be the wrong instinct: refusing to boot a memory substrate
+because it might later fail to compact loses every session in the meantime, which
+is a larger harm than running tight.
+
+### `make cn-prod` preflights
+
+Before starting, the recipe refuses a data directory that is not actually a mount
+point — a leftover directory at the same path on the boot volume would otherwise
+host a fresh, empty substrate and hide the real one once the volume mounts. It
+also enforces the same free-space floor with a message naming the volume.
 
 ## Observability
 

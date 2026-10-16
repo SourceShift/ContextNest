@@ -58,6 +58,7 @@ pub mod resource_monitor;
 pub mod session_index;
 pub mod tenants;
 pub mod transcript_tail;
+pub mod volume_watchdog;
 pub mod wal;
 
 pub use context::ContextManagerService;
