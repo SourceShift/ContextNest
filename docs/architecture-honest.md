@@ -150,7 +150,7 @@ All optional, env-overridable, sensible defaults:
 | `CONTEXTNEST_RETRIEVE_CANDIDATE_POOL` | unset → `max(20 × top_k, 1000)` | 4–6 | Upper bound on candidates **materialized** into hits. Every candidate is still scored exactly (one store read-lock, query norm computed once, no vector clone); this bounds only how many get text + metadata pulled from the sidecars. `0` = unbounded, i.e. the pre-knob behaviour |
 | `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | disk-first | LRU bound on the text→vector response cache (~16 MB at 1024-d); `0` disables it |
 | `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | disk-first | Directory for the operator's file-backed vector arena. Derived state: created fresh and unlinked at boot, rebuilt from the checkpoint. Pages are written back to the file under memory pressure instead of compressed/swapped |
-| `CONTEXTNEST_VOLUME_WATCH` | on | boot | `0` disables the data-volume watchdog. Armed on the WAL's parent directory before any boot work; samples `st_dev` + `st_ino` every 5 s and exits with code 75 (`EXIT_VOLUME_LOST`) after 3 consecutive misses (~15 s). See "Data-volume resilience" below |
+| `CONTEXTNEST_VOLUME_WATCH` | on | boot | `0` disables the data-volume watchdog. Armed on the WAL's parent directory before any boot work; every 5 s it samples `st_dev` + `st_ino` **and** writes one byte through a sentinel descriptor opened at arm time, and exits with code 75 (`EXIT_VOLUME_LOST`) after 3 consecutive misses (~15 s). See "Data-volume resilience" below |
 | `CONTEXTNEST_MIN_FREE_MB` | 5120 | boot | Free-space floor on the data volume, in MiB. Below it the process logs at `error!` and exits with code 74 (`EXIT_DISK_FLOOR`) rather than accept work it cannot keep. `0` disables. Separately warns when the volume cannot hold two checkpoints, which is what `cn-compact` needs |
 
 ### Exit codes
@@ -179,9 +179,20 @@ spinning in the kernel, with every port-only health check reporting it healthy.
 `src/services/volume_watchdog.rs` samples the *identity* of the data directory —
 `st_dev` and `st_ino` — not merely whether the path resolves. That distinction is
 the whole point: after a remount the path resolves again, to a directory that
-looks right to any path comparison, while every fd stays revoked. Only the device
-number separates the two mounts. Three consecutive misses (~15 s) are required so
-a busy volume's transient `stat` failure cannot take the substrate down.
+looks right to any path comparison, while every fd stays revoked. Three
+consecutive misses (~15 s) are required so a busy volume's transient `stat`
+failure cannot take the substrate down.
+
+**But identity is not usability.** On 2026-10-18 the same drive dropped and
+re-enumerated over USB and came back on the **same BSD node** — `st_dev` was
+`16777247` before and after — so the identity check reported *intact* forever
+while every held fd was dead: the original outage with a detector that could not
+see it. The watchdog therefore also opens a one-byte sentinel file inside the
+data directory at arm time and keeps that descriptor. Every sample seeks to 0 and
+writes through it; a revoked vnode rejects that with `EBADF` immediately, which
+is reported as `Health::Stale` and counts as a miss. Path identity answers "is
+there a directory here that looks right?"; the sentinel answers "can this
+process still use it?", and only the second question matters after a remount.
 
 There is no in-process recovery, so the watchdog exits with `_exit(2)` — *not*
 `std::process::exit`, which runs atexit handlers and flushes stdio, and a flush

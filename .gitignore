@@ -129,6 +129,9 @@ hive-mind-prompt-*.txt
 /test_results/
 /validation/
 
+# Volume-watchdog liveness sentinel (written into the WAL's parent directory)
+.volume-watchdog.sentinel
+
 # Stray test binaries that shouldn't be committed
 *.exe
 
