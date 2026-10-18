@@ -7,8 +7,14 @@
   ~/Library/LaunchAgents/<label>.plist with the absolute paths of the current
   checkout, then bootstraps it. This file holds no secrets: the program is a
   non-login shell that sources <envfile> (mode 600, operator-owned) before
-  exec'ing the binary, so the embedding and tenant credentials never enter this
-  file, the rendered plist, or the repo.
+  exec'ing the binary, so the embedding credentials never enter this file, the
+  rendered plist, or the repo.
+
+  <envfile> must hold SERVER-SIDE secrets only. `CONTEXTNEST_TENANTS_FILE` in
+  that file turns the API auth-enforced, and clients that do not present
+  `Authorization` (the contextnest MCP server, the dashboard, the curl recipes)
+  then fail with `401 unauthorized scope` against a process that otherwise
+  looks healthy. Keep client tokens in a separate file.
 
   KeepAlive is `SuccessfulExit=false`: the job restarts when the substrate exits
   *non-zero*, which is exactly what the data-volume watchdog (75) and the
