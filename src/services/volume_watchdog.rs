@@ -35,6 +35,23 @@
 //!    in every way a path comparison could check, while every fd this process
 //!    holds stays revoked. Only `st_dev` tells the two mounts apart.
 //!
+//! ## The blind spot: a remount that keeps its device number
+//!
+//! On 2026-10-18 the same volume detached and re-enumerated over USB, came
+//! back on the *same* BSD node, and `st_dev` was unchanged (`16777247` before
+//! and after). [`classify`] therefore reported [`Health::Intact`] forever while
+//! every fd the server held was revoked — the 2026-10-14 outage with a
+//! detector that could not see it. Path identity is necessary but not
+//! sufficient: it answers "is there a directory here that looks right?", not
+//! "can this process still use it?".
+//!
+//! So arming also opens a **sentinel file inside the data directory** and keeps
+//! that `File` for the lifetime of the process. Every sample seeks to 0 and
+//! writes one byte through it. A revoked vnode fails that write with `EBADF`
+//! immediately, which is [`Health::Stale`] — the state the path comparison
+//! cannot distinguish from healthy. One byte at offset 0, never truncated, so
+//! the file stays a single byte and the probe costs no allocation or fsync.
+//!
 //! A single failed sample is not a detach: a busy volume can transiently fail a
 //! `stat`. [`MISSES_BEFORE_EXIT`] consecutive failures are required, so the
 //! watchdog needs ~15 s of sustained silence to fire and a blip does not take
@@ -62,7 +79,8 @@
 //! `std::process::exit` runs atexit handlers and flushes stdio, and a flush
 //! against a revoked fd is one more way to hang rather than a way to be heard.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -87,6 +105,15 @@ const MISSES_BEFORE_EXIT: u32 = 3;
 /// Name of the breadcrumb file left on the boot volume. Full path is
 /// `std::env::temp_dir().join(this)`.
 const BREADCRUMB: &str = "contextnest-volume-lost.log";
+
+/// Liveness sentinel opened inside the data directory at arm time. The open
+/// `File` is the watchdog's proof that this process can still *use* the volume,
+/// not merely see it — see the module docs on same-device remounts.
+const SENTINEL: &str = ".volume-watchdog.sentinel";
+
+/// What each sample flips the sentinel to. One byte at offset 0, so the file
+/// never grows past a single byte no matter how long the process runs.
+const SENTINEL_BYTE: &[u8] = b".";
 
 /// Identity of the filesystem object at a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +147,12 @@ pub enum Health {
     /// The path resolves, but to a different filesystem object — the volume
     /// remounted, or an automount stub took the mount point's place.
     Replaced,
+    /// The path still stats to the object recorded at boot, but a write
+    /// through the descriptor opened then no longer works. The volume
+    /// detached and came back on the same device number, so every fd this
+    /// process holds — including the WAL and every data file — is revoked and
+    /// can never recover.
+    Stale,
 }
 
 impl Health {
@@ -130,6 +163,7 @@ impl Health {
             Health::Intact => "is intact",
             Health::Missing => "no longer resolves",
             Health::Replaced => "now resolves to a different filesystem object",
+            Health::Stale => "still stats but its filesystem handles are revoked",
         }
     }
 }
@@ -140,6 +174,84 @@ pub fn classify(expected: VolumeId, observed: Option<VolumeId>) -> Health {
         None => Health::Missing,
         Some(actual) if actual == expected => Health::Intact,
         Some(_) => Health::Replaced,
+    }
+}
+
+/// Open — creating if needed — the liveness sentinel inside `data_dir`.
+///
+/// `None` means the sentinel could not be opened. The watchdog still arms on
+/// path identity alone, but a same-device remount will not be detected; that is
+/// a degraded guard, not a reason to refuse to boot, since a data directory the
+/// substrate cannot write to will fail loudly on its own.
+fn open_sentinel(dir: &Path) -> Option<File> {
+    let path = dir.join(SENTINEL);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                %err,
+                "volume watchdog: could not open the liveness sentinel; falling back to \
+                 path-identity checks only (a remount that keeps the same device number \
+                 will not be detected)"
+            );
+            None
+        }
+    }
+}
+
+/// Flip the sentinel through the descriptor opened at arm time.
+///
+/// A revoked vnode rejects `lseek` and `write` with `EBADF` immediately — that
+/// is the entire signal. `Interrupted` is retried rather than counted, because a
+/// signal arriving mid-probe says nothing about the volume.
+fn probe_sentinel<W: Write + Seek>(sentinel: &mut W) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let attempt_result = sentinel
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| sentinel.write_all(SENTINEL_BYTE));
+        match attempt_result {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted && attempt < ATTEMPTS => {
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// One full liveness sample: path identity first, then the held descriptor.
+///
+/// The descriptor check only runs when the path still looks right — if the
+/// volume is already [`Health::Missing`] or [`Health::Replaced`] there is
+/// nothing the sentinel could add, and probing it would just be a guaranteed
+/// failure on the way to the same verdict.
+fn sample<W: Write + Seek>(dir: &Path, expected: VolumeId, sentinel: &mut Option<W>) -> Health {
+    let by_path = classify(expected, volume_id(dir));
+    if by_path != Health::Intact {
+        return by_path;
+    }
+    let Some(sentinel) = sentinel.as_mut() else {
+        return Health::Intact;
+    };
+    match probe_sentinel(sentinel) {
+        Ok(()) => Health::Intact,
+        Err(err) => {
+            tracing::debug!(
+                path = %dir.display(),
+                %err,
+                "volume watchdog: sentinel write failed — the volume's descriptors are stale"
+            );
+            Health::Stale
+        }
     }
 }
 
@@ -155,6 +267,11 @@ fn disabled() -> bool {
 /// time. An unarmed watchdog is *not* an error: a boot that cannot see its own
 /// data directory will fail on its own, loudly, and arming a guard that fires
 /// immediately would turn that clear failure into a crash loop.
+///
+/// Arming also opens a sentinel file inside `data_dir` and keeps the descriptor
+/// for the life of the process. Samples write through it, so the guard detects
+/// a remount that comes back on the same device number and leaves every held
+/// file descriptor revoked — see the module docs.
 pub fn spawn_watchdog(data_dir: &Path) -> Option<VolumeId> {
     if disabled() {
         tracing::warn!(
@@ -172,6 +289,12 @@ pub fn spawn_watchdog(data_dir: &Path) -> Option<VolumeId> {
         return None;
     };
 
+    // Opened here rather than inside the thread so the descriptor is bound to
+    // the mount this process booted against — the whole point is to hold a
+    // handle from before any detach.
+    let mut sentinel = open_sentinel(data_dir);
+    let has_sentinel = sentinel.is_some();
+
     let dir = data_dir.to_path_buf();
     let started = std::thread::Builder::new()
         .name("volume-guard".into())
@@ -179,7 +302,7 @@ pub fn spawn_watchdog(data_dir: &Path) -> Option<VolumeId> {
             let mut misses = 0u32;
             loop {
                 std::thread::sleep(SAMPLE_INTERVAL);
-                let health = classify(expected, volume_id(&dir));
+                let health = sample(&dir, expected, &mut sentinel);
                 if health == Health::Intact {
                     if misses > 0 {
                         tracing::info!(
@@ -222,6 +345,7 @@ pub fn spawn_watchdog(data_dir: &Path) -> Option<VolumeId> {
             tracing::info!(
                 path = %data_dir.display(),
                 dev = expected.dev,
+                sentinel = has_sentinel,
                 interval_s = SAMPLE_INTERVAL.as_secs(),
                 "Volume watchdog armed on the data directory"
             );
@@ -431,6 +555,76 @@ mod tests {
     #[test]
     fn arming_on_a_missing_directory_declines_rather_than_looping() {
         assert_eq!(spawn_watchdog(Path::new("/definitely/not/here")), None);
+    }
+
+    /// A descriptor that is already revoked: `lseek` and `write` both fail the
+    /// way a revoked vnode does. This is the 2026-10-18 case — the path still
+    /// stats to exactly the object recorded at boot, but nothing can use it.
+    struct RevokedDescriptor;
+
+    impl Write for RevokedDescriptor {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(nix::libc::EBADF))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for RevokedDescriptor {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::from_raw_os_error(nix::libc::EBADF))
+        }
+    }
+
+    #[test]
+    fn a_revoked_descriptor_reads_as_stale_even_though_the_path_is_intact() {
+        let here = volume_id(Path::new(".")).expect("the cwd exists");
+        assert_eq!(
+            classify(here, volume_id(Path::new("."))),
+            Health::Intact,
+            "the path check alone cannot see this failure"
+        );
+        let mut sentinel = Some(RevokedDescriptor);
+        assert_eq!(sample(Path::new("."), here, &mut sentinel), Health::Stale);
+    }
+
+    #[test]
+    fn a_healthy_sentinel_keeps_an_intact_path_intact() {
+        let here = volume_id(Path::new(".")).expect("the cwd exists");
+        let mut sentinel = Some(std::io::Cursor::new(Vec::new()));
+        assert_eq!(sample(Path::new("."), here, &mut sentinel), Health::Intact);
+    }
+
+    #[test]
+    fn a_missing_path_is_reported_without_consulting_the_sentinel() {
+        // A healthy sentinel must not mask a path that stopped resolving.
+        let expected = VolumeId { dev: 1, ino: 2 };
+        let mut sentinel = Some(std::io::Cursor::new(Vec::new()));
+        assert_eq!(
+            sample(Path::new("/definitely/not/here"), expected, &mut sentinel),
+            Health::Missing
+        );
+    }
+
+    #[test]
+    fn the_sentinel_stays_one_byte_however_many_samples_run() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        for _ in 0..100 {
+            probe_sentinel(&mut cursor).expect("a cursor never revokes");
+        }
+        assert_eq!(cursor.into_inner(), SENTINEL_BYTE);
+    }
+
+    #[test]
+    fn arming_creates_the_sentinel_inside_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sentinel = open_sentinel(dir.path()).expect("a writable directory can hold it");
+        probe_sentinel(&mut sentinel).expect("a fresh sentinel is writable");
+
+        let path = dir.path().join(SENTINEL);
+        let bytes = std::fs::read(&path).expect("the probe created the file on disk");
+        assert_eq!(bytes, SENTINEL_BYTE);
     }
 
     #[test]
