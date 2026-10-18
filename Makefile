@@ -193,7 +193,15 @@ CN_AGENT_LOG      ?= /tmp/contextnest-agent.log
 # DEEPINFRA_API_KEY / OPENAI_API_KEY must live for the agent to embed. launchd
 # jobs inherit no interactive-shell environment, so a key exported in ~/.zshrc
 # will NOT reach the agent.
-CN_AGENT_ENV_FILE ?= $(HOME)/.contextnest/tenant-auth/server.env
+#
+# SERVER-SIDE secrets only. Do not point this at a file that also carries client
+# credentials: `CONTEXTNEST_TENANTS_FILE` alone flips the API into auth-enforced
+# mode, and every client that does not present `Authorization` — the contextnest
+# MCP server, the dashboard, the curl recipes in docs/usage.md — starts getting
+# `401 unauthorized scope` while the process otherwise looks healthy. The
+# operator's `server.env` is a client file (it also holds OPERATOR_HEADERS and
+# LIBWIT_TOKEN); the agent gets the embedding keys from `agent.env` instead.
+CN_AGENT_ENV_FILE ?= $(HOME)/.contextnest/tenant-auth/agent.env
 # Absolutised at render time: a launchd job starts with cwd `/`.
 CN_AGENT_BIN     ?= $(abspath $(CN_BIN))
 CN_AGENT_WORKDIR ?= $(abspath .)

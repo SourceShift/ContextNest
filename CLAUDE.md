@@ -158,7 +158,7 @@ in order: `api_key` literal → `api_key_env` → `$DEEPINFRA_API_KEY` →
 | `CONTEXTNEST_RETRIEVE_CANDIDATE_POOL` | unset → `max(20 × top_k, 1000)` | Upper bound on candidates **materialized** into hits. Scoring stays exact over every candidate; only this many get text + metadata pulled from the sidecars. `0` = unbounded (the pre-knob behaviour) — the A/B escape hatch for a global query, which otherwise scores all ~527k active fragments. |
 | `CONTEXTNEST_EMBEDDING_CACHE_MAX_ENTRIES` | 4096 | LRU bound on the embedding response cache (~16 MB at 1024-d). `0` disables it. |
 | `CONTEXTNEST_VECTOR_ARENA_DIR` | unset (heap) | Put the operator's vector arena in a file-backed mapping under this dir (derived state, unlinked at boot). Use a volume with free space. |
-| `CONTEXTNEST_VOLUME_WATCH` | on | `0` disables the data-volume watchdog. Exits 75 after ~15 s if the data directory's `st_dev`/`st_ino` change (a USB detach + remount revokes every fd and never recovers). See `docs/architecture-honest.md` → "Data-volume resilience". |
+| `CONTEXTNEST_VOLUME_WATCH` | on | `0` disables the data-volume watchdog. Exits 75 after ~15 s if the data directory's `st_dev`/`st_ino` change **or** a write through the sentinel descriptor opened at arm time fails (a detach that remounts on the same device number leaves `st_dev` unchanged but revokes every fd, and neither recovers in-process). See `docs/architecture-honest.md` → "Data-volume resilience". |
 | `CONTEXTNEST_MIN_FREE_MB` | 5120 | Free-space floor on the data volume; below it the process refuses to boot (exit 74). `0` disables. |
 
 Full list in `docs/architecture-honest.md`.
