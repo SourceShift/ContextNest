@@ -535,6 +535,81 @@ async fn dod5_mailbox_404_400_ack_idempotent_unacked_count() {
 // ────────────── DoD 6 — bad id 400 ──────────────
 
 #[tokio::test]
+async fn messages_from_lists_the_senders_outbox_across_recipients() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
+    let server = make_server().await;
+    let sender = unique_id("outbox-sender");
+    let first = unique_id("outbox-to-a");
+    let second = unique_id("outbox-to-b");
+    for pid in [&sender, &first, &second] {
+        server
+            .put(&format!("/api/v1/coord/principals/{pid}"))
+            .json(&json!({"harness": "h"}))
+            .await
+            .assert_status(axum::http::StatusCode::OK);
+    }
+    for (to, body) in [(&first, "one"), (&second, "two"), (&first, "three")] {
+        server
+            .post(&format!("/api/v1/coord/principals/{to}/messages"))
+            .json(&json!({"from": sender, "body": body}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+    }
+    // A message TO the sender is its inbox, not its outbox.
+    server
+        .post(&format!("/api/v1/coord/principals/{sender}/messages"))
+        .json(&json!({"from": first, "body": "inbound"}))
+        .await
+        .assert_status(axum::http::StatusCode::CREATED);
+
+    let res = server
+        .get("/api/v1/coord/messages")
+        .add_query_param("from", &sender)
+        .await;
+    res.assert_status(axum::http::StatusCode::OK);
+    let body: Value = res.json();
+    let messages = body["messages"].as_array().expect("messages array");
+    let bodies: Vec<&str> = messages
+        .iter()
+        .map(|m| m["body"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(bodies, ["one", "two", "three"]);
+    assert_eq!(messages[1]["principal_id"], second.as_str());
+    assert_eq!(messages[0]["from"], sender.as_str());
+
+    let res = server
+        .get("/api/v1/coord/messages")
+        .add_query_param("from", &sender)
+        .add_query_param("limit", "1")
+        .await;
+    res.assert_status(axum::http::StatusCode::OK);
+    let body: Value = res.json();
+    assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["messages"][0]["body"], "three");
+
+    // An unregistered sender is an empty outbox, not a 404.
+    let res = server
+        .get("/api/v1/coord/messages")
+        .add_query_param("from", "human:never-sent-anything")
+        .await;
+    res.assert_status(axum::http::StatusCode::OK);
+    let body: Value = res.json();
+    assert_eq!(body["messages"], json!([]));
+
+    // `from` is required.
+    let res = server.get("/api/v1/coord/messages").await;
+    res.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert!(body["error"].as_str().unwrap_or_default().contains("from"));
+    let res = server
+        .get("/api/v1/coord/messages")
+        .add_query_param("from", "")
+        .await;
+    res.assert_status(axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn dod6_bad_ids_return_400_on_put() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("CONTEXTNEST_COORD_PRINCIPAL_TTL_SECS");
