@@ -854,6 +854,7 @@ const SCHEMA: &str = "
         FOREIGN KEY(principal_id) REFERENCES principals(principal_id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_messages_principal ON messages(principal_id, id);
+    CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_actor, id);
     CREATE INDEX IF NOT EXISTS idx_bindings_principal ON bindings(principal_id);
     CREATE TABLE IF NOT EXISTS footprints (
         seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1373,6 +1374,27 @@ impl CoordStore {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt
             .query_map(params![principal_id], MessageRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(MessageRow::into_message).collect()
+    }
+
+    /// Messages sent by `from`, across every recipient: the outbox view
+    /// of the mailbox. `from_actor` is free text (a `human:` sender need
+    /// not be a registered principal), so an unknown sender is an empty
+    /// list, never `NotFound`. Keeps the newest `limit` rows and returns
+    /// them oldest first, the same order as [`Self::list_messages`].
+    pub fn list_messages_from(&self, from: &str, limit: usize) -> CoordStoreResult<Vec<Message>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, principal_id, from_actor, body, created_at,
+                    delivered_at, delivered_to, acked_at, acked_by
+             FROM (SELECT * FROM messages WHERE from_actor = ?1
+                   ORDER BY id DESC LIMIT ?2)
+             ORDER BY id ASC",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(params![from, limit], MessageRow::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(MessageRow::into_message).collect()
     }
@@ -3505,6 +3527,39 @@ mod tests {
         // last_seen advanced; started_at preserved.
         assert!(second.last_seen > first.last_seen);
         assert_eq!(second.started_at, first.started_at);
+    }
+
+    #[test]
+    fn list_messages_from_is_the_outbox_newest_kept_oldest_first() {
+        let s = store();
+        for pid in ["run:a", "run:b", "run:c"] {
+            s.upsert_principal(pid, PrincipalUpsert::default()).unwrap();
+        }
+        s.post_message("run:b", "run:a", "first").unwrap();
+        s.post_message("run:a", "run:b", "reply to a").unwrap();
+        s.post_message("run:c", "run:a", "second").unwrap();
+        s.post_message("run:b", "run:a", "third").unwrap();
+
+        let sent = s.list_messages_from("run:a", 200).unwrap();
+        let bodies: Vec<&str> = sent.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["first", "second", "third"]);
+        let recipients: Vec<&str> = sent.iter().map(|m| m.principal_id.as_str()).collect();
+        assert_eq!(recipients, ["run:b", "run:c", "run:b"]);
+        assert!(sent.iter().all(|m| m.from == "run:a"));
+
+        // The inbox of run:a holds only what was sent TO it.
+        let inbox = s.list_messages("run:a", false).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].body, "reply to a");
+
+        let newest_two = s.list_messages_from("run:a", 2).unwrap();
+        let bodies: Vec<&str> = newest_two.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, ["second", "third"]);
+
+        assert!(s
+            .list_messages_from("human:nobody", 200)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

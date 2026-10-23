@@ -44,6 +44,7 @@ pub fn create_coord_principals_router() -> Router<ContextNestServices> {
             "/api/v1/coord/principals/:principal_id/messages/:msg_id/ack",
             post(post_ack),
         )
+        .route("/api/v1/coord/messages", get(get_messages_from))
 }
 
 // ──────────────────────── helpers ────────────────────────
@@ -319,6 +320,45 @@ async fn get_messages(
         .coord_store
         .list_messages(&principal_id, unacked_only)
     {
+        Ok(messages) => (StatusCode::OK, Json(ListMessagesResponse { messages })).into_response(),
+        Err(e) => err_to_response(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesFromQuery {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const MESSAGES_FROM_DEFAULT_LIMIT: usize = 200;
+const MESSAGES_FROM_MAX_LIMIT: usize = 1000;
+
+/// GET /api/v1/coord/messages?from=<actor>[&limit=N]
+///
+/// The outbox: every message `from` sent, to any principal (each
+/// message's `principal_id` is its recipient). The newest `limit`
+/// (default 200, clamped to 1..=1000), oldest first. A sender that sent
+/// nothing, or is not a registered principal, is `200` with an empty list.
+async fn get_messages_from(
+    State(services): State<ContextNestServices>,
+    Query(q): Query<MessagesFromQuery>,
+) -> AxumResponse {
+    let from = q.from.as_deref().map(str::trim).unwrap_or("");
+    if from.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing required query parameter 'from'"})),
+        )
+            .into_response();
+    }
+    let limit = q
+        .limit
+        .unwrap_or(MESSAGES_FROM_DEFAULT_LIMIT)
+        .clamp(1, MESSAGES_FROM_MAX_LIMIT);
+    match services.coord_store.list_messages_from(from, limit) {
         Ok(messages) => (StatusCode::OK, Json(ListMessagesResponse { messages })).into_response(),
         Err(e) => err_to_response(e),
     }
